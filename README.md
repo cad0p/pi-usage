@@ -230,10 +230,10 @@ Inside Pi:
 
 | Command | Effect |
 | --- | --- |
-| `/usage` | one on-demand refresh, show the full panel, notify a one-line summary |
+| `/usage` | one on-demand refresh, show the full panel until the next prompt (or a second `/usage`), notify a one-line summary |
 | `/usage box` | pin the five-row box above the editor |
 | `/usage line` | pin the compact line above the editor, in its own row |
-| `/usage panel` | full boxed panel above the editor |
+| `/usage panel` | full panel above the editor, pinned across prompts |
 | `/usage hide` | hide the panel/line and stop background refresh until a surface is on again |
 | `/usage status` / `nostatus` | enable/disable the footer status |
 | `/usage refresh` | refresh only |
@@ -248,8 +248,9 @@ it fresh with a background refresh (and a gentle refresh after each agent turn).
 `/usage hide` gives the row back.
 
 A provider with several accounts is shown as one header (`OP-Go · 7 of 14 accounts
-ok`) plus one line per account: its fullest window, or the reason it failed (`key
-rejected`, `no Go plan`). The panel is rendered as a component, so Pi's ten-line
+ok`) plus one line per account with every window and its reset, e.g.
+`#2 ● session 2% (10m) · week 10% (6d) · month 90% (19d)`, or the reason it failed
+(`key rejected`, `no Go plan`). The leading glyph is the fullest window's band. The panel is rendered as a component, so Pi's ten-line
 cap on plain widgets never truncates it, and the summary names the account with the
 most room: `OP-Go: 7/14 ok · lowest 24% (#7)`.
 
@@ -498,7 +499,7 @@ extensions/quota-panel.ts      Pi TUI line and /usage
 ## Tests
 
 ```bash
-node --test tests/*.test.mjs     # 265 tests, fake tokens only, no network
+node --test tests/*.test.mjs     # 266 tests, fake tokens only, no network
 ```
 
 Modules covered: `auth.json` parsing and de-duplication, the Claude Code store

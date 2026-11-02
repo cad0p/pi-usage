@@ -257,9 +257,9 @@ test("the full panel lists every account while the box and the line keep one per
   const panelWidget = harness.widgets.at(-1);
   const panel = plain(renderWidget(panelWidget).join("\n"));
   assert.match(panel, /OP-Go · 2 of 2 accounts ok/);
-  assert.match(panel, /#1 .*100% monthly/, "each account shows only its fullest window");
-  assert.match(panel, /#2 .*100% monthly/);
-  assert.equal(/5h window/.test(panel), false, "per-account windows are not listed one by one");
+  assert.match(panel, /#1 +● session +10% \(10m\) +· month 100% \(10d\)/, "every window of an account shares its one line");
+  assert.match(panel, /#2 +● session +50% \(10m\) +· month 100% \(10d\)/);
+  assert.equal(/5h window/.test(panel), false, "per-account windows are not listed one per line");
   assert.match(harness.notifications.at(-1), /OP-Go: 2\/2 ok · lowest 100% \(#1\)/);
 
   assert.equal((harness.notifications.at(-1).match(/OP-Go/g) ?? []).length, 1, "the summary names each family once");
@@ -308,8 +308,32 @@ test("a fourteen-account panel is a component, so Pi's ten-line cap never trunca
   assert.match(panel, /OP-Go · 7 of 14 accounts ok/);
   assert.match(panel, /#14 .*no Go plan/);
   assert.match(panel, /#8 .*key rejected/);
-  assert.match(panel, /#7 .*80% monthly/);
+  assert.match(panel, /#7 .*session +0% .*month +80%/);
   assert.match(harness.notifications.at(-1), /OP-Go: 7\/14 ok · lowest 20% \(#1\)/);
+});
+
+test("the panel bare /usage opens closes on the next prompt or a second /usage; /usage panel stays", async () => {
+  const module = await import(EXTENSION);
+  const harness = makeHarness();
+  module.default(harness.pi);
+  const usage = harness.commands.find((command) => command.name === "usage");
+  const agentStart = harness.handlers.get("agent_start");
+
+  await usage.definition.handler("", harness.ctx);
+  assert.equal(typeof harness.widgets.at(-1), "function", "bare /usage shows the panel");
+  await agentStart({}, harness.ctx);
+  assert.equal(harness.widgets.at(-1), undefined, "the next prompt dismisses it");
+
+  await usage.definition.handler("", harness.ctx);
+  assert.equal(typeof harness.widgets.at(-1), "function");
+  await usage.definition.handler("", harness.ctx);
+  assert.equal(harness.widgets.at(-1), undefined, "a second bare /usage closes it");
+
+  await usage.definition.handler("panel", harness.ctx);
+  await agentStart({}, harness.ctx);
+  assert.equal(typeof harness.widgets.at(-1), "function", "/usage panel pins it across prompts");
+  await usage.definition.handler("hide", harness.ctx);
+  assert.equal(harness.widgets.at(-1), undefined);
 });
 
 test("no surface is pinned at session start and the footer is left alone", async () => {
