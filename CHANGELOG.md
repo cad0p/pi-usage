@@ -11,6 +11,7 @@ All notable changes to this project will be documented in this file.
 ### 🐛 Bug Fixes
 
 - *(extension)* /usage glance closes on the next prompt; every window per account (closes #9)
+- *(auth)* Read Antigravity from Pi's google-antigravity login (closes #12)
 
 
 ## [0.11.3] - 2026-11-02
