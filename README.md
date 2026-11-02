@@ -8,7 +8,7 @@ One source of truth for quota: **the credentials Pi already owns**.
 > * **OpenCode Go from the API key**: `GET https://opencode.ai/zen/go/v1/usage` returns the rolling (5h), weekly and monthly windows for the key Pi already stores, so no browser session is needed.
 > * **Numbered accounts**: `auth.json` entries such as `opencode-go-2` … `opencode-go-14` (the [pi-fallback-provider](https://github.com/cad0p/pi-fallback-provider) sibling convention) are read as extra accounts of their base provider.
 > * **One Omarchy tab per provider**: a multi-account provider shows each account's binding window (`#2 · Monthly`) in a single tab, and summarises failed accounts.
-> * **`/usage` on demand**: the Pi command is `/usage` only, and nothing is pinned above the editor or in the footer unless you ask for it.
+> * **`/usage` on demand**: the Pi command is `/usage` only, and nothing is pinned above the editor or in the footer unless you ask for it. A multi-account provider gets one line per account in the panel.
 > * **No dead Claude store**: `auto` passes over an expired Claude Code token when Pi's own `anthropic` login is fresh, and says so in the warnings.
 >
 > Everything below still applies; the CLI is still called `piquota`.
@@ -246,6 +246,12 @@ above the editor and leaves the footer alone. Turn a surface on with `/usage box
 `/usage line`, `/usage panel` or `/usage status`; only then does the extension keep
 it fresh with a background refresh (and a gentle refresh after each agent turn).
 `/usage hide` gives the row back.
+
+A provider with several accounts is shown as one header (`OP-Go · 7 of 14 accounts
+ok`) plus one line per account: its fullest window, or the reason it failed (`key
+rejected`, `no Go plan`). The panel is rendered as a component, so Pi's ten-line
+cap on plain widgets never truncates it, and the summary names the account with the
+most room: `OP-Go: 7/14 ok · lowest 24% (#7)`.
 
 `/usage box` pins the **five-row box above the editor**:
 
@@ -492,7 +498,7 @@ extensions/quota-panel.ts      Pi TUI line and /usage
 ## Tests
 
 ```bash
-node --test tests/*.test.mjs     # 264 tests, fake tokens only, no network
+node --test tests/*.test.mjs     # 265 tests, fake tokens only, no network
 ```
 
 Modules covered: `auth.json` parsing and de-duplication, the Claude Code store
