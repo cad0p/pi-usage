@@ -10,7 +10,7 @@
 #   2. detects operating system and platform nuances
 #   3. copies src/, bin/ and package.json to ~/.local/share/pi-quota
 #   4. symlinks ~/.local/bin/piquota
-#   5. installs extensions/*.ts into ~/.pi/agent/extensions
+#   5. installs extensions/*.ts into ~/.pi/agent/extensions (skip with --no-extension)
 #   6. cleans up obsolete shims if upgrading from previous versions
 #   7. with --omarchy-timer, installs a systemd user timer that runs
 #      `piquota omarchy` every 5 minutes (opt-in)
@@ -37,6 +37,7 @@ BIN_DIR="${PI_QUOTA_BIN_DIR:-$HOME/.local/bin}"
 EXT_DIR="${PI_QUOTA_EXT_DIR:-$HOME/.pi/agent/extensions}"
 MODE="copy"
 OMARCHY_TIMER=false
+INSTALL_EXTENSION=true
 UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
 
 for arg in "$@"; do
@@ -45,14 +46,19 @@ for arg in "$@"; do
     --copy) MODE="copy" ;;
     --uninstall) MODE="uninstall" ;;
     --omarchy-timer) OMARCHY_TIMER=true ;;
+    --no-extension) INSTALL_EXTENSION=false ;;
     -h|--help)
       cat <<'USAGE'
-Usage: ./install.sh [--copy|--link|--uninstall] [--omarchy-timer]
+Usage: ./install.sh [--copy|--link|--uninstall] [--omarchy-timer] [--no-extension]
 
   --copy       Copy the project into ~/.local/share/pi-quota (default)
   --link       Symlink the project instead, for development
   --uninstall  Remove the installed tree, the piquota shim, the Pi extension and the
                Omarchy timer (its pi-*.json records are removed too)
+  --no-extension
+               Install only the CLI. Use this when the Pi extension is installed as a
+               pi package (`pi install npm:@j3pf/piquota`); nothing is copied or
+               symlinked into ~/.pi/agent/extensions
   --omarchy-timer
                Also install and enable a systemd user timer that runs `piquota omarchy`
                every 5 minutes, so Omarchy's Agents panel shows every piQuota provider
@@ -177,7 +183,10 @@ esac
 
 echo
 echo "--- Installing Files ---"
-mkdir -p "$BIN_DIR" "$EXT_DIR"
+mkdir -p "$BIN_DIR"
+if [[ "$INSTALL_EXTENSION" == "true" ]]; then
+  mkdir -p "$EXT_DIR"
+fi
 
 if [[ "$MODE" == "link" ]]; then
   rm -rf "$PREFIX"
@@ -229,16 +238,21 @@ install_extension() {
   fi
 }
 
-install_extension "quota-panel.ts" "Pi TUI quota extension"
+if [[ "$INSTALL_EXTENSION" == "true" ]]; then
+  install_extension "quota-panel.ts" "Pi TUI quota extension"
 
-# gentle-pi paints its right rail from a hardcoded allowlist, so the quota card only
-# appears there once piQuota's part is added to it. The extension re-checks and
-# re-applies this on every session start; doing it here means the first Pi run after
-# installing already has the slot instead of waiting for the next session.
-if [[ -f "$PREFIX/src/gentle-pi/rail-patch.js" ]]; then
-  if ! node "$PREFIX/src/gentle-pi/rail-patch.js" --apply 2>&1 | sed 's/^/  /'; then
-    warn "the gentle-pi rail slot could not be patched; the quota box still renders above the editor"
+  # gentle-pi paints its right rail from a hardcoded allowlist, so the quota card only
+  # appears there once piQuota's part is added to it. The extension re-checks and
+  # re-applies this on every session start; doing it here means the first Pi run after
+  # installing already has the slot instead of waiting for the next session.
+  if [[ -f "$PREFIX/src/gentle-pi/rail-patch.js" ]]; then
+    if ! node "$PREFIX/src/gentle-pi/rail-patch.js" --apply 2>&1 | sed 's/^/  /'; then
+      warn "the gentle-pi rail slot could not be patched; the quota box still renders above the editor"
+    fi
   fi
+else
+  log "skipping the Pi extension and its gentle-pi rail slot (--no-extension)"
+  log "  install it as a package instead: pi install npm:@j3pf/piquota"
 fi
 
 # --- Omarchy Agents panel timer (opt-in) ---

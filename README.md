@@ -141,6 +141,8 @@ pi install npm:@j3pf/piquota
 Loads both Pi extensions straight from the package. The quota panel resolves
 the CLI from inside the package, so nothing else is required to see quotas in
 the TUI.
+When you also run `install.sh` for the terminal CLI, pass
+`--no-extension` so the two copies cannot drift apart.
 
 | Capability | `pi install npm:` | `install.sh` |
 | --- | --- | --- |
@@ -159,12 +161,14 @@ sync while Pi is not running.
 ```bash
 git clone https://github.com/J3fp/piQuota.git
 cd piQuota
-./install.sh              # --link for development, --uninstall to remove
+./install.sh                 # --link for development, --uninstall to remove
+./install.sh --no-extension  # CLI only; keep the Pi extension installed as a package
 ```
 
 No sudo. It validates Node, Pi and Gentle AI, reports which Claude source it found,
 copies the project to `~/.local/share/pi-quota`, symlinks `~/.local/bin/piquota`,
-installs the Pi TUI extension,
+installs the Pi TUI extension (and its gentle-pi rail slot) unless `--no-extension`
+is given,
 and removes the previous generation's `shuvquota` shim so upstream `/usr/bin/shuvquota`
 is reachable again.
 
