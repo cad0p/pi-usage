@@ -17,7 +17,7 @@ One source of truth for quota: **the credentials Pi already owns**.
 shuvquota, and it never writes to a credential file.
 
 > [!TIP]
-> **Working with AI Agents?** See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for architectural boundaries, test runner commands, and hard invariants for AI coding agents.
+> **Working with AI Agents?** See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for architectural boundaries, test runner commands, and hard invariants for AI coding agents, and [docs/verification.md](docs/verification.md) for the verification checklist every change follows.
 
 | Surface | Command |
 | --- | --- |
