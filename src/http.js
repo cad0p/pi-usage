@@ -36,7 +36,43 @@ export function redact(value) {
  * @property {string} [error]      Redacted, human-readable failure reason.
  * @property {boolean} [authError] True for 401/403, which callers surface as a
  *                                 "sign in again" degradation.
+ * @property {string | null} [authMessage] The provider's own error message for a
+ *                                 401/403, redacted and length-capped. Callers
+ *                                 that need to distinguish "revoked key" from
+ *                                 "plan not active" use it; the generic error
+ *                                 text stays the same for everyone else.
  */
+
+/**
+ * Read a provider's JSON error message from a 401/403 body.
+ *
+ * The status alone cannot tell a revoked credential from a valid credential
+ * whose workspace is not entitled to the product, and both Pi and the vendor
+ * return that distinction in the body. Never throws: an unreadable body is
+ * simply no detail.
+ *
+ * @param {{ text?: () => Promise<string> }} response
+ * @returns {Promise<string | null>}
+ */
+async function readAuthMessage(response) {
+  let raw = "";
+  try {
+    raw = await response.text();
+  } catch {
+    return null;
+  }
+  if (!raw || raw.trim() === "") return null;
+  let message = null;
+  try {
+    const body = JSON.parse(raw);
+    const value = body?.error?.message ?? body?.message ?? body?.error;
+    message = typeof value === "string" ? value : null;
+  } catch {
+    return null;
+  }
+  if (!message) return null;
+  return redact(message).replace(/\s+/g, " ").trim().slice(0, 120) || null;
+}
 
 /**
  * Perform one request and parse a JSON body.
@@ -70,6 +106,7 @@ export async function requestJson(url, options = {}) {
         ok: false,
         status: response.status,
         authError: true,
+        authMessage: await readAuthMessage(response),
         error: `sign-in expired (HTTP ${response.status})`,
       };
     }

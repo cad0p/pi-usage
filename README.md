@@ -34,8 +34,8 @@ shuvquota, and it never writes to a credential file.
   token the installed `claude` owns. `~/.claude.json` is read only for the account
   e-mail and display name; its project history is never touched.
 * Browser cookie databases are copied to a private temp dir and opened
-  read-only. This is only used to fetch the opencode.ai session cookie that Pi
-  does not store.
+  read-only. This is only used for the OpenCode Go fallback, when the key usage
+  endpoint is gone and no session cookie is configured.
 * `/quota` never injects quota into the LLM context: the extension only calls
   `ui.setStatus`, `ui.setWidget` and `ui.notify`.
 * Nothing is written outside these paths:
@@ -55,7 +55,7 @@ shuvquota, and it never writes to a credential file.
 | Claude | Claude Code CLI store, else `anthropic.access` | `GET api.anthropic.com/api/oauth/usage` | ✅ 5h + weekly + plan |
 | Codex | `openai-codex.access` + `accountId` | `GET chatgpt.com/backend-api/wham/usage` | ✅ 5h + weekly + plan |
 | Antigravity | `antigravity.access` + `projectId` | `POST cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary` | ✅ Gemini + Claude/GPT buckets, **with in-memory refresh** |
-| OpenCode Go | opencode.ai session cookie | `GET opencode.ai/workspace/<id>/go` | ✅ weekly + monthly, verified live |
+| OpenCode Go | `opencode-go.key`, numbered siblings included | `GET opencode.ai/zen/go/v1/usage` | ✅ 5h + weekly + monthly per account; the session cookie and SSR dashboard are a base-account fallback |
 | GitHub Actions (opt-in) | Authenticated `gh` CLI | `gh api /organizations/<org>/settings/billing/usage/summary?product=Actions` | ✅ org-wide monthly Linux minutes, plan-derived allowance |
 
 Four findings worth recording, each of which cost a wrong hypothesis:
@@ -63,10 +63,13 @@ Four findings worth recording, each of which cost a wrong hypothesis:
 1. **Antigravity needs the CLI `User-Agent`.** Without
    `User-Agent: antigravity/cli/...` the backend answers
    `403 You do not have a valid license of this product` for a healthy token.
-2. **Pi's `opencode-go` entry is an OpenCode Zen API key, not a Go session.** It
-   validates (`/zen/v1/models` → 200, 70 models) but exposes no usage, and every
-   `/api/*` path on opencode.ai returns 404: the Go windows only exist in the
-   authenticated SSR page.
+2. **Pi's `opencode-go` entry is an OpenCode Zen API key, and that key reads its
+   own Go usage.** `GET /zen/go/v1/usage` answers with the rolling (5h), weekly
+   and monthly windows for the key's workspace; `401` means the key was revoked
+   and `403 Workspace access denied` means the key is valid but its workspace has
+   no Go plan. Only a `404` (endpoint gone) or an entry without a key falls back
+   to the session cookie and the authenticated SSR dashboard, and only for the
+   base account, because one browser session belongs to one workspace.
 3. **`primaryWindowId` identifies the most urgent window.** The CLI computes the
    shortest, most pressing window (e.g. 5h session before weekly) so downstream UI
    consumers like `rp-host` and the Pi TUI render priority pills without reimplementing
@@ -461,7 +464,7 @@ extensions/quota-panel.ts      Pi TUI line and /quota
 ## Tests
 
 ```bash
-node --test tests/*.test.mjs     # 249 tests, fake tokens only, no network
+node --test tests/*.test.mjs     # 254 tests, fake tokens only, no network
 ```
 
 Modules covered: `auth.json` parsing and de-duplication, the Claude Code store
