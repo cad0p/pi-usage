@@ -222,6 +222,67 @@ test("a multi-account family where every account fails keeps the single-failure 
   assert.ok(record.limits[0].percent < 0, "the panel filters percent < 0, so nothing is drawn");
 });
 
+test("a multi-account record lists every window of every account, failed ones with a short status", () => {
+  const providers = [
+    provider({
+      family: "opencode-go",
+      label: "OpenCode Go (Pi)",
+      account: "#1",
+      slot: null,
+      windows: [
+        { id: "5h", label: "5h window", usedPercent: 2, remainingPercent: 98, resetsAt: "2026-10-04T05:10:00.000Z" },
+        { id: "weekly", label: "Weekly window", usedPercent: 10, remainingPercent: 90, resetsAt: "2026-10-10T00:00:00.000Z" },
+        { id: "monthly", label: "Monthly window", usedPercent: 90, remainingPercent: 10, resetsAt: null },
+      ],
+    }),
+    provider({
+      family: "opencode-go",
+      label: "OpenCode Go (Pi)",
+      account: "#2",
+      slot: "2",
+      ok: false,
+      windows: [],
+      error: "OpenCode Go key rejected (401); reconnect that account in Pi",
+    }),
+    provider({
+      family: "opencode-go",
+      label: "OpenCode Go (Pi)",
+      account: "#3",
+      slot: "3",
+      ok: false,
+      windows: [],
+      error: "Go plan not active for this key's workspace (403 Workspace access denied)",
+    }),
+  ];
+
+  const { record } = buildRecords(/** @type {any} */ ({ providers }), { now: NOW })[0];
+  assert.deepEqual(record.accounts, [
+    {
+      id: "#1",
+      ok: true,
+      status: "",
+      limits: [
+        { label: "5h window", title: "Session", percent: 0.02, resetsAt: "2026-10-04T05:10:00.000Z" },
+        { label: "Weekly window", title: "Weekly", percent: 0.1, resetsAt: "2026-10-10T00:00:00.000Z" },
+        { label: "Monthly window", title: "Monthly", percent: 0.9, resetsAt: "" },
+      ],
+    },
+    { id: "#2", ok: false, status: "Key rejected", limits: [] },
+    { id: "#3", ok: false, status: "No Go plan", limits: [] },
+  ]);
+  // The flattened limits Omarchy's built-in panel reads are unchanged.
+  assert.deepEqual(record.limits, [
+    { label: "#1 · Monthly window", title: "#1 · Monthly", percent: 0.9, resetsAt: "" },
+  ]);
+});
+
+test("a single-account record carries no accounts list", () => {
+  const { record } = buildRecord(provider(), { now: NOW });
+  assert.equal("accounts" in record, false);
+  const [built] = buildRecords(/** @type {any} */ ({ providers: [provider({ family: "codex", label: "Codex (Pi)" })] }), { now: NOW });
+  assert.equal("accounts" in built.record, false);
+});
+
 test("publishRecords writes valid JSON atomically and leaves no temp files", () => {
   const dir = join(tempDir(), "usage");
   try {
@@ -418,4 +479,3 @@ test("syncOmarchyAssets copies SVG marks into Omarchy plugin asset directories i
     rmSync(home, { recursive: true, force: true });
   }
 });
-

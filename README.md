@@ -487,7 +487,10 @@ piquota omarchy                  # write pi-claude.json, pi-codex.json, ... once
   `auth.json`) still gets **one** record: every healthy account contributes only
   the window that constrains it, titled `#<slot> · Session|Weekly|Monthly`, and
   failed accounts add no rows but are summarised by reason, e.g.
-  `#8–#10 key rejected · #11–#14 no Go plan`.
+  `#8–#10 key rejected · #11–#14 no Go plan`. The same record also carries
+  `accounts[{id, ok, status, limits}]` with every window of every account
+  (`status` is a short reason such as `Key rejected` for a failed one), which
+  Omarchy's built-in panel ignores and this package's own plugin draws.
 - Omarchy's native collector already tracks Claude with richer local statistics, so
   `piquota omarchy` automatically skips `claude` and cleans up duplicate `pi-claude.json`
   files when `claude.json` exists in the usage directory (override with `PI_QUOTA_OMARCHY_SKIP`).
