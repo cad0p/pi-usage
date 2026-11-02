@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## [calver-released]
+## [0.11.3] - 2026-11-02
 
 <!-- USER-EDITABLE SECTION START -->
 First fix release of the fork. With Claude Code uninstalled, Claude now reads Pi's own login instead of a dead Claude Code store, and `/usage` shows every OpenCode Go account.
