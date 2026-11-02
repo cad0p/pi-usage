@@ -550,12 +550,14 @@ totals stay — and `piquota stats --rebuild-totals` recomputes `totals.json` fr
 every month file, recovering days whose session files are already gone. A normal
 run reads only `totals.json` plus the month files covering the last seven days
 (current month, and the previous one early in a month), so years of history
-never slow a run: on this machine the 41 frozen days use a ~1 KB
-`totals.json` and two month files of a few tens of KB.
+never slow a run: on this machine 45 frozen days cost ~28 KB in total —
+`totals.json` 6.9 KB and two month files of 5.4 KB and 16 KB.
 
-Cost: the first run streams each session file once (1.5 GB ≈ 3 s here); later
-runs read only the bytes appended since the previous scan (≈ 10–40 ms when
-nothing or little changed), and every byte is parsed once in normal operation.
+Cost: the first run streams each session file once — 1.56 GB across 608 files
+in 3.0 s here; later runs read only the bytes appended since the previous scan
+(59 ms of scanning for the whole store, ~20 KB read), and every byte is parsed
+once in normal operation. The CLI's own wall time is dominated by the provider
+calls either way.
 The cache is atomic and `0600`; a rewrite or shrink rescans that file, a
 corrupt cache is a cache miss, and frozen days are skipped in either case. The
 scan has a wall-clock budget (12 s, or `PI_QUOTA_LOCAL_STATS_BUDGET_MS`) so the
