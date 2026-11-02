@@ -5,7 +5,7 @@ import { join } from "node:path";
 import test from "node:test";
 
 import { runOmarchyCommand, skippedFamilies } from "../src/cli/commands/omarchy.js";
-import { publishRecords, resolveOmarchyDir, syncOmarchyAssets } from "../src/omarchy/publish.js";
+import { publishRecords, resolveOmarchyDir } from "../src/omarchy/publish.js";
 import { buildRecord, buildRecords } from "../src/omarchy/record.js";
 
 const NOW = Date.parse("2026-10-04T05:00:00.000Z");
@@ -458,36 +458,15 @@ test("github-actions record formats multiple organization windows distinctly in 
   assert.equal(built.record.limits[1].title, "J3pf (0 / 2000 min)");
 });
 
-test("syncOmarchyAssets copies SVG marks into Omarchy plugin asset directories idempotently", () => {
+test("publishRecords never writes into Omarchy plugin directories", () => {
   const home = tempDir();
   try {
-    const pluginDir = join(home, ".config", "omarchy", "plugins", "my.agents");
+    const pluginDir = join(home, ".config", "omarchy", "plugins", "someone.else");
     mkdirSync(pluginDir, { recursive: true });
-    writeFileSync(join(pluginDir, "manifest.json"), "{}");
-
-    const copied = syncOmarchyAssets({ home });
-    assert.ok(copied.length > 0);
-    assert.ok(existsSync(join(pluginDir, "assets", "antigravity.svg")));
-    assert.ok(existsSync(join(pluginDir, "assets", "pi-antigravity.svg")));
-    assert.ok(existsSync(join(pluginDir, "assets", "opencode-go.svg")));
-    assert.ok(existsSync(join(pluginDir, "assets", "github-actions.svg")));
-
-    // Idempotent: identical files must not be touched to prevent triggering Omarchy shell reload watches
-    const secondPass = syncOmarchyAssets({ home });
-    assert.equal(secondPass.length, 0);
-  } finally {
-    rmSync(home, { recursive: true, force: true });
-  }
-});
-
-test("syncOmarchyAssets leaves this package's own plugin alone", () => {
-  const home = tempDir();
-  try {
-    const ownDir = join(home, ".config", "omarchy", "plugins", "cad0p.pi-usage");
-    mkdirSync(ownDir, { recursive: true });
-    writeFileSync(join(ownDir, "manifest.json"), JSON.stringify({ id: "cad0p.pi-usage" }));
-    assert.deepEqual(syncOmarchyAssets({ home }), []);
-    assert.equal(existsSync(join(ownDir, "assets")), false, "the symlinked package must not be written into");
+    writeFileSync(join(pluginDir, "manifest.json"), JSON.stringify({ id: "someone.else" }));
+    const dir = join(home, "usage");
+    publishRecords([], { dir, home, env: {} });
+    assert.deepEqual(readdirSync(pluginDir), ["manifest.json"], "another plugin's directory must stay untouched");
   } finally {
     rmSync(home, { recursive: true, force: true });
   }

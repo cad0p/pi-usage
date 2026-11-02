@@ -7,10 +7,9 @@
  * Omarchy's own `claude.json` / `codex.json` records are never touched.
  */
 
-import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { fileURLToPath } from "node:url";
 
 import { isPiRecordId, RECORD_PREFIX } from "./record.js";
 
@@ -58,90 +57,6 @@ function writeRecord(dir, id, record) {
 }
 
 /**
- * Copy a file only if the target does not exist or its content differs.
- * This is critical when writing to directories watched by inotify, such as
- * Omarchy's plugins directory, where redundant writes trigger full shell reloads.
- *
- * @param {string} srcPath
- * @param {string} dstPath
- * @returns {boolean} Whether the file was written.
- */
-function copyIfChanged(srcPath, dstPath) {
-  try {
-    if (existsSync(dstPath)) {
-      const srcBuf = readFileSync(srcPath);
-      const dstBuf = readFileSync(dstPath);
-      if (srcBuf.equals(dstBuf)) return false;
-    }
-    copyFileSync(srcPath, dstPath);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-/**
- * This package's own Omarchy plugin. It ships its marks inside the package and
- * is normally a symlink into it, so copying into it would write into the
- * installed package (or a git checkout) on every run.
- */
-export const OWN_PLUGIN_ID = "cad0p.pi-usage";
-
-/**
- * @param {string} manifestPath
- * @returns {string}
- */
-function manifestId(manifestPath) {
-  try {
-    const parsed = JSON.parse(readFileSync(manifestPath, "utf-8"));
-    return parsed && typeof parsed.id === "string" ? parsed.id : "";
-  } catch {
-    return "";
-  }
-}
-
-/**
- * Synchronize provider SVG icons into Omarchy plugin assets directories if present.
- * This package's own plugin is skipped: it already carries the marks.
- *
- * @param {{ env?: Record<string, string | undefined>, home?: string }} [options]
- * @returns {string[]} Paths of written assets.
- */
-export function syncOmarchyAssets(options = {}) {
-  const env = options.env ?? process.env;
-  const home = options.home ?? (env.HOME || homedir());
-  const pluginsDir = join(home, ".config", "omarchy", "plugins");
-  if (!existsSync(pluginsDir)) return [];
-
-  const assetsSrc = fileURLToPath(new URL("assets", import.meta.url));
-  if (!existsSync(assetsSrc)) return [];
-
-  const copied = [];
-  try {
-    for (const plugin of readdirSync(pluginsDir)) {
-      const pluginDir = join(pluginsDir, plugin);
-      const manifestPath = join(pluginDir, "manifest.json");
-      if (!existsSync(manifestPath)) continue;
-      if (manifestId(manifestPath) === OWN_PLUGIN_ID) continue;
-      const targetAssetsDir = join(pluginDir, "assets");
-      if (!existsSync(targetAssetsDir)) {
-        mkdirSync(targetAssetsDir, { recursive: true });
-      }
-
-      for (const file of readdirSync(assetsSrc)) {
-        if (!file.endsWith(".svg")) continue;
-        const srcPath = join(assetsSrc, file);
-        const dstPath = join(targetAssetsDir, file);
-        const piDstPath = join(targetAssetsDir, `pi-${file}`);
-        if (copyIfChanged(srcPath, dstPath)) copied.push(dstPath);
-        if (copyIfChanged(srcPath, piDstPath)) copied.push(piDstPath);
-      }
-    }
-  } catch {}
-  return copied;
-}
-
-/**
  * Write the given records and remove stale `pi-*.json` files whose provider is
  * no longer present.
  *
@@ -168,7 +83,6 @@ export function publishRecords(records, options = {}) {
     removed.push(join(dir, name));
   }
 
-  syncOmarchyAssets(options);
 
   return { dir, written, removed };
 }
