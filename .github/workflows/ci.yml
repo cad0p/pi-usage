@@ -31,4 +31,4 @@ jobs:
       # Zero runtime and dev dependencies: there is nothing to install.
       - run: npm test
       - name: Package contents
-        run: npm pack --dry-run --json | node -e 'const f=JSON.parse(require("fs").readFileSync(0,"utf8"))[0].files.map(x=>x.path); for (const need of ["bin/piquota.js","extensions/quota-panel.ts","README.md","LICENSE"]) if (!f.includes(need)) { console.error("missing from tarball:", need); process.exit(1); }'
+        run: npm pack --dry-run --json | node -e 'const f=JSON.parse(require("fs").readFileSync(0,"utf8"))[0].files.map(x=>x.path); for (const need of ["bin/piquota.js","extensions/quota-panel.ts","omarchy/cad0p.pi-usage/manifest.json","omarchy/cad0p.pi-usage/Panel.qml","omarchy/cad0p.pi-usage/UsageLogic.js","README.md","LICENSE"]) if (!f.includes(need)) { console.error("missing from tarball:", need); process.exit(1); }'

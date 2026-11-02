@@ -186,6 +186,7 @@ git clone https://github.com/cad0p/pi-usage.git
 cd pi-usage
 ./install.sh                 # --link for development, --uninstall to remove
 ./install.sh --no-extension  # CLI only; keep the Pi extension installed as a package
+./install.sh --omarchy-plugin  # also link the AI Usage bar plugin (see Omarchy integration)
 ```
 
 No sudo. It validates Node, Pi and Gentle AI, reports which Claude source it found,
@@ -497,6 +498,71 @@ piquota omarchy                  # write pi-claude.json, pi-codex.json, ... once
 - `PI_QUOTA_OMARCHY_DIR` overrides the output directory. `./install.sh --uninstall`
   removes the timer and the `pi-*.json` records.
 
+### The AI Usage bar plugin
+
+The package also ships its own Omarchy bar widget, `cad0p.pi-usage` ("AI
+Usage", in [`omarchy/cad0p.pi-usage/`](omarchy/cad0p.pi-usage/)). It is derived
+from Omarchy's built-in Agents plugin (MIT, by Omarchy) and reuses the shell's
+own panel components, so it looks the same, but it has no tabs: every provider
+is a collapsible section of one scrolling panel.
+
+- **Header row**: the provider's mark, name and plan, the headline percentage
+  with its window and reset (`Weekly · 1d`), a chip when something is wrong
+  (`Unavailable`, `7 down`), and the headline meter while folded. The headline is
+  the fullest window; for a multi-account provider it is the healthy account
+  with the most room left, the `lowest` figure `/usage` prints.
+- **Expanded**: the status card, LIMITS with the built-in meters and countdowns,
+  then for a multi-account record one row per account with every window
+  (`#2  session 2% 10m · week 10% 6d · month 90% 19d`, failed accounts dimmed
+  with their reason), then TOKENS BY DAY and TOKENS BY MODEL whenever the record
+  carries local statistics, drawn exactly as the built-in draws them.
+- **Which section is open**: on first use, only the provider closest to a limit
+  (ties go to the earliest reset). Every expand or collapse you make sticks,
+  across popup opens and shell restarts, in
+  `~/.local/state/omarchy/settings/cad0p.pi-usage.json`.
+- **Keys**: `j`/`k` or the arrows walk the section headers (a tall open section
+  scrolls first), Enter or Space toggles, `l`/`h` expand/collapse, `r` refreshes,
+  Tab moves to the neighbouring bar panel, Esc closes. The mouse wheel scrolls;
+  a click on a header toggles it.
+- **Records**: every `*.json` in the usage directory, Omarchy's own included, so
+  it can replace the built-in widget. A provider is hidden by
+  `providers.<id>.enabled = false` in the widget's settings, the same switch the
+  built-in uses.
+- **Refresh**: the systemd timer and the Pi extension already publish the
+  `pi-*.json` records, so the plugin never schedules `piquota`. `r`, a middle
+  click or `omarchy-shell cad0p.pi-usage refresh` starts
+  `piquota-omarchy.service` (or runs the package's `piquota omarchy` when there is
+  no unit). Omarchy's collectors (`omarchy-agent-usage-update`) run on the
+  `refreshIntervalSec` timer only while the built-in Agents widget is off the bar
+  (`omarchyCollectors`: `Auto`, `On` or `Off`), so keeping both never doubles the work.
+
+Install it by linking it into Omarchy's plugin directory; the link points into
+the pi package when there is one, so `pi update` updates the plugin too:
+
+```bash
+./install.sh --omarchy-plugin                          # symlink ~/.config/omarchy/plugins/cad0p.pi-usage (idempotent)
+omarchy plugin enable cad0p.pi-usage                   # put it on the bar (right section)
+omarchy bar put cad0p.pi-usage --after omarchy.agents  # or: right next to the built-in Agents icon
+omarchy plugin disable omarchy.agents                  # optional: drop the built-in widget
+```
+
+Without the installer, the link is
+`ln -s ~/.pi/agent/npm/node_modules/@cad0p/pi-usage/omarchy/cad0p.pi-usage ~/.config/omarchy/plugins/cad0p.pi-usage`
+followed by `omarchy-shell shell rescanPlugins`. To hide providers, pass the whole
+object, as with the built-in:
+`omarchy bar set cad0p.pi-usage providers '{"fireworks":{"enabled":false}}' --json`.
+Remove it with `omarchy plugin disable cad0p.pi-usage` and
+`rm ~/.config/omarchy/plugins/cad0p.pi-usage` (`./install.sh --uninstall` removes
+the link too); `omarchy plugin enable omarchy.agents` brings the built-in back.
+
+IPC: `omarchy-shell cad0p.pi-usage <open|close|toggle|refresh>`, plus
+`expand <id>` / `collapse <id>` (e.g. `expand pi-opencode-go`).
+
+`tests/omarchy-harness/render.sh [out-dir] [--light]` renders the panel offscreen
+to PNGs against fixture records, with Omarchy's real components and the current
+theme, next to the built-in panel for comparison. It never touches the running
+shell.
+
 ## Token stats from Pi's own sessions
 
 Pi writes every assistant message's `usage` block into
@@ -659,6 +725,8 @@ src/cli/commands/stats.js      `piquota stats` and `--rebuild-totals`
 src/exec.js                    the one place that spawns gh CLI binary
 src/http.js                    fetch wrapper: timeouts, JSON, redaction
 contrib/systemd/               user service and timer behind `install.sh --omarchy-timer`
+omarchy/cad0p.pi-usage/        the AI Usage Omarchy bar plugin (QML; UsageLogic.js is its pure logic)
+tests/omarchy-harness/         offscreen renderer for the plugin, fixtures included
 bin/piquota.js                 the only CLI
 extensions/quota-panel.ts      Pi TUI line and /usage
 ```
@@ -692,13 +760,14 @@ Actions plan resolution, opt-in gating and degradation, the two Antigravity
 failures and the OpenCode degradation), the dashboard parser's three
 strategies, the Firefox cookie reader against a synthetic SQLite database, the
 Antigravity refresh (in-memory only), sticky and last-good snapshots resilience,
-the Omarchy record mapping and atomic writer, the local token scan (family and
-slot mapping, incremental append, shrink, deletion, local-day bucketing, cache
-corruption), the durable history (month partitioning, freezing at midnight, late
-appends to frozen days, cache loss, a crash between the month and totals writes,
-corrupt-history quarantine, rebuild-totals), the renderers, the Pi extension
-contract, the per-family refresh clocks, argument parsing, and the structure of
-these documents themselves (tables, fences, links, anchors).
+the Omarchy record mapping and atomic writer, the Omarchy plugin's logic,
+manifest and marks, the local token scan (family and slot mapping, incremental
+append, shrink, deletion, local-day bucketing, cache corruption), the durable
+history (month partitioning, freezing at midnight, late appends to frozen days,
+cache loss, a crash between the month and totals writes, corrupt-history
+quarantine, rebuild-totals), the renderers, the Pi extension contract, the
+per-family refresh clocks, argument parsing, and the structure of these
+documents themselves (tables, fences, links, anchors).
 
 ## Acknowledgments & Prior Art
 
