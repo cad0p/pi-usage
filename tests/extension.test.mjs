@@ -190,19 +190,28 @@ function makeHarness(options = {}) {
   return { pi, ctx, commands, handlers, statuses, widgets, notifications, forbidden };
 }
 
-async function startSession(harness) {
+/**
+ * Start the session and, unless `surface` is null, turn that surface on the way a
+ * user would. Nothing is pinned at session start, so tests that inspect a widget
+ * must ask for it first.
+ */
+async function startSession(harness, surface = "box") {
   await harness.handlers.get("session_start")({}, harness.ctx);
   await new Promise((resolve) => setTimeout(resolve, 50));
+  if (surface) {
+    const usage = harness.commands.find((command) => command.name === "usage");
+    await usage.definition.handler(surface, harness.ctx);
+  }
 }
 
-test("the extension loads and registers /quota and /usage", async () => {
+test("the extension loads and registers /usage", async () => {
   const module = await import(EXTENSION);
   assert.equal(typeof module.default, "function");
 
   const harness = makeHarness();
   module.default(harness.pi);
 
-  assert.deepEqual(harness.commands.map((command) => command.name), ["quota", "usage"]);
+  assert.deepEqual(harness.commands.map((command) => command.name), ["usage"]);
   for (const command of harness.commands) {
     assert.equal(typeof command.definition.handler, "function");
     assert.equal(typeof command.definition.description, "string");
@@ -210,16 +219,65 @@ test("the extension loads and registers /quota and /usage", async () => {
   assert.equal(harness.forbidden.length, 0, "extension must not register context-affecting APIs");
 });
 
-test("the boxed widget is the default surface and the footer is left alone", async () => {
+test("the full panel lists every account while the box and the line keep one per family", async () => {
   const module = await import(EXTENSION);
-  const harness = makeHarness();
+  /** @param {number} slot @param {number} used */
+  const account = (slot, used) => ({
+    family: "opencode-go",
+    label: "OpenCode Go (Pi)",
+    primaryWindowId: "5h",
+    account: `#${slot}`,
+    slot: slot === 1 ? null : String(slot),
+    plan: "Go plan",
+    windows: [
+      { id: "5h", label: "5h window", usedPercent: used, remainingPercent: 100 - used, resetsAt: null, resetsInSec: 600, note: null },
+      { id: "monthly", label: "Monthly window", usedPercent: 100, remainingPercent: 0, resetsAt: null, resetsInSec: 900000, note: "rate-limited" },
+    ],
+    error: null,
+    ok: true,
+    updatedAt: "2030-01-01T00:00:00.000Z",
+    expiresInMin: null,
+  });
+  const harness = makeHarness({
+    report: {
+      generatedAt: "2030-01-01T00:00:00.000Z",
+      sources: [],
+      warnings: [],
+      providers: [account(1, 10), account(2, 50)],
+    },
+  });
   module.default(harness.pi);
   await startSession(harness);
 
-  const widget = renderWidget(harness.widgets.at(-1));
-  assert.ok(Array.isArray(widget), "the quota surface must be a Pi widget: gentle-pi truncates the footer from the end");
-  assert.equal(widget.length, 7, "the default surface is the five-row box with borders");
+  const box = plain(renderWidget(harness.widgets.at(-1)).join("\n"));
+  assert.equal((box.match(/OP-Go/g) ?? []).length, 1, "the box shows one row per family");
+
+  const usage = harness.commands.find((command) => command.name === "usage");
+  await usage.definition.handler("", harness.ctx);
+  const panelWidget = harness.widgets.at(-1);
+  const panel = plain((Array.isArray(panelWidget) ? panelWidget : panelWidget.render(100)).join("\n"));
+  assert.match(panel, /OP-Go #1/);
+  assert.match(panel, /OP-Go #2/);
+  assert.match(panel, /Monthly window/);
+
+  assert.equal((harness.notifications.at(-1).match(/OP-Go/g) ?? []).length, 1, "the summary names each family once");
+});
+
+test("no surface is pinned at session start and the footer is left alone", async () => {
+  const module = await import(EXTENSION);
+  const harness = makeHarness();
+  module.default(harness.pi);
+  await startSession(harness, null);
+
+  assert.equal(harness.widgets.at(-1), undefined, "nothing is pinned above the editor by default");
   assert.equal(harness.statuses.at(-1), undefined, "the footer must stay untouched by default");
+
+  const usage = harness.commands.find((command) => command.name === "usage");
+  assert.deepEqual(
+    usage.definition.getArgumentCompletions("").map((completion) => completion.value),
+    ["refresh", "line", "box", "panel", "hide", "status", "nostatus", "json"],
+    "every surface stays one subcommand away",
+  );
 });
 
 test("the boxed widget remains when sidebar symbols are present but inactive", async () => {
@@ -285,7 +343,7 @@ test("todo rail mounting suppresses the above-editor widget without ownsHost", a
   });
 });
 
-test("an inactive patched rail keeps the default box and allows opting into the compact line", async () => {
+test("an inactive patched rail keeps opt into the box and then the compact line", async () => {
   await withRailFixtures(async () => {
     const module = await import(EXTENSION);
     const harness = makeHarness();
@@ -297,10 +355,10 @@ test("an inactive patched rail keeps the default box and allows opting into the 
     const defaultLines = renderWidget(harness.widgets.at(-1), harness.ctx.ui.theme, 100, tui);
     assert.equal(defaultLines.length, 7, "the box remains the default when the rail is inactive");
 
-    const quota = harness.commands.find((command) => command.name === "quota");
-    await quota.definition.handler("line", harness.ctx);
+    const usage = harness.commands.find((command) => command.name === "usage");
+    await usage.definition.handler("line", harness.ctx);
     const lines = renderWidget(harness.widgets.at(-1), harness.ctx.ui.theme, 100, tui);
-    assert.equal(lines.length, 1, "explicit /quota line opts into the compact surface");
+    assert.equal(lines.length, 1, "explicit /usage line opts into the compact surface");
     assert.match(plain(lines[0]), /Claude:○\s+4%/);
   }, { patched: true });
 });
@@ -325,7 +383,7 @@ test("an unpatched active rail uses the runtime hook without changing gentle-pi 
     assert.equal(readFileSync(layoutPath, "utf-8"), originalLayout, "an unpatched layout stays byte-for-byte pristine");
     assert.equal(existsSync(`${layoutPath}.pi-quota-backup`), false, "startup creates no patch backup");
     assert.equal(originalLayout, STOCK_RAIL);
-    assert.equal(harness.notifications.length, 0, "runtime fallback needs no restart warning");
+    assert.equal(harness.notifications.some((message) => /restart/i.test(message)), false, "runtime fallback needs no restart warning");
     const chainedFooter = state.parts.get("footer");
     assert.notEqual(chainedFooter, originalFooter);
     assert.ok(state.parts.has("quota"), "the runtime quota part remains registered");
@@ -354,7 +412,7 @@ test("a gentle-pi update that removes the rail slot stays untouched and needs no
     module.default(second.pi);
     await startSession(second);
     assert.equal(readFileSync(layoutPath, "utf-8"), STOCK_RAIL, "a package update remains unmodified");
-    assert.equal(second.notifications.length, 0, "the runtime fallback does not ask for a restart");
+    assert.equal(second.notifications.some((message) => /restart/i.test(message)), false, "the runtime fallback does not ask for a restart");
   }, { patched: true });
 });
 
@@ -438,11 +496,11 @@ test("the bare command reveals the full panel and summarises used percent", asyn
   const module = await import(EXTENSION);
   const harness = makeHarness();
   module.default(harness.pi);
-  const quota = harness.commands.find((command) => command.name === "quota");
-  await quota.definition.handler("", harness.ctx);
+  const usage = harness.commands.find((command) => command.name === "usage");
+  await usage.definition.handler("", harness.ctx);
 
   const widget = harness.widgets.at(-1);
-  assert.ok(widget.length > 1, "the panel lists every window");
+  assert.ok(Array.isArray(widget) && widget.length > 1, "the panel lists every window");
   const text = plain(widget.join("\n"));
   assert.match(text, /5h window/);
   assert.match(text, /Weekly window/);
@@ -457,24 +515,24 @@ test("subcommands toggle the line, the panel, the footer and hide everything", a
   const module = await import(EXTENSION);
   const harness = makeHarness();
   module.default(harness.pi);
-  const quota = harness.commands.find((command) => command.name === "quota");
+  const usage = harness.commands.find((command) => command.name === "usage");
 
-  await quota.definition.handler("panel", harness.ctx);
+  await usage.definition.handler("panel", harness.ctx);
   assert.ok(harness.widgets.at(-1).length > 1);
 
-  await quota.definition.handler("line", harness.ctx);
+  await usage.definition.handler("line", harness.ctx);
   assert.equal(renderWidget(harness.widgets.at(-1)).length, 1);
 
-  await quota.definition.handler("box", harness.ctx);
+  await usage.definition.handler("box", harness.ctx);
   assert.equal(renderWidget(harness.widgets.at(-1)).length, 7);
 
-  await quota.definition.handler("status", harness.ctx);
+  await usage.definition.handler("status", harness.ctx);
   assert.match(plain(harness.statuses.at(-1)), /Claude:○ 4%/);
 
-  await quota.definition.handler("nostatus", harness.ctx);
+  await usage.definition.handler("nostatus", harness.ctx);
   assert.equal(harness.statuses.at(-1), undefined);
 
-  await quota.definition.handler("hide", harness.ctx);
+  await usage.definition.handler("hide", harness.ctx);
   assert.equal(harness.widgets.at(-1), undefined);
 });
 
@@ -486,8 +544,8 @@ test("a failing CLI reports an error instead of throwing", async () => {
 
   assert.match(plain(renderWidget(harness.widgets.at(-1)).join("\n")), /quota …/);
 
-  const quota = harness.commands.find((command) => command.name === "quota");
-  await quota.definition.handler("", harness.ctx);
+  const usage = harness.commands.find((command) => command.name === "usage");
+  await usage.definition.handler("", harness.ctx);
   assert.ok(harness.notifications.some((message) => message.startsWith("Quota unavailable")));
 });
 
@@ -512,19 +570,19 @@ test("the line stays compact enough to fit one row", async () => {
   assert.ok(visible.split("\n").every((line) => line.length <= 100), `box too wide: ${visible}`);
 });
 
-test("the first paint says loading, not unavailable", async () => {
+test("the panel is only painted after /usage asks for it", async () => {
   const module = await import(EXTENSION);
   const harness = makeHarness();
   module.default(harness.pi);
+  await startSession(harness, null);
 
-  // Paint before the async refresh resolves.
-  await harness.handlers.get("session_start")({}, harness.ctx);
-  const first = plain(renderWidget(harness.widgets.at(-1)).join("\n"));
-  assert.match(first, /quota …/);
-  assert.equal(/unavailable/.test(first), false, "no false error before the first fetch");
+  assert.equal(harness.widgets.at(-1), undefined, "session start paints no surface");
 
-  await new Promise((resolve) => setTimeout(resolve, 50));
-  assert.match(plain(renderWidget(harness.widgets.at(-1)).join("\n")), /Claude:\s+○\s+4%/);
+  const usage = harness.commands.find((command) => command.name === "usage");
+  await usage.definition.handler("panel", harness.ctx);
+  const panel = plain(harness.widgets.at(-1).join("\n"));
+  assert.match(panel, /Claude/);
+  assert.match(panel, /5h window/, "the panel shows the fetched windows, not a loading placeholder");
 });
 
 test("unconfigured providers are omitted from the editor line and summary", async () => {
@@ -589,8 +647,8 @@ test("unconfigured providers are omitted from the editor line and summary", asyn
     },
   });
   module.default(harness.pi);
-  const quota = harness.commands.find((command) => command.name === "quota");
-  await quota.definition.handler("line", harness.ctx);
+  const usage = harness.commands.find((command) => command.name === "usage");
+  await usage.definition.handler("line", harness.ctx);
 
   const visible = plain(renderWidget(harness.widgets.at(-1)).join("\n"));
   // When only Claude and Codex are in auth.json, only those two appear!
@@ -624,8 +682,8 @@ test("renderLine distinguishes transient / throttle / expired / auth with catego
     theme: { fg: (key, text) => `[${key}:${text}]`, bold: (text) => text },
   });
   module.default(harness.pi);
-  const quota = harness.commands.find((command) => command.name === "quota");
-  await quota.definition.handler("line", harness.ctx);
+  const usage = harness.commands.find((command) => command.name === "usage");
+  await usage.definition.handler("line", harness.ctx);
 
   const line = plain(renderWidget(harness.widgets.at(-1), harness.ctx.ui.theme).join("\n"));
   assert.match(line, /transient:\[warning:~\]/);
@@ -654,8 +712,8 @@ test("renderLine excludes notConfigured providers using the flag, not the error 
     },
   });
   module.default(harness.pi);
-  const quota = harness.commands.find((command) => command.name === "quota");
-  await quota.definition.handler("line", harness.ctx);
+  const usage = harness.commands.find((command) => command.name === "usage");
+  await usage.definition.handler("line", harness.ctx);
 
   const line = plain(renderWidget(harness.widgets.at(-1)).join("\n"));
   assert.match(line, /Codex:\?/);
@@ -682,8 +740,8 @@ test("when mergeLastGood restores a transient failure, the line paints the carri
   const line = plain(renderWidget(harness.widgets.at(-1)).join("\n"));
   assert.match(line, /Claude:\s+○\s+4%/);
   assert.equal(line.includes("Claude:!"), false);
-  const quota = harness.commands.find((command) => command.name === "quota");
-  await quota.definition.handler("", harness.ctx);
+  const usage = harness.commands.find((command) => command.name === "usage");
+  await usage.definition.handler("", harness.ctx);
   assert.match(plain(harness.widgets.at(-1).join("\n")), /last known values, 1 min old/);
 });
 
@@ -701,8 +759,8 @@ test("renderPanel footer lists notConfigured providers using the flag", async ()
     },
   });
   module.default(harness.pi);
-  const quota = harness.commands.find((command) => command.name === "quota");
-  await quota.definition.handler("panel", harness.ctx);
+  const usage = harness.commands.find((command) => command.name === "usage");
+  await usage.definition.handler("panel", harness.ctx);
 
   const panel = plain(harness.widgets.at(-1).join("\n"));
   assert.match(panel, /Codex/);
@@ -710,7 +768,7 @@ test("renderPanel footer lists notConfigured providers using the flag", async ()
   assert.equal(/not configured in Pi: Claude/.test(panel), false);
 });
 
-test("the bare /quota summary uses category captions, not the word unavailable for everything", async () => {
+test("the bare /usage summary uses category captions, not the word unavailable for everything", async () => {
   const module = await import(EXTENSION);
   const harness = makeHarness({
     report: {
@@ -721,8 +779,8 @@ test("the bare /quota summary uses category captions, not the word unavailable f
     },
   });
   module.default(harness.pi);
-  const quota = harness.commands.find((command) => command.name === "quota");
-  await quota.definition.handler("", harness.ctx);
+  const usage = harness.commands.find((command) => command.name === "usage");
+  await usage.definition.handler("", harness.ctx);
 
   const summary = harness.notifications.at(-1);
   assert.match(summary, /Claude: token expired/);
@@ -760,10 +818,36 @@ test("the panel names the Claude store, and the line never does", async () => {
   assert.equal(/Claude Code CLI/.test(line), false, "the compact widget must stay short");
   assert.match(line, /Claude:\s+○\s+10%/);
 
-  const quota = harness.commands.find((command) => command.name === "quota");
-  await quota.definition.handler("", harness.ctx);
+  const usage = harness.commands.find((command) => command.name === "usage");
+  await usage.definition.handler("", harness.ctx);
   const panel = plain(harness.widgets.at(-1).join("\n"));
   assert.match(panel, /Claude Code CLI/, "the panel says which store was read");
+});
+
+test("agent_end is a no-op while no surface is on", async () => {
+  const previousDebounce = process.env.PI_QUOTA_EVENT_DEBOUNCE_MS;
+  process.env.PI_QUOTA_EVENT_DEBOUNCE_MS = "20";
+  try {
+    const module = await import(EXTENSION);
+    let execCalls = 0;
+    const harness = makeHarness();
+    const originalExec = harness.pi.exec;
+    /** @type {(...args: any[]) => Promise<any>} */
+    harness.pi.exec = async (...args) => {
+      execCalls++;
+      return originalExec(...args);
+    };
+    module.default(harness.pi);
+    await startSession(harness, null);
+    const initialCalls = execCalls;
+
+    await harness.handlers.get("agent_end")({}, harness.ctx);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.equal(execCalls, initialCalls, "no surface is visible, so nothing polls");
+  } finally {
+    if (previousDebounce === undefined) delete process.env.PI_QUOTA_EVENT_DEBOUNCE_MS;
+    else process.env.PI_QUOTA_EVENT_DEBOUNCE_MS = previousDebounce;
+  }
 });
 
 test("agent_end triggers a debounced quota refresh and agent_start cancels pending", async () => {

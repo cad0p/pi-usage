@@ -23,6 +23,8 @@
  * @property {string} family
  * @property {string} label
  * @property {string} account              Display identity (email or short id).
+ * @property {string | null} [slot]         Numbered sibling account ("2"), or null
+ *                                          for the base entry of a family.
  * @property {string | null} plan
  * @property {QuotaWindow[]} windows
  * @property {string | null} error         Degradation message; null when healthy.

@@ -43,6 +43,8 @@ const MAX_WINDOWS_PROFILES = 40;
  * @typedef {Object} PiCredential
  * @property {string} provider            Raw Pi provider key, e.g. "openai-codex".
  * @property {string} family              Normalized family, e.g. "codex".
+ * @property {string | null} slot         Numbered sibling account, e.g. "2" for
+ *                                        "opencode-go-2"; null for the base entry.
  * @property {string} label               Display label, e.g. "Codex (Pi)".
  * @property {string} source              Absolute path the credential came from.
  * @property {"pi" | "claude-code"} [sourceKind]  Which kind of store produced it.
@@ -200,6 +202,33 @@ function fingerprint(parts) {
 }
 
 /**
+ * Resolve a raw auth.json key onto a family and, when it is a numbered sibling,
+ * its slot.
+ *
+ * Pi's own identifiers are the only base providers. Everything else follows the
+ * convention used by multi-account providers: `<base>-<account>`, where the
+ * account starts at the FIRST `-<digits>` boundary. That boundary is what makes
+ * "opencode-go-2" a slot 2 of "opencode-go" and "opencode-2-work" a slot
+ * "2-work" of "opencode" (an unknown base, therefore ignored) rather than a
+ * slot "work" of "opencode-2".
+ *
+ * @param {string} provider
+ * @returns {{ base: string, family: string, slot: string | null } | null}
+ */
+export function resolveProviderSlot(provider) {
+  if (typeof provider !== "string" || provider === "") return null;
+  const family = FAMILY_BY_PROVIDER[provider];
+  if (family) return { base: provider, family, slot: null };
+
+  const match = /^(.*?)-(\d.*)$/.exec(provider);
+  if (!match) return null;
+  const [, base, account] = match;
+  const siblingFamily = FAMILY_BY_PROVIDER[base];
+  if (!siblingFamily || account === "") return null;
+  return { base, family: siblingFamily, slot: account };
+}
+
+/**
  * Normalize one raw auth.json entry into a credential.
  *
  * @param {string} provider
@@ -208,8 +237,9 @@ function fingerprint(parts) {
  * @returns {PiCredential | null}
  */
 export function normalizeCredential(provider, raw, source) {
-  const family = FAMILY_BY_PROVIDER[provider];
-  if (!family || !raw || typeof raw !== "object") return null;
+  const resolved = resolveProviderSlot(provider);
+  if (!resolved || !raw || typeof raw !== "object") return null;
+  const { base, family, slot } = resolved;
 
   const kind = raw.type === "api_key" ? "api_key" : "oauth";
   const access = text(raw.access);
@@ -223,12 +253,16 @@ export function normalizeCredential(provider, raw, source) {
   const planType = text(raw.planType) ?? (access ? extractChatGptPlanType(access) : null);
   const expiresAtMs = epochMs(raw.expires) ?? (access ? extractExpiresAtMs(access) : null);
 
+  // Fingerprint on the BASE provider, not the raw slot id: the same secret in
+  // "opencode-go" and "opencode-go-2" must still collapse to one credential,
+  // while different secrets in two slots stay distinct.
   const secretMaterial = access ?? key ?? refresh ?? "";
-  const identity = accountId ?? email ?? projectId ?? fingerprint([provider, secretMaterial]);
+  const identity = accountId ?? email ?? projectId ?? fingerprint([base, secretMaterial]);
 
   return {
     provider,
     family,
+    slot,
     label: LABEL_BY_FAMILY[family],
     source,
     sourceKind: "pi",
@@ -278,7 +312,7 @@ export function readAuthStore(path) {
   }
 
   for (const [provider, entry] of Object.entries(parsed)) {
-    if (!FAMILY_BY_PROVIDER[provider]) continue;
+    if (!resolveProviderSlot(provider)) continue;
     if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
       warnings.push(`${path}: ${provider} entry is not an object`);
       continue;
@@ -327,8 +361,35 @@ export function loadPiCredentials(options = {}) {
     }
   }
 
-  credentials.sort((a, b) => a.family.localeCompare(b.family));
+  credentials.sort(compareCredentials);
   return { credentials, paths: usedPaths, warnings, rawProviders: Array.from(rawProviders) };
+}
+
+/**
+ * Slot order inside a family: the base entry first, then siblings by their
+ * leading number. Plain string comparison would put "#10" before "#2", which
+ * reads as a shuffled account list in every renderer.
+ *
+ * @param {string | null} slot
+ * @returns {number}
+ */
+function slotOrder(slot) {
+  if (slot === null) return -1;
+  const numeric = Number.parseInt(slot, 10);
+  return Number.isFinite(numeric) ? numeric : Number.MAX_SAFE_INTEGER;
+}
+
+/**
+ * @param {PiCredential} a
+ * @param {PiCredential} b
+ * @returns {number}
+ */
+function compareCredentials(a, b) {
+  const byFamily = a.family.localeCompare(b.family);
+  if (byFamily !== 0) return byFamily;
+  const bySlot = slotOrder(a.slot) - slotOrder(b.slot);
+  if (bySlot !== 0) return bySlot;
+  return String(a.slot ?? "").localeCompare(String(b.slot ?? ""));
 }
 
 /**

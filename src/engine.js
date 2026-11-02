@@ -293,6 +293,9 @@ export async function collectQuota(options = {}) {
             stores: options.stores,
             allowBrowser: options.allowBrowser,
           });
+          // The renderers group siblings by family; the record builder needs the
+          // slot to label each account without re-parsing its display string.
+          result.slot = credential.slot ?? null;
           if (isThrottled(result.error)) {
             const seconds = recordBackoff(family, {
               retryAfterSec: retryAfterFromError(result.error),
@@ -307,17 +310,17 @@ export async function collectQuota(options = {}) {
           results.push(result);
         } catch (error) {
           // A provider must never take the whole report down.
-          results.push(
-            degradedResult({
-              family,
-              label: credential.label,
-              account: credential.email ?? credential.accountId ?? "unknown",
-              error: `provider crashed: ${/** @type {{ message?: string }} */ (error)?.message ?? String(error)}`,
-              source: credential.source,
-              now,
-              expiresInMin: freshness.expiresInMin,
-            }),
-          );
+          const crashed = degradedResult({
+            family,
+            label: credential.label,
+            account: credential.email ?? credential.accountId ?? "unknown",
+            error: `provider crashed: ${/** @type {{ message?: string }} */ (error)?.message ?? String(error)}`,
+            source: credential.source,
+            now,
+            expiresInMin: freshness.expiresInMin,
+          });
+          crashed.slot = credential.slot ?? null;
+          results.push(crashed);
         }
       }
       byFamily[family] = results;

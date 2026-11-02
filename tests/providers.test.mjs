@@ -13,6 +13,7 @@ import { fetchQuota as fetchClaude } from "../src/providers/claude.js";
 import { fetchQuota as fetchCodex } from "../src/providers/codex.js";
 import { fetchQuota as fetchAntigravity } from "../src/providers/antigravity.js";
 import { fetchQuota as fetchOpenCodeGo } from "../src/providers/opencode-go.js";
+import { errorKind } from "../src/providers/error-kind.js";
 import { normalizeCredential } from "../src/auth/pi-auth.js";
 import { redact } from "../src/http.js";
 import {
@@ -126,7 +127,10 @@ test("antigravity: the license 403 becomes an actionable message", async () => {
 });
 
 test("opencode-go: without dashboard credentials it degrades and explains the missing fields", async () => {
-  const { fetchFn } = routedFetch([["opencode.ai/zen", () => jsonResponse({ object: "list", data: [{ id: "m1" }] })]]);
+  const { fetchFn } = routedFetch([
+    ["zen/go/v1/usage", () => jsonResponse({}, { status: 404 })],
+    ["opencode.ai/zen", () => jsonResponse({ object: "list", data: [{ id: "m1" }] })],
+  ]);
   const credential = normalizeCredential("opencode-go", { type: "api_key", key: "sk-FAKE-zen" }, "/tmp/auth.json");
   assert.ok(credential);
 
@@ -138,12 +142,114 @@ test("opencode-go: without dashboard credentials it degrades and explains the mi
 });
 
 test("opencode-go: a rejected Zen key is reported as a credential problem", async () => {
-  const { fetchFn } = routedFetch([["opencode.ai/zen", () => jsonResponse({}, { status: 401 })]]);
+  const { fetchFn } = routedFetch([
+    ["zen/go/v1/usage", () => jsonResponse({}, { status: 404 })],
+    ["opencode.ai/zen", () => jsonResponse({}, { status: 401 })],
+  ]);
   const credential = normalizeCredential("opencode-go", { type: "api_key", key: "sk-FAKE-zen" }, "/tmp/auth.json");
   assert.ok(credential);
   const result = await fetchOpenCodeGo(credential, { now: NOW, fetchFn, env: {}, stores: [], allowBrowser: false });
   assert.equal(result.ok, false);
   assert.match(result.error ?? "", /rejected by OpenCode Zen/);
+});
+
+/** The verbatim shape of /zen/go/v1/usage, including a rate-limited month. */
+function goUsageBody() {
+  return {
+    usage: {
+      rolling: { status: "ok", percent: 0, resetsAt: "2026-11-02T23:44:34.385Z" },
+      weekly: { status: "ok", percent: 9, resetsAt: "2026-11-09T00:00:00.000Z" },
+      monthly: { status: "rate-limited", percent: 100, resetsAt: "2026-11-21T15:22:17.000Z" },
+    },
+  };
+}
+
+test("opencode-go: the API key reads its own 5h/weekly/monthly windows", async () => {
+  const { fetchFn, calls } = routedFetch([["zen/go/v1/usage", () => jsonResponse(goUsageBody())]]);
+  const base = normalizeCredential("opencode-go", { type: "api_key", key: "sk-FAKE-base" }, "/tmp/auth.json");
+  const sibling = normalizeCredential("opencode-go-2", { type: "api_key", key: "sk-FAKE-two" }, "/tmp/auth.json");
+  assert.ok(base && sibling);
+
+  const first = await fetchOpenCodeGo(base, { now: NOW, fetchFn, env: {}, stores: [], allowBrowser: false });
+  assert.equal(first.ok, true);
+  assert.equal(first.account, "#1");
+  assert.equal(first.plan, "Go plan");
+  assert.deepEqual(first.windows.map((window) => window.id), ["5h", "weekly", "monthly"]);
+  assert.deepEqual(first.windows.map((window) => window.usedPercent), [0, 9, 100]);
+  assert.deepEqual(first.windows.map((window) => window.windowSeconds), [18000, 604800, 2592000]);
+  assert.equal(first.windows[2].note, "rate-limited");
+  assert.equal(first.windows[1].resetsAt, "2026-11-09T00:00:00.000Z");
+
+  const second = await fetchOpenCodeGo(sibling, { now: NOW, fetchFn, env: {}, stores: [], allowBrowser: false });
+  assert.equal(second.ok, true);
+  assert.equal(second.account, "#2");
+
+  assert.equal(calls.length, 2, "the key path must not probe the dashboard or the Zen model list");
+  const headers = /** @type {Record<string, string>} */ (calls[0].init.headers);
+  assert.equal(headers.Authorization, "Bearer sk-FAKE-base");
+});
+
+test("opencode-go: a 401 is an auth failure, not a session fallback", async () => {
+  const { fetchFn, calls } = routedFetch([
+    ["zen/go/v1/usage", () => jsonResponse({ type: "error", error: { type: "AuthError", message: "Unauthorized" } }, { status: 401 })],
+  ]);
+  const credential = normalizeCredential("opencode-go-8", { type: "api_key", key: "sk-FAKE-revoked" }, "/tmp/auth.json");
+  assert.ok(credential);
+
+  const result = await fetchOpenCodeGo(credential, { now: NOW, fetchFn, env: {}, stores: [], allowBrowser: false });
+  assert.equal(result.ok, false);
+  assert.equal(result.account, "#8");
+  assert.equal(errorKind(result.error), "auth");
+  assert.match(result.error ?? "", /OpenCode Go key rejected \(401\)/);
+  assert.equal(calls.length, 1);
+});
+
+test("opencode-go: a 403 says the workspace has no Go plan instead of claiming a bad key", async () => {
+  const { fetchFn } = routedFetch([
+    ["zen/go/v1/usage", () => jsonResponse({ type: "error", error: { type: "api_error", message: "Workspace access denied" } }, { status: 403 })],
+  ]);
+  const credential = normalizeCredential("opencode-go-11", { type: "api_key", key: "sk-FAKE-noplan" }, "/tmp/auth.json");
+  assert.ok(credential);
+
+  const result = await fetchOpenCodeGo(credential, { now: NOW, fetchFn, env: {}, stores: [], allowBrowser: false });
+  assert.equal(result.ok, false);
+  assert.equal(errorKind(result.error), "auth");
+  assert.match(result.error ?? "", /Go plan not active for this key's workspace \(403 Workspace access denied\)/);
+  assert.equal((result.error ?? "").includes("sk-FAKE"), false);
+});
+
+test("opencode-go: a 429 stays throttled so the family backs off", async () => {
+  const { fetchFn } = routedFetch([["zen/go/v1/usage", () => jsonResponse({}, { status: 429 })]]);
+  const credential = normalizeCredential("opencode-go", { type: "api_key", key: "sk-FAKE-zen" }, "/tmp/auth.json");
+  assert.ok(credential);
+
+  const result = await fetchOpenCodeGo(credential, { now: NOW, fetchFn, env: {}, stores: [], allowBrowser: false });
+  assert.equal(result.ok, false);
+  assert.equal(errorKind(result.error), "throttle");
+  assert.match(result.error ?? "", /429/);
+});
+
+test("opencode-go: a 404 falls back to the dashboard for the base account only", async () => {
+  const baseRoutes = [
+    ["zen/go/v1/usage", () => jsonResponse({}, { status: 404 })],
+    ["opencode.ai/zen", () => jsonResponse({ object: "list", data: [{ id: "m1" }] })],
+  ];
+  const { fetchFn, calls } = routedFetch(baseRoutes);
+  const base = normalizeCredential("opencode-go", { type: "api_key", key: "sk-FAKE-zen" }, "/tmp/auth.json");
+  const sibling = normalizeCredential("opencode-go-3", { type: "api_key", key: "sk-FAKE-three" }, "/tmp/auth.json");
+  assert.ok(base && sibling);
+
+  const baseResult = await fetchOpenCodeGo(base, { now: NOW, fetchFn, env: {}, stores: [], allowBrowser: false });
+  assert.equal(baseResult.ok, false);
+  assert.match(baseResult.error ?? "", /Pi OpenCode key is valid \(1 Zen models visible\)/);
+  assert.match(baseResult.error ?? "", /piquota auth opencode/);
+  const baseCalls = calls.length;
+  assert.ok(baseCalls >= 2, "base falls back to the session path");
+
+  const siblingResult = await fetchOpenCodeGo(sibling, { now: NOW, fetchFn, env: {}, stores: [], allowBrowser: false });
+  assert.equal(siblingResult.ok, false);
+  assert.match(siblingResult.error ?? "", /only covers the base account/);
+  assert.equal(calls.length, baseCalls + 1, "a sibling must not reuse the base workspace session");
 });
 
 test("redact removes credentials and e-mails from any leaked text", () => {

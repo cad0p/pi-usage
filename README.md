@@ -1,17 +1,27 @@
-# pi-quota
+# pi-usage
 
 One source of truth for quota: **the credentials Pi already owns**.
+
+> [!NOTE]
+> `@cad0p/pi-usage` is a fork of [J3pf/piQuota](https://github.com/J3pf/piQuota) (`@j3pf/piquota`). It adds:
+>
+> * **OpenCode Go from the API key**: `GET https://opencode.ai/zen/go/v1/usage` returns the rolling (5h), weekly and monthly windows for the key Pi already stores, so no browser session is needed.
+> * **Numbered accounts**: `auth.json` entries such as `opencode-go-2` … `opencode-go-14` (the [pi-fallback-provider](https://github.com/cad0p/pi-fallback-provider) sibling convention) are read as extra accounts of their base provider.
+> * **One Omarchy tab per provider**: a multi-account provider shows each account's binding window (`#2 · Monthly`) in a single tab, and summarises failed accounts.
+> * **`/usage` on demand**: the Pi command is `/usage` only, and nothing is pinned above the editor or in the footer unless you ask for it.
+>
+> Everything below still applies; the CLI is still called `piquota`.
 
 `pi-quota` is a standalone project. It does not import, invoke or modify
 shuvquota, and it never writes to a credential file.
 
 > [!TIP]
-> **Working with AI Agents?** See [AGENTS.md](AGENTS.md) for architectural boundaries, test runner commands, and hard invariants for AI coding agents.
+> **Working with AI Agents?** See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for architectural boundaries, test runner commands, and hard invariants for AI coding agents.
 
 | Surface | Command |
 | --- | --- |
 | Terminal | `piquota` · `piquota --json` · `piquota --status` · `piquota --compact` |
-| Pi TUI | `/quota` · `/usage` |
+| Pi TUI | `/usage` |
 | External / `rp-host` / automation | `piquota --json` (structured JSON feed with `primaryWindowId` and countdowns) |
 | Omarchy Bar Panel | `piquota omarchy` (or systemd user timer via `--omarchy-timer`) |
 
@@ -34,9 +44,9 @@ shuvquota, and it never writes to a credential file.
   token the installed `claude` owns. `~/.claude.json` is read only for the account
   e-mail and display name; its project history is never touched.
 * Browser cookie databases are copied to a private temp dir and opened
-  read-only. This is only used to fetch the opencode.ai session cookie that Pi
-  does not store.
-* `/quota` never injects quota into the LLM context: the extension only calls
+  read-only. This is only used for the OpenCode Go fallback, when the key usage
+  endpoint is gone and no session cookie is configured.
+* `/usage` never injects quota into the LLM context: the extension only calls
   `ui.setStatus`, `ui.setWidget` and `ui.notify`.
 * Nothing is written outside these paths:
 
@@ -55,7 +65,7 @@ shuvquota, and it never writes to a credential file.
 | Claude | Claude Code CLI store, else `anthropic.access` | `GET api.anthropic.com/api/oauth/usage` | ✅ 5h + weekly + plan |
 | Codex | `openai-codex.access` + `accountId` | `GET chatgpt.com/backend-api/wham/usage` | ✅ 5h + weekly + plan |
 | Antigravity | `antigravity.access` + `projectId` | `POST cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary` | ✅ Gemini + Claude/GPT buckets, **with in-memory refresh** |
-| OpenCode Go | opencode.ai session cookie | `GET opencode.ai/workspace/<id>/go` | ✅ weekly + monthly, verified live |
+| OpenCode Go | `opencode-go.key`, numbered siblings included | `GET opencode.ai/zen/go/v1/usage` | ✅ 5h + weekly + monthly per account; the session cookie and SSR dashboard are a base-account fallback |
 | GitHub Actions (opt-in) | Authenticated `gh` CLI | `gh api /organizations/<org>/settings/billing/usage/summary?product=Actions` | ✅ org-wide monthly Linux minutes, plan-derived allowance |
 
 Four findings worth recording, each of which cost a wrong hypothesis:
@@ -63,10 +73,13 @@ Four findings worth recording, each of which cost a wrong hypothesis:
 1. **Antigravity needs the CLI `User-Agent`.** Without
    `User-Agent: antigravity/cli/...` the backend answers
    `403 You do not have a valid license of this product` for a healthy token.
-2. **Pi's `opencode-go` entry is an OpenCode Zen API key, not a Go session.** It
-   validates (`/zen/v1/models` → 200, 70 models) but exposes no usage, and every
-   `/api/*` path on opencode.ai returns 404: the Go windows only exist in the
-   authenticated SSR page.
+2. **Pi's `opencode-go` entry is an OpenCode Zen API key, and that key reads its
+   own Go usage.** `GET /zen/go/v1/usage` answers with the rolling (5h), weekly
+   and monthly windows for the key's workspace; `401` means the key was revoked
+   and `403 Workspace access denied` means the key is valid but its workspace has
+   no Go plan. Only a `404` (endpoint gone) or an entry without a key falls back
+   to the session cookie and the authenticated SSR dashboard, and only for the
+   base account, because one browser session belongs to one workspace.
 3. **`primaryWindowId` identifies the most urgent window.** The CLI computes the
    shortest, most pressing window (e.g. 5h session before weekly) so downstream UI
    consumers like `rp-host` and the Pi TUI render priority pills without reimplementing
@@ -118,7 +131,7 @@ the `read:org`, `repo`, and `workflow` scopes may be required.
 
 ## Prerequisites & Installation
 
-* **Node.js >= 20.0.0** (native `node:sqlite` and global `fetch` support; zero npm dependencies).
+* **Node.js >= 22.19.0** (native `node:sqlite` and global `fetch` support; zero npm dependencies).
 * **[Pi Coding Agent](https://github.com/earendil-works/pi)** (`pi`).
 * **[Gentle AI](https://github.com/Gentleman-Programming/gentle-pi)** (`gentle-pi`).
 * Platform support: Linux, WSL2, macOS. See [docs/OS-COMPATIBILITY.md](docs/OS-COMPATIBILITY.md) for OS-specific details.
@@ -126,22 +139,24 @@ the `read:org`, `repo`, and `workflow` scopes may be required.
 ### 1-Line Quick Install
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/J3fp/piQuota/master/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/cad0p/pi-usage/main/install.sh | bash
 ```
 
 ### Install the Pi extension from npm
 
 ```bash
-pi install npm:@j3pf/piquota
+pi install npm:@cad0p/pi-usage
 ```
 
 Loads both Pi extensions straight from the package. The quota panel resolves
 the CLI from inside the package, so nothing else is required to see quotas in
 the TUI.
+When you also run `install.sh` for the terminal CLI, pass
+`--no-extension` so the two copies cannot drift apart.
 
 | Capability | `pi install npm:` | `install.sh` |
 | --- | --- | --- |
-| TUI panel, sidebar and `/quota` | yes | yes |
+| TUI panel, sidebar and `/usage` | yes | yes |
 | Omarchy bar records | yes, written on every refresh | yes |
 | `piquota` on your `PATH` for terminal use | no | yes, symlinked |
 | Omarchy sync while Pi is closed | no | yes, with `--omarchy-timer` |
@@ -154,14 +169,16 @@ sync while Pi is not running.
 ### Manual Install / Development
 
 ```bash
-git clone https://github.com/J3fp/piQuota.git
-cd piQuota
-./install.sh              # --link for development, --uninstall to remove
+git clone https://github.com/cad0p/pi-usage.git
+cd pi-usage
+./install.sh                 # --link for development, --uninstall to remove
+./install.sh --no-extension  # CLI only; keep the Pi extension installed as a package
 ```
 
 No sudo. It validates Node, Pi and Gentle AI, reports which Claude source it found,
 copies the project to `~/.local/share/pi-quota`, symlinks `~/.local/bin/piquota`,
-installs the Pi TUI extension,
+installs the Pi TUI extension (and its gentle-pi rail slot) unless `--no-extension`
+is given,
 and removes the previous generation's `shuvquota` shim so upstream `/usr/bin/shuvquota`
 is reachable again.
 
@@ -209,19 +226,24 @@ Inside Pi:
 
 | Command | Effect |
 | --- | --- |
-| `/quota` | refresh, reveal the panel, notify a one-line summary |
-| `/quota box` | pin the five-row box above the editor (the default surface) |
-| `/quota line` | pin the compact line above the editor, in its own row |
-| `/quota panel` | full boxed panel above the editor |
-| `/quota hide` | hide the panel/line |
-| `/quota status` / `nostatus` | enable/disable the footer status |
-| `/quota refresh` | refresh only |
-| `/quota json` | where the cached report lives |
-| `/usage` | alias of `/quota` |
+| `/usage` | one on-demand refresh, show the full panel, notify a one-line summary |
+| `/usage box` | pin the five-row box above the editor |
+| `/usage line` | pin the compact line above the editor, in its own row |
+| `/usage panel` | full boxed panel above the editor |
+| `/usage hide` | hide the panel/line and stop background refresh until a surface is on again |
+| `/usage status` / `nostatus` | enable/disable the footer status |
+| `/usage refresh` | refresh only |
+| `/usage json` | where the cached report lives |
 
 ### The Pi surface
 
-By default the extension pins the **five-row box above the editor**:
+Nothing is pinned by default: `/usage` is a one-shot command, so it claims no row
+above the editor and leaves the footer alone. Turn a surface on with `/usage box`,
+`/usage line`, `/usage panel` or `/usage status`; only then does the extension keep
+it fresh with a background refresh (and a gentle refresh after each agent turn).
+`/usage hide` gives the row back.
+
+`/usage box` pins the **five-row box above the editor**:
 
 ```
               ╭─ Quota ──────────────────╮
@@ -246,7 +268,7 @@ the numbers are not shown twice. See [the rail slot](#the-gentle-pi-rail-slot).
   in Pi, only Claude and Codex appear in the line and on Moshi (no empty warning
   icons for providers you don't use);
 * `NO_COLOR` / `TERM=dumb` drops the colours and keeps the glyphs;
-* the window shown is the **shortest** one (5h first), and `/quota` expands every
+* the window shown is the **shortest** one (5h first), and `/usage` expands every
   window with a used-fraction bar and the reset countdown.
 
 Pi's theme only exposes a fixed palette, so brand colours are emitted as
@@ -266,7 +288,7 @@ while (segments.length > 1 && visibleWidth(left) > width) segments.pop();
 Extension statuses render last, so a footer status is the first thing discarded —
 which is why a long status line appears and then vanishes once the bar fills with
 cost, branch and usage data. The quota line therefore lives in its own row, where
-nothing competes for it. `/quota status` still enables the footer variant for
+nothing competes for it. `/usage status` still enables the footer variant for
 anyone who wants it.
 
 ### The gentle-pi rail slot
@@ -406,6 +428,11 @@ piquota omarchy                  # write pi-claude.json, pi-codex.json, ... once
 - A provider with a failing sign-in shows a status and a help line instead of
   limits. A provider that is not configured gets no record, and a stale
   `pi-*.json` is removed on the next run.
+- A family with several accounts (numbered `<base>-<slot>` entries in
+  `auth.json`) still gets **one** record: every healthy account contributes only
+  the window that constrains it, titled `#<slot> · Session|Weekly|Monthly`, and
+  failed accounts add no rows but are summarised by reason, e.g.
+  `#8–#10 key rejected · #11–#14 no Go plan`.
 - Omarchy's native collector already tracks Claude with richer local statistics, so
   `piquota omarchy` automatically skips `claude` and cleans up duplicate `pi-claude.json`
   files when `claude.json` exists in the usage directory (override with `PI_QUOTA_OMARCHY_SKIP`).
@@ -439,7 +466,7 @@ src/exec.js                    the one place that spawns gh CLI binary
 src/http.js                    fetch wrapper: timeouts, JSON, redaction
 contrib/systemd/               user service and timer behind `install.sh --omarchy-timer`
 bin/piquota.js                 the only CLI
-extensions/quota-panel.ts      Pi TUI line and /quota
+extensions/quota-panel.ts      Pi TUI line and /usage
 ```
 
 ## Troubleshooting
@@ -461,7 +488,7 @@ extensions/quota-panel.ts      Pi TUI line and /quota
 ## Tests
 
 ```bash
-node --test tests/*.test.mjs     # 247 tests, fake tokens only, no network
+node --test tests/*.test.mjs     # 261 tests, fake tokens only, no network
 ```
 
 Modules covered: `auth.json` parsing and de-duplication, the Claude Code store

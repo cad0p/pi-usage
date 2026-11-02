@@ -35,6 +35,14 @@ fingerprint of the secret). The fingerprint is one-way and is only a stable key.
 `expires` is epoch **milliseconds** (values above `1e11` are ms, below are
 seconds).
 
+An entry may also be a numbered sibling of one of those providers, following the
+convention Pi's multi-account providers use: `<base>-<account>`, split at the
+**first** `-<digits>` boundary (so `opencode-go-2` is slot `2` of
+`opencode-go`, and `opencode-2-work` is slot `2-work` of an unknown `opencode`
+and is ignored). Siblings share the base family; the base entry itself has a
+`null` slot. Different secrets in two slots stay separate credentials, while the
+same secret in two slots collapses into one.
+
 ### Claude Code entry schema
 
 ```jsonc

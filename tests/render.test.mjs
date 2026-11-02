@@ -132,6 +132,39 @@ test("compact and status renderers mention every provider", () => {
   assert.match(status, /15%/);
 });
 
+/** One OpenCode Go account result, as the engine emits it. */
+function accountFixture(slot, usedPercent) {
+  return providerFixture({
+    family: "opencode-go",
+    label: "OpenCode Go (Pi)",
+    account: `#${slot}`,
+    slot: slot === 1 ? null : String(slot),
+    windows: [windowFixture({ usedPercent, remainingPercent: 100 - usedPercent })],
+  });
+}
+
+test("the panel titles one row per account of a multi-account family", () => {
+  const lines = renderPanel([accountFixture(1, 20), accountFixture(2, 60)], plainPalette(), {
+    generatedAt: "2030-01-01T00:00:00.000Z",
+  });
+  const text = lines.join("\n");
+  assert.match(text, /OpenCode Go \(Pi\) #1/);
+  assert.match(text, /OpenCode Go \(Pi\) #2/);
+  assert.equal((text.match(/#2/g) ?? []).length, 1, "the account is not repeated on its own row");
+});
+
+test("compact and status keep only the first account of a multi-account family", () => {
+  const providers = [accountFixture(1, 20), accountFixture(2, 60)];
+  const compact = renderCompact(providers, plainPalette()).join("\n");
+  assert.equal((compact.match(/OpenCode Go \(Pi\)/g) ?? []).length, 1);
+  assert.match(compact, /80% left/);
+  assert.equal(compact.includes("40% left"), false);
+
+  const status = renderStatusLine(providers, plainPalette());
+  assert.equal((status.match(/G /g) ?? []).length, 1);
+  assert.match(status, /80%/);
+});
+
 test("transient upstream failure paints ~ + caption, not !", () => {
   const status = renderStatusLine(
     [providerFixture({ ok: false, windows: [], error: "upstream request failed: HTTP 502" })],

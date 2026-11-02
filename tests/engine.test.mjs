@@ -29,6 +29,7 @@ function fullRoutes() {
     ["api.anthropic.com", () => jsonResponse(claudeUsageBody())],
     ["chatgpt.com", () => jsonResponse(codexUsageBody())],
     ["cloudcode", () => jsonResponse(antigravityUsageBody())],
+    ["zen/go/v1/usage", () => jsonResponse({}, { status: 404 })],
     ["opencode.ai/zen", () => jsonResponse({ object: "list", data: [{ id: "m1" }, { id: "m2" }] })],
   ]);
 }

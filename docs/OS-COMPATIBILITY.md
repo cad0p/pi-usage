@@ -33,7 +33,7 @@ This is the primary tested environment.
 ## 2. Native Linux (Ubuntu, Debian, Fedora, Arch)
 
 * **Prerequisites:**
-  * Node.js >= 20.0.0
+  * Node.js >= 22.19.0
   * Pi Coding Agent (`pi`) and Gentle AI (`npm:gentle-pi`) installed.
 * **OpenCode Go Cookie Discovery:**
   * Reads `~/.mozilla/firefox/` directly.
@@ -44,7 +44,7 @@ This is the primary tested environment.
 ## 3. macOS (Apple Silicon / Intel)
 
 * **Prerequisites:**
-  * Node.js >= 20.0.0 (`brew install node`)
+  * Node.js >= 22.19.0 (`brew install node`)
   * Pi Coding Agent (`pi`) and Gentle AI (`npm:gentle-pi`) installed.
 * **OpenCode Go Cookie Discovery:**
   * Reads `~/Library/Application Support/Firefox/Profiles/`.
@@ -55,7 +55,7 @@ This is the primary tested environment.
 ## 4. Native Windows (PowerShell / Command Prompt)
 
 * **Prerequisites:**
-  * Node.js >= 20.0.0 (from nodejs.org)
+  * Node.js >= 22.19.0 (from nodejs.org)
   * Git for Windows.
 * **Paths:**
   * Pi store: `%USERPROFILE%\.pi\agent\auth.json`

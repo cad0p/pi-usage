@@ -1,13 +1,13 @@
 {
-  "name": "@j3pf/piquota",
-  "version": "0.11.1",
+  "name": "@cad0p/pi-usage",
+  "version": "0.11.2",
   "publishConfig": {
     "access": "public"
   },
   "type": "module",
-  "description": "Read-only quota monitor for the AI provider credentials Pi already owns: terminal CLI, Pi TUI line, and JSON engine for rp-host and automations",
+  "description": "Read-only usage/quota for the AI subscriptions Pi already owns (Claude, Codex, multi-account OpenCode Go, Antigravity): /usage in Pi and the Omarchy Agents panel. Fork of @j3pf/piquota.",
   "engines": {
-    "node": ">=20.0.0"
+    "node": ">=22.19.0"
   },
   "bin": {
     "piquota": "./bin/piquota.js"
@@ -17,6 +17,7 @@
     "src",
     "extensions",
     "README.md",
+    "CHANGELOG.md",
     "LICENSE"
   ],
   "keywords": [
@@ -28,16 +29,20 @@
     "claude",
     "codex",
     "antigravity",
-    "opencode"
+    "opencode",
+    "usage",
+    "omarchy",
+    "opencode-go",
+    "multi-account"
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/J3pf/piQuota.git"
+    "url": "git+https://github.com/cad0p/pi-usage.git"
   },
   "bugs": {
-    "url": "https://github.com/J3pf/piQuota/issues"
+    "url": "https://github.com/cad0p/pi-usage/issues"
   },
-  "homepage": "https://github.com/J3pf/piQuota#readme",
+  "homepage": "https://github.com/cad0p/pi-usage#readme",
   "pi": {
     "extensions": [
       "./extensions/quota-panel.ts"
@@ -48,5 +53,9 @@
     "quota": "node bin/piquota.js",
     "quota:json": "node bin/piquota.js --json"
   },
-  "license": "MIT"
+  "license": "MIT",
+  "contributors": [
+    "J3pf (https://github.com/J3pf)",
+    "Pier Carlo Cadoppi (https://github.com/cad0p)"
+  ]
 }
