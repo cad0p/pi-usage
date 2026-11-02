@@ -1,7 +1,8 @@
 /**
  * Pi quota line — read-only quota for the providers Pi already owns.
  *
- * Surface: nothing at session start. /usage box, /usage line or /usage panel pins
+ * Surface: nothing at session start. Bare /usage shows the panel until the next
+ * prompt or a second /usage. /usage box, /usage line or /usage panel pins
  * a surface above the editor, /usage status enables the footer, and /usage hide
  * removes it. No timer or post-turn refresh runs until a surface is on.
  *
@@ -550,6 +551,18 @@ function summarize(report: QuotaReport): string {
     .join(" · ");
 }
 
+/** Window names for the one-line account rows (same words as the Omarchy panel). */
+const WINDOW_TAG: Record<string, string> = { "5h": "session", weekly: "week", monthly: "month" };
+
+/** A reset countdown in its largest unit, so a row of three stays narrow. */
+function shortDuration(seconds: number | null): string {
+  if (seconds === null || !Number.isFinite(seconds)) return "";
+  if (seconds <= 0) return "now";
+  if (seconds >= 86400) return `${Math.floor(seconds / 86400)}d`;
+  if (seconds >= 3600) return `${Math.floor(seconds / 3600)}h`;
+  return `${Math.max(1, Math.floor(seconds / 60))}m`;
+}
+
 /** The account's fullest window: the one that stops its next prompt. */
 function bindingWindow(provider: QuotaProvider): QuotaWindow | null {
   let best: QuotaWindow | null = null;
@@ -600,13 +613,17 @@ function renderAccountRows(accounts: QuotaProvider[], theme: Theme): string[] {
       lines.push(`  ${label}  ${theme.fg("dim", "no rate-limit windows reported")}`);
       continue;
     }
+    // Every window on one line, each in its own band colour; the leading glyph
+    // is the fullest window's, so the column still sorts the accounts by eye.
     const band = bandFor(used);
-    const reset = window.resetsInSec === null ? "" : theme.fg("dim", ` · reset in ${humanDuration(window.resetsInSec)}`);
-    lines.push(
-      `  ${label}  ${paint(band.color, band.glyph)} ${paint(band.color, bar(used))} ` +
-        `${paint(band.color, `${used.toFixed(used < 10 ? 1 : 0)}%`.padStart(5))} ` +
-        `${theme.fg("dim", window.id)}${reset}`,
-    );
+    const cells = account.windows
+      .filter((each) => usedOf(each) !== null)
+      .map((each) => {
+        const pct = usedOf(each) as number;
+        const reset = each.resetsInSec === null ? "" : ` ${theme.fg("dim", `(${shortDuration(each.resetsInSec)})`.padEnd(5))}`;
+        return `${theme.fg("dim", WINDOW_TAG[each.id] ?? each.id)} ${paint(bandFor(pct).color, `${Math.round(pct)}%`.padStart(4))}${reset}`;
+      });
+    lines.push(`  ${label}  ${paint(band.color, band.glyph)} ${cells.join(theme.fg("dim", " · "))}`);
   }
   return lines;
 }
@@ -686,6 +703,11 @@ export default function quotaPanelExtension(pi: ExtensionAPI): void {
   let timer: ReturnType<typeof setInterval> | null = null;
   let agentEndTimer: ReturnType<typeof setTimeout> | null = null;
   let panelVisible = false;
+  /**
+   * The panel bare `/usage` opens is a glance, not a pin: it goes away when the
+   * next prompt starts or when `/usage` is run again. `/usage panel` pins it.
+   */
+  let transientPanel = false;
   /**
    * Nothing is pinned by default. A box or line above the editor is a persistent
    * surface, and a quota command should not claim a row until asked.
@@ -933,7 +955,17 @@ export default function quotaPanelExtension(pi: ExtensionAPI): void {
     paintUi(ui);
   });
 
-  pi.on("agent_start", () => {
+  function dismissTransientPanel(ui: UiContext): void {
+    panelVisible = false;
+    transientPanel = false;
+    if (!surfaceActive()) stopPolling();
+    paintUi(ui);
+  }
+
+  pi.on("agent_start", (_event, ctx) => {
+    // SAFETY: Pi's agent_start context implements UiContext when hasUI is true.
+    const ui = ctx as unknown as UiContext;
+    if (transientPanel && panelVisible && ui?.hasUI && !disposed) dismissTransientPanel(ui);
     if (agentEndTimer) {
       clearTimeout(agentEndTimer);
       agentEndTimer = null;
@@ -1002,6 +1034,7 @@ export default function quotaPanelExtension(pi: ExtensionAPI): void {
         return;
       case "panel":
         panelVisible = true;
+        transientPanel = false;
         lineVisible = false;
         boxVisible = false;
         explicitBox = false;
@@ -1048,8 +1081,15 @@ export default function quotaPanelExtension(pi: ExtensionAPI): void {
         break;
     }
 
+    // Bare /usage again while its glance is open closes it.
+    if (panelVisible && transientPanel) {
+      dismissTransientPanel(ctx);
+      return;
+    }
+
     // Bare /usage: one on-demand refresh, show the panel, report the percentages.
     panelVisible = true;
+    transientPanel = true;
     lineVisible = false;
     boxVisible = false;
     await refresh(ctx, true);
