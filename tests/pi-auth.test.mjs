@@ -54,6 +54,50 @@ test("stored credentials never carry an unknown provider", () => {
   assert.equal(credentials[0].family, "claude");
 });
 
+test("numbered sibling providers map onto their base family and slot", () => {
+  const base = normalizeCredential("opencode-go", { type: "api_key", key: "sk-fake-base" }, "/tmp/auth.json");
+  const sibling = normalizeCredential("opencode-go-2", { type: "api_key", key: "sk-fake-two" }, "/tmp/auth.json");
+  const codex = normalizeCredential("openai-codex-3", { type: "api_key", key: "sk-fake-three" }, "/tmp/auth.json");
+  assert.ok(base && sibling && codex);
+  assert.equal(base.slot, null);
+  assert.equal(sibling.slot, "2");
+  assert.equal(sibling.provider, "opencode-go-2");
+  assert.equal(sibling.family, "opencode-go");
+  assert.equal(sibling.label, "OpenCode Go (Pi)");
+  assert.equal(codex.slot, "3");
+  assert.equal(codex.family, "codex");
+
+  // A non-numeric suffix is a different provider, not a sibling slot, and a
+  // sibling of an unknown base is ignored instead of guessed at.
+  assert.equal(normalizeCredential("opencode-go-main", { type: "api_key", key: "sk-fake-main" }, "/tmp/auth.json"), null);
+  assert.equal(normalizeCredential("opencode-2-work", { type: "api_key", key: "sk-fake-mid" }, "/tmp/auth.json"), null);
+});
+
+test("siblings are ordered numerically and de-duplicated by base provider and secret", () => {
+  const directory = mkdtempSync(join(tmpdir(), "pi-quota-slots-"));
+  const path = join(directory, "auth.json");
+  /** @param {number} n */
+  const entry = (n) => ({ type: "api_key", key: `sk-fake-slot-${n}` });
+  writeFileSync(
+    path,
+    JSON.stringify({
+      "opencode-go-11": entry(11),
+      "opencode-go-2": entry(2),
+      "opencode-go": entry(1),
+      "opencode-go-10": entry(10),
+      "opencode-go-main": entry(99),
+      // Same secret as the base entry: identical secrets collapse even though the
+      // slot ids differ.
+      "opencode-go-3": entry(1),
+    }),
+  );
+
+  // loadPiCredentials is what sorts and de-duplicates; readAuthStore keeps file order.
+  const { credentials } = loadPiCredentials({ paths: [path] });
+  assert.deepEqual(credentials.map((credential) => credential.slot), [null, "2", "10", "11"]);
+  assert.deepEqual(credentials.map((credential) => credential.family), ["opencode-go", "opencode-go", "opencode-go", "opencode-go"]);
+});
+
 test("an unreadable or corrupt store degrades with a warning instead of throwing", () => {
   const directory = mkdtempSync(join(tmpdir(), "pi-quota-auth-"));
   const broken = join(directory, "auth.json");
