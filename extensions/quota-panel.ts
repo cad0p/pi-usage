@@ -1,8 +1,9 @@
 /**
  * Pi quota line — read-only quota for the providers Pi already owns.
  *
- * Surface: one compact line above the editor (its own row, so gentle-pi's shell
- * bar cannot pop it out), plus an optional detailed panel.
+ * Surface: nothing at session start. /usage box, /usage line or /usage panel pins
+ * a surface above the editor, /usage status enables the footer, and /usage hide
+ * removes it. No timer or post-turn refresh runs until a surface is on.
  *
  * Design rules:
  *   - the numbers are **used**, not remaining, so the line answers "how much have
@@ -16,8 +17,8 @@
  *   - the footer status is off by default: gentle-pi already owns that line and
  *     truncates it from the end.
  *
- * Commands: /quota, /usage, /quota refresh | line | panel | hide | status |
- * nostatus | json.
+ * Command: /usage, with /usage refresh | line | panel | hide | status | nostatus |
+ * json. No surface is pinned at session start: the command is on demand.
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -564,10 +565,13 @@ export default function quotaPanelExtension(pi: ExtensionAPI): void {
   let timer: ReturnType<typeof setInterval> | null = null;
   let agentEndTimer: ReturnType<typeof setTimeout> | null = null;
   let panelVisible = false;
-  /** The compact box is the default surface: its own row, nothing competes for it. */
-  let lineVisible = true;
-  let boxVisible = true;
-  let explicitBox = true;
+  /**
+   * Nothing is pinned by default. A box or line above the editor is a persistent
+   * surface, and a quota command should not claim a row until asked.
+   */
+  let lineVisible = false;
+  let boxVisible = false;
+  let explicitBox = false;
   /** gentle-pi owns the footer and truncates it from the end, so start off. */
   let statusVisible = false;
   let lastError: string | null = null;
@@ -753,6 +757,31 @@ export default function quotaPanelExtension(pi: ExtensionAPI): void {
     );
   }
 
+  /** True when something is pinned above the editor or the footer is on. */
+  function surfaceActive(): boolean {
+    return lineVisible || boxVisible || panelVisible || statusVisible;
+  }
+
+  /**
+   * Poll only once a surface has asked for live numbers. A bare /usage refresh is
+   * a one-shot read; it must not leave a timer behind.
+   */
+  function ensurePolling(ui: UiContext): void {
+    if (disposed || timer || !surfaceActive()) return;
+    timer = setInterval(() => {
+      if (!ui.hasUI || disposed) return;
+      void refresh(ui, false);
+    }, REFRESH_MS);
+    // SAFETY: Node.js Timer provides unref to prevent hanging process exit.
+    (timer as unknown as { unref?: () => void }).unref?.();
+  }
+
+  function stopPolling(): void {
+    if (!timer) return;
+    clearInterval(timer);
+    timer = null;
+  }
+
   async function refresh(ctx: UiContext, force: boolean): Promise<void> {
     if (refreshing) return;
     refreshing = true;
@@ -777,16 +806,10 @@ export default function quotaPanelExtension(pi: ExtensionAPI): void {
     // Resolve the native rail mode before the first paint.
     await syncRailPatch();
     if (disposed) return;
+    // Default: no persistent surface. Nothing is pinned above the editor, the
+    // footer stays untouched and no timer polls until /usage turns a surface on.
+    stopPolling();
     paintUi(ui);
-    void refresh(ui, false);
-    if (timer) clearInterval(timer);
-    if (disposed) return;
-    timer = setInterval(() => {
-      if (!ui.hasUI || disposed) return;
-      void refresh(ui, false);
-    }, REFRESH_MS);
-    // SAFETY: Node.js Timer provides unref to prevent hanging process exit.
-    (timer as unknown as { unref?: () => void }).unref?.();
   });
 
   pi.on("agent_start", () => {
@@ -800,6 +823,8 @@ export default function quotaPanelExtension(pi: ExtensionAPI): void {
     // SAFETY: Pi's agent_end context implements UiContext when hasUI is true.
     const ui = ctx as unknown as UiContext;
     if (!ui.hasUI || disposed) return;
+    // A quota refresh after every turn is only useful when its result is visible.
+    if (!surfaceActive()) return;
     if (agentEndTimer) clearTimeout(agentEndTimer);
     const debounceMs = Number(process.env.PI_QUOTA_EVENT_DEBOUNCE_MS) || AGENT_END_DEBOUNCE_MS;
     agentEndTimer = setTimeout(() => {
@@ -850,6 +875,7 @@ export default function quotaPanelExtension(pi: ExtensionAPI): void {
         explicitBox = false;
         panelVisible = false;
         if (!report) await refresh(ctx, false);
+        ensurePolling(ctx);
         paintUi(ctx);
         ctx.ui.notify("Quota line pinned above the editor", "info");
         return;
@@ -859,6 +885,7 @@ export default function quotaPanelExtension(pi: ExtensionAPI): void {
         boxVisible = false;
         explicitBox = false;
         if (!report) await refresh(ctx, false);
+        ensurePolling(ctx);
         paintUi(ctx);
         ctx.ui.notify("Quota panel shown above the editor", "info");
         return;
@@ -868,6 +895,7 @@ export default function quotaPanelExtension(pi: ExtensionAPI): void {
         explicitBox = true;
         panelVisible = false;
         if (!report) await refresh(ctx, false);
+        ensurePolling(ctx);
         paintUi(ctx);
         ctx.ui.notify("Quota box pinned above the editor", "info");
         return;
@@ -877,16 +905,19 @@ export default function quotaPanelExtension(pi: ExtensionAPI): void {
         lineVisible = false;
         boxVisible = false;
         explicitBox = false;
+        if (!surfaceActive()) stopPolling();
         paintUi(ctx);
-        ctx.ui.notify("Quota line hidden", "info");
+        ctx.ui.notify("Quota hidden", "info");
         return;
       case "status":
         statusVisible = true;
+        ensurePolling(ctx);
         paintUi(ctx);
         ctx.ui.notify("Also showing quota in the footer (may be truncated when the bar is full)", "info");
         return;
       case "nostatus":
         statusVisible = false;
+        if (!surfaceActive()) stopPolling();
         paintUi(ctx);
         return;
       case "json":
@@ -896,11 +927,12 @@ export default function quotaPanelExtension(pi: ExtensionAPI): void {
         break;
     }
 
-    // Bare /quota: refresh, show the panel, and report the used percentages.
+    // Bare /usage: one on-demand refresh, show the panel, report the percentages.
     panelVisible = true;
     lineVisible = false;
     boxVisible = false;
     await refresh(ctx, true);
+    ensurePolling(ctx);
     paintUi(ctx);
     if (!report) {
       ctx.ui.notify(`Quota unavailable: ${lastError}`, "error");
@@ -918,18 +950,13 @@ export default function quotaPanelExtension(pi: ExtensionAPI): void {
     ctx.ui.notify(summary || "No active providers configured in Pi", "info");
   };
 
-  pi.registerCommand("quota", {
-    description: "Show read-only provider quota (used %, shortest window)",
+  pi.registerCommand("usage", {
+    description: "Show read-only provider quota on demand (used %, shortest window)",
     getArgumentCompletions: (prefix: string) => {
       const options = ["refresh", "line", "box", "panel", "hide", "status", "nostatus", "json"];
       const matches = options.filter((option) => option.startsWith(prefix));
       return matches.length > 0 ? matches.map((value) => ({ value, label: value })) : null;
     },
-    handler,
-  });
-
-  pi.registerCommand("usage", {
-    description: "Alias of /quota (read-only provider quota)",
     handler,
   });
 }

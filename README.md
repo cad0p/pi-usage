@@ -11,7 +11,7 @@ shuvquota, and it never writes to a credential file.
 | Surface | Command |
 | --- | --- |
 | Terminal | `piquota` · `piquota --json` · `piquota --status` · `piquota --compact` |
-| Pi TUI | `/quota` · `/usage` |
+| Pi TUI | `/usage` |
 | External / `rp-host` / automation | `piquota --json` (structured JSON feed with `primaryWindowId` and countdowns) |
 | Omarchy Bar Panel | `piquota omarchy` (or systemd user timer via `--omarchy-timer`) |
 
@@ -36,7 +36,7 @@ shuvquota, and it never writes to a credential file.
 * Browser cookie databases are copied to a private temp dir and opened
   read-only. This is only used for the OpenCode Go fallback, when the key usage
   endpoint is gone and no session cookie is configured.
-* `/quota` never injects quota into the LLM context: the extension only calls
+* `/usage` never injects quota into the LLM context: the extension only calls
   `ui.setStatus`, `ui.setWidget` and `ui.notify`.
 * Nothing is written outside these paths:
 
@@ -146,7 +146,7 @@ When you also run `install.sh` for the terminal CLI, pass
 
 | Capability | `pi install npm:` | `install.sh` |
 | --- | --- | --- |
-| TUI panel, sidebar and `/quota` | yes | yes |
+| TUI panel, sidebar and `/usage` | yes | yes |
 | Omarchy bar records | yes, written on every refresh | yes |
 | `piquota` on your `PATH` for terminal use | no | yes, symlinked |
 | Omarchy sync while Pi is closed | no | yes, with `--omarchy-timer` |
@@ -216,19 +216,24 @@ Inside Pi:
 
 | Command | Effect |
 | --- | --- |
-| `/quota` | refresh, reveal the panel, notify a one-line summary |
-| `/quota box` | pin the five-row box above the editor (the default surface) |
-| `/quota line` | pin the compact line above the editor, in its own row |
-| `/quota panel` | full boxed panel above the editor |
-| `/quota hide` | hide the panel/line |
-| `/quota status` / `nostatus` | enable/disable the footer status |
-| `/quota refresh` | refresh only |
-| `/quota json` | where the cached report lives |
-| `/usage` | alias of `/quota` |
+| `/usage` | one on-demand refresh, show the full panel, notify a one-line summary |
+| `/usage box` | pin the five-row box above the editor |
+| `/usage line` | pin the compact line above the editor, in its own row |
+| `/usage panel` | full boxed panel above the editor |
+| `/usage hide` | hide the panel/line and stop background refresh until a surface is on again |
+| `/usage status` / `nostatus` | enable/disable the footer status |
+| `/usage refresh` | refresh only |
+| `/usage json` | where the cached report lives |
 
 ### The Pi surface
 
-By default the extension pins the **five-row box above the editor**:
+Nothing is pinned by default: `/usage` is a one-shot command, so it claims no row
+above the editor and leaves the footer alone. Turn a surface on with `/usage box`,
+`/usage line`, `/usage panel` or `/usage status`; only then does the extension keep
+it fresh with a background refresh (and a gentle refresh after each agent turn).
+`/usage hide` gives the row back.
+
+`/usage box` pins the **five-row box above the editor**:
 
 ```
               ╭─ Quota ──────────────────╮
@@ -253,7 +258,7 @@ the numbers are not shown twice. See [the rail slot](#the-gentle-pi-rail-slot).
   in Pi, only Claude and Codex appear in the line and on Moshi (no empty warning
   icons for providers you don't use);
 * `NO_COLOR` / `TERM=dumb` drops the colours and keeps the glyphs;
-* the window shown is the **shortest** one (5h first), and `/quota` expands every
+* the window shown is the **shortest** one (5h first), and `/usage` expands every
   window with a used-fraction bar and the reset countdown.
 
 Pi's theme only exposes a fixed palette, so brand colours are emitted as
@@ -273,7 +278,7 @@ while (segments.length > 1 && visibleWidth(left) > width) segments.pop();
 Extension statuses render last, so a footer status is the first thing discarded —
 which is why a long status line appears and then vanishes once the bar fills with
 cost, branch and usage data. The quota line therefore lives in its own row, where
-nothing competes for it. `/quota status` still enables the footer variant for
+nothing competes for it. `/usage status` still enables the footer variant for
 anyone who wants it.
 
 ### The gentle-pi rail slot
@@ -451,7 +456,7 @@ src/exec.js                    the one place that spawns gh CLI binary
 src/http.js                    fetch wrapper: timeouts, JSON, redaction
 contrib/systemd/               user service and timer behind `install.sh --omarchy-timer`
 bin/piquota.js                 the only CLI
-extensions/quota-panel.ts      Pi TUI line and /quota
+extensions/quota-panel.ts      Pi TUI line and /usage
 ```
 
 ## Troubleshooting
@@ -473,7 +478,7 @@ extensions/quota-panel.ts      Pi TUI line and /quota
 ## Tests
 
 ```bash
-node --test tests/*.test.mjs     # 260 tests, fake tokens only, no network
+node --test tests/*.test.mjs     # 261 tests, fake tokens only, no network
 ```
 
 Modules covered: `auth.json` parsing and de-duplication, the Claude Code store

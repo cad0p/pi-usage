@@ -327,5 +327,5 @@ log "piquota                # test the CLI panel"
 log "piquota --json         # JSON output for rp-host and automations"
 log "piquota auth status    # check OpenCode Go session discovery"
 log "piquota omarchy       # write the Omarchy Agents panel records once (see --omarchy-timer)"
-log "/quota                 # reload or start Pi and run inside TUI"
+log "/usage                 # reload or start Pi and run inside TUI"
 echo
