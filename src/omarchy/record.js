@@ -104,16 +104,17 @@ function windowTitle(window, provider) {
 /**
  * @param {import("../model.js").QuotaWindow[]} windows
  * @param {import("../model.js").QuotaResult} [provider]
+ * @param {string} [prefix] Account prefix for a multi-account family, e.g. "#2 · ".
  * @returns {Array<{ label: string, title: string, percent: number, resetsAt: string }>}
  */
-function mapLimits(windows, provider) {
+function mapLimits(windows, provider, prefix = "") {
   const limits = [];
   for (const window of windows ?? []) {
     // A window without a percentage would otherwise read as "0% used".
     if (typeof window.usedPercent !== "number" || !Number.isFinite(window.usedPercent)) continue;
     limits.push({
-      label: redact(window.label || window.id || "Limit"),
-      title: redact(windowTitle(window, provider)),
+      label: redact(`${prefix}${window.label || window.id || "Limit"}`),
+      title: redact(`${prefix}${windowTitle(window, provider)}`),
       percent: Math.min(1, Math.max(0, window.usedPercent / 100)),
       resetsAt: typeof window.resetsAt === "string" ? window.resetsAt : "",
     });
@@ -177,6 +178,216 @@ function recordTierLabel(provider) {
 }
 
 /**
+ * Slot label of one account: "#1" for the base entry (or the first result when
+ * the provider does not carry slots at all), "#<slot>" for a sibling.
+ *
+ * @param {import("../model.js").QuotaResult} provider
+ * @param {number} index
+ * @returns {string}
+ */
+function accountLabel(provider, index) {
+  if (typeof provider.slot === "string" && provider.slot !== "") return `#${provider.slot}`;
+  if (typeof provider.account === "string" && /^#\d/.test(provider.account)) return provider.account;
+  return `#${index + 1}`;
+}
+
+/**
+ * The window an account is actually constrained by: the most consumed one, and
+ * on a tie the one that resets first. Unknown reset times sort last.
+ *
+ * @param {import("../model.js").QuotaWindow[]} windows
+ * @returns {import("../model.js").QuotaWindow | null}
+ */
+function bindingWindow(windows) {
+  /** @type {import("../model.js").QuotaWindow | null} */
+  let best = null;
+  for (const window of windows ?? []) {
+    if (typeof window.usedPercent !== "number" || !Number.isFinite(window.usedPercent)) continue;
+    if (!best) {
+      best = window;
+      continue;
+    }
+    const used = window.usedPercent;
+    const bestUsed = /** @type {number} */ (best.usedPercent);
+    if (used > bestUsed) {
+      best = window;
+      continue;
+    }
+    if (used === bestUsed && resetOrder(window.resetsAt) < resetOrder(best.resetsAt)) best = window;
+  }
+  return best;
+}
+
+/**
+ * @param {string | null | undefined} resetsAt
+ * @returns {number} Epoch ms, or Infinity when unknown, so unknown resets sort last.
+ */
+function resetOrder(resetsAt) {
+  if (typeof resetsAt !== "string" || resetsAt === "") return Number.POSITIVE_INFINITY;
+  const parsed = Date.parse(resetsAt);
+  return Number.isNaN(parsed) ? Number.POSITIVE_INFINITY : parsed;
+}
+
+/**
+ * A short, user-facing reason for one failed account.
+ *
+ * @param {string | null | undefined} error
+ * @returns {string}
+ */
+function failureReason(error) {
+  const text = typeof error === "string" ? error : "";
+  if (/key rejected|key was rejected/i.test(text)) return "key rejected";
+  if (/Go plan not active|Workspace access denied/i.test(text)) return "no Go plan";
+  switch (errorKind(error)) {
+    case "expired":
+      return "sign-in expired";
+    case "auth":
+      return "credential rejected";
+    case "throttle":
+      return "rate limited";
+    case "transient":
+      return "temporarily unavailable";
+    case "missing":
+      return "not configured";
+    default:
+      return "unavailable";
+  }
+}
+
+/**
+ * Collapse consecutive numeric account labels into ranges: #8,#9,#10 -> "#8–#10".
+ *
+ * @param {string[]} labels
+ * @returns {string}
+ */
+function compactLabels(labels) {
+  /** @type {string[]} */
+  const parts = [];
+  /** @type {number | null} */
+  let runStart = null;
+  /** @type {number | null} */
+  let runEnd = null;
+  const flush = () => {
+    if (runStart === null || runEnd === null) return;
+    parts.push(runStart === runEnd ? `#${runStart}` : `#${runStart}–#${runEnd}`);
+    runStart = null;
+    runEnd = null;
+  };
+  for (const label of labels) {
+    const match = /^#(\d+)$/.exec(label);
+    if (!match) {
+      flush();
+      parts.push(label);
+      continue;
+    }
+    const number = Number(match[1]);
+    if (runStart === null || runEnd === null) {
+      runStart = number;
+      runEnd = number;
+    } else if (number === runEnd + 1) {
+      runEnd = number;
+    } else {
+      flush();
+      runStart = number;
+      runEnd = number;
+    }
+  }
+  flush();
+  return parts.join(", ");
+}
+
+/**
+ * Explain failures compactly, grouped by reason in slot order, e.g.
+ * "#8–#10 key rejected · #11–#14 no Go plan".
+ *
+ * @param {Array<{ label: string, reason: string }>} failures
+ * @returns {string}
+ */
+function compactFailureList(failures) {
+  /** @type {string[]} */
+  const groups = [];
+  let index = 0;
+  while (index < failures.length) {
+    const reason = failures[index].reason;
+    /** @type {string[]} */
+    const labels = [];
+    while (index < failures.length && failures[index].reason === reason) {
+      labels.push(failures[index].label);
+      index += 1;
+    }
+    groups.push(`${compactLabels(labels)} ${reason}`);
+  }
+  const text = redact(groups.join(" · "));
+  return text.length <= HELP_MAX ? text : `${text.slice(0, HELP_MAX - 1).trimEnd()}…`;
+}
+
+/**
+ * One record for a family with several accounts.
+ *
+ * Each healthy account contributes only the window that constrains it (the most
+ * consumed one), so a fourteen-account family stays a readable tab instead of a
+ * wall of forty rows. Failed accounts contribute no rows at all: they are
+ * summarised in the status and the compact help text, which is what makes a
+ * revoked key distinguishable from a workspace without a plan.
+ *
+ * @param {string} family
+ * @param {import("../model.js").QuotaResult[]} providers
+ * @param {{ now?: number }} [options]
+ * @returns {{ id: string, record: Record<string, unknown> } | null}
+ */
+function buildFamilyRecord(family, providers, options = {}) {
+  const now = options.now ?? Date.now();
+  const first = providers[0];
+  if (!first) return null;
+  if (providers.every((provider) => !provider.ok && errorKind(provider.error) === "missing")) return null;
+
+  /** @type {Array<{ label: string, title: string, percent: number, resetsAt: string }>} */
+  const limits = [];
+  /** @type {Array<{ label: string, reason: string }>} */
+  const failures = [];
+  let okCount = 0;
+
+  providers.forEach((provider, index) => {
+    const label = accountLabel(provider, index);
+    if (provider.ok) {
+      okCount += 1;
+      const window = bindingWindow(provider.windows);
+      const mapped = window ? mapLimits([window], provider, `${label} · `)[0] : null;
+      if (mapped) limits.push(mapped);
+      return;
+    }
+    failures.push({ label, reason: failureReason(provider.error) });
+  });
+
+  const failedCount = providers.length - okCount;
+  const allFailed = okCount === 0;
+  const status = allFailed
+    ? describeError(family, first.error ?? "no usage windows")
+    : {
+        usageStatusText: failedCount > 0 ? `${failedCount} of ${providers.length} accounts unavailable` : "",
+        authHelpText: "",
+      };
+
+  const id = recordId(family);
+  return {
+    id,
+    record: {
+      schemaVersion: SCHEMA_VERSION,
+      id,
+      name: recordName(first),
+      ready: okCount > 0,
+      tierLabel: `${okCount} of ${providers.length} accounts`,
+      limits: limits.length > 0 ? limits : [{ ...PLACEHOLDER_LIMIT }],
+      usageStatusText: status.usageStatusText,
+      authHelpText: failures.length > 0 ? compactFailureList(failures) : status.authHelpText,
+      hasLocalStats: false,
+      hasPromptStats: false,
+      updatedAt: new Date(now).toISOString(),
+    },
+  };
+}
+
+/**
  * Build the record for one provider, or `null` when the provider is simply not
  * configured: a tab that only says "not configured" is noise, so it is omitted
  * (and any record from an earlier run is removed by the publisher).
@@ -216,7 +427,10 @@ export function buildRecord(provider, options = {}) {
 }
 
 /**
- * One record per family (the first result wins, matching the other renderers).
+ * One record per family. A family with a single result produces exactly the same
+ * record as before; several accounts collapse into one record with one binding
+ * window per healthy account.
+ *
  * Never throws: a malformed provider entry is skipped.
  *
  * @param {import("../engine.js").PiQuotaReport} report
@@ -224,13 +438,21 @@ export function buildRecord(provider, options = {}) {
  * @returns {Array<{ id: string, record: Record<string, unknown> }>}
  */
 export function buildRecords(report, options = {}) {
-  const seen = new Set();
-  const records = [];
+  /** @type {Map<string, import("../model.js").QuotaResult[]>} */
+  const groups = new Map();
   for (const provider of report?.providers ?? []) {
-    if (!provider || typeof provider.family !== "string" || seen.has(provider.family)) continue;
-    seen.add(provider.family);
+    if (!provider || typeof provider.family !== "string") continue;
+    const list = groups.get(provider.family) ?? [];
+    list.push(provider);
+    groups.set(provider.family, list);
+  }
+
+  const records = [];
+  for (const [family, providers] of groups) {
     try {
-      const built = buildRecord(provider, options);
+      const built = providers.length > 1
+        ? buildFamilyRecord(family, providers, options)
+        : buildRecord(providers[0], options);
       if (built) records.push(built);
     } catch {
       // A broken entry must not take the other providers' records down with it.

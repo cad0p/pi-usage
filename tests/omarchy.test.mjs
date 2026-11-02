@@ -129,6 +129,99 @@ test("records never carry tokens, accounts or e-mail addresses", () => {
   assert.ok(!text.includes("/home/u"), "credential source paths stay out of the record");
 });
 
+test("a multi-account family becomes one record with one binding window per account", () => {
+  const report = {
+    providers: [
+      provider({
+        family: "opencode-go",
+        label: "OpenCode Go (Pi)",
+        account: "#1",
+        slot: null,
+        plan: "Go plan",
+        windows: [
+          { id: "5h", label: "5h window", usedPercent: 0, remainingPercent: 100, resetsAt: "2026-10-04T10:00:00.000Z" },
+          { id: "weekly", label: "Weekly window", usedPercent: 20, remainingPercent: 80, resetsAt: "2026-10-10T00:00:00.000Z" },
+          { id: "monthly", label: "Monthly window", usedPercent: 90, remainingPercent: 10, resetsAt: "2026-10-20T00:00:00.000Z" },
+        ],
+      }),
+      provider({
+        family: "opencode-go",
+        label: "OpenCode Go (Pi)",
+        account: "#2",
+        slot: "2",
+        plan: "Go plan",
+        windows: [
+          // Same percentage: the earlier reset breaks the tie.
+          { id: "5h", label: "5h window", usedPercent: 5, remainingPercent: 95, resetsAt: "2026-10-06T10:00:00.000Z" },
+          { id: "weekly", label: "Weekly window", usedPercent: 5, remainingPercent: 95, resetsAt: "2026-10-05T10:00:00.000Z" },
+        ],
+      }),
+    ],
+  };
+
+  const records = buildRecords(/** @type {any} */ (report), { now: NOW });
+  assert.equal(records.length, 1, "one record per family, even with many accounts");
+  const { record } = records[0];
+  assert.equal(record.id, "pi-opencode-go");
+  assert.equal(record.name, "OP-Go");
+  assert.equal(record.ready, true);
+  assert.equal(record.tierLabel, "2 of 2 accounts");
+  assert.equal(record.usageStatusText, "");
+  assert.deepEqual(record.limits, [
+    { label: "#1 · Monthly window", title: "#1 · Monthly", percent: 0.9, resetsAt: "2026-10-20T00:00:00.000Z" },
+    { label: "#2 · Weekly window", title: "#2 · Weekly", percent: 0.05, resetsAt: "2026-10-05T10:00:00.000Z" },
+  ]);
+});
+
+test("failed accounts add no rows and are summarised by reason with slot ranges", () => {
+  const providers = Array.from({ length: 6 }, (_, index) =>
+    provider({
+      family: "opencode-go",
+      label: "OpenCode Go (Pi)",
+      account: `#${index + 1}`,
+      slot: index === 0 ? null : String(index + 1),
+      plan: "Go plan",
+      ok: index < 2,
+      error: index < 2
+        ? null
+        : index < 4
+          ? "OpenCode Go key rejected (401); reconnect that account in Pi"
+          : "Go plan not active for this key's workspace (403 Workspace access denied)",
+      windows: index < 2
+        ? [{ id: "5h", label: "5h window", usedPercent: 10 + index, remainingPercent: 90 - index, resetsAt: null }]
+        : [],
+    }),
+  );
+
+  const { record } = buildRecords(/** @type {any} */ ({ providers }), { now: NOW })[0];
+  assert.equal(record.ready, true);
+  assert.equal(record.tierLabel, "2 of 6 accounts");
+  assert.equal(record.usageStatusText, "4 of 6 accounts unavailable");
+  assert.equal(record.authHelpText, "#3–#4 key rejected · #5–#6 no Go plan");
+  assert.deepEqual(record.limits.map((limit) => limit.title), ["#1 · Session", "#2 · Session"]);
+});
+
+test("a multi-account family where every account fails keeps the single-failure shape", () => {
+  const providers = ["#1", "#2"].map((account, index) =>
+    provider({
+      family: "opencode-go",
+      label: "OpenCode Go (Pi)",
+      account,
+      slot: index === 0 ? null : "2",
+      ok: false,
+      error: "HTTP 401 unauthorized",
+      windows: [],
+    }),
+  );
+
+  const { record } = buildRecords(/** @type {any} */ ({ providers }), { now: NOW })[0];
+  assert.equal(record.ready, false);
+  assert.equal(record.usageStatusText, "Credential rejected");
+  assert.equal(record.authHelpText, "#1–#2 credential rejected");
+  assert.equal(record.limits.length, 1);
+  assert.ok(record.limits[0].percent < 0, "the panel filters percent < 0, so nothing is drawn");
+});
+
 test("publishRecords writes valid JSON atomically and leaves no temp files", () => {
   const dir = join(tempDir(), "usage");
   try {

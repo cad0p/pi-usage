@@ -409,6 +409,11 @@ piquota omarchy                  # write pi-claude.json, pi-codex.json, ... once
 - A provider with a failing sign-in shows a status and a help line instead of
   limits. A provider that is not configured gets no record, and a stale
   `pi-*.json` is removed on the next run.
+- A family with several accounts (numbered `<base>-<slot>` entries in
+  `auth.json`) still gets **one** record: every healthy account contributes only
+  the window that constrains it, titled `#<slot> · Session|Weekly|Monthly`, and
+  failed accounts add no rows but are summarised by reason, e.g.
+  `#8–#10 key rejected · #11–#14 no Go plan`.
 - Omarchy's native collector already tracks Claude with richer local statistics, so
   `piquota omarchy` automatically skips `claude` and cleans up duplicate `pi-claude.json`
   files when `claude.json` exists in the usage directory (override with `PI_QUOTA_OMARCHY_SKIP`).
@@ -464,7 +469,7 @@ extensions/quota-panel.ts      Pi TUI line and /quota
 ## Tests
 
 ```bash
-node --test tests/*.test.mjs     # 254 tests, fake tokens only, no network
+node --test tests/*.test.mjs     # 260 tests, fake tokens only, no network
 ```
 
 Modules covered: `auth.json` parsing and de-duplication, the Claude Code store

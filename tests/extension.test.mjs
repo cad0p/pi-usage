@@ -210,6 +210,50 @@ test("the extension loads and registers /quota and /usage", async () => {
   assert.equal(harness.forbidden.length, 0, "extension must not register context-affecting APIs");
 });
 
+test("the full panel lists every account while the box and the line keep one per family", async () => {
+  const module = await import(EXTENSION);
+  /** @param {number} slot @param {number} used */
+  const account = (slot, used) => ({
+    family: "opencode-go",
+    label: "OpenCode Go (Pi)",
+    primaryWindowId: "5h",
+    account: `#${slot}`,
+    slot: slot === 1 ? null : String(slot),
+    plan: "Go plan",
+    windows: [
+      { id: "5h", label: "5h window", usedPercent: used, remainingPercent: 100 - used, resetsAt: null, resetsInSec: 600, note: null },
+      { id: "monthly", label: "Monthly window", usedPercent: 100, remainingPercent: 0, resetsAt: null, resetsInSec: 900000, note: "rate-limited" },
+    ],
+    error: null,
+    ok: true,
+    updatedAt: "2030-01-01T00:00:00.000Z",
+    expiresInMin: null,
+  });
+  const harness = makeHarness({
+    report: {
+      generatedAt: "2030-01-01T00:00:00.000Z",
+      sources: [],
+      warnings: [],
+      providers: [account(1, 10), account(2, 50)],
+    },
+  });
+  module.default(harness.pi);
+  await startSession(harness);
+
+  const box = plain(renderWidget(harness.widgets.at(-1)).join("\n"));
+  assert.equal((box.match(/OP-Go/g) ?? []).length, 1, "the box shows one row per family");
+
+  const quota = harness.commands.find((command) => command.name === "quota");
+  await quota.definition.handler("", harness.ctx);
+  const panelWidget = harness.widgets.at(-1);
+  const panel = plain((Array.isArray(panelWidget) ? panelWidget : panelWidget.render(100)).join("\n"));
+  assert.match(panel, /OP-Go #1/);
+  assert.match(panel, /OP-Go #2/);
+  assert.match(panel, /Monthly window/);
+
+  assert.equal((harness.notifications.at(-1).match(/OP-Go/g) ?? []).length, 1, "the summary names each family once");
+});
+
 test("the boxed widget is the default surface and the footer is left alone", async () => {
   const module = await import(EXTENSION);
   const harness = makeHarness();

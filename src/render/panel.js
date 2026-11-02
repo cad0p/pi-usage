@@ -70,6 +70,28 @@ function statusPaintKeyForKind(kind) {
 }
 
 /**
+ * Keep the first result per family.
+ *
+ * The compact surfaces answer "how much have I burned" at a glance; a family
+ * with fourteen accounts would otherwise repeat its glyph fourteen times. The
+ * full panel is the one place that lists every account.
+ *
+ * @param {import("../model.js").QuotaResult[]} providers
+ * @returns {import("../model.js").QuotaResult[]}
+ */
+export function firstPerFamily(providers) {
+  const seen = new Set();
+  /** @type {import("../model.js").QuotaResult[]} */
+  const out = [];
+  for (const provider of providers ?? []) {
+    if (!provider || seen.has(provider.family)) continue;
+    seen.add(provider.family);
+    out.push(provider);
+  }
+  return out;
+}
+
+/**
  * Compact status-line text, e.g. `C ●  78%  ·  X ◑  44%  ·  A ○   8%  ·  G ! n/a`.
  *
  * @param {import("../model.js").QuotaResult[]} providers
@@ -77,7 +99,7 @@ function statusPaintKeyForKind(kind) {
  * @returns {string}
  */
 export function renderStatusLine(providers, paint) {
-  const active = providers.filter((provider) => !provider.notConfigured);
+  const active = firstPerFamily(providers).filter((provider) => !provider.notConfigured);
   if (active.length === 0) return paint("dim", "quota: no configured providers");
 
   const parts = [];
@@ -145,14 +167,17 @@ function wrapPlain(text, width) {
  * @param {import("../model.js").QuotaResult} provider
  * @param {import("./theme.js").Paint} paint
  * @param {number} contentWidth
+ * @param {{ title?: string | null, accountInTitle?: boolean }} [options]
  * @returns {string[]}
  */
-export function renderProviderLines(provider, paint, contentWidth = MAX_WIDTH) {
-  const title = FAMILY_TITLE[provider.family] ?? provider.label;
+export function renderProviderLines(provider, paint, contentWidth = MAX_WIDTH, options = {}) {
+  const title = options.title ?? FAMILY_TITLE[provider.family] ?? provider.label;
   /** @type {string[]} */
   const lines = [];
 
-  const meta = [provider.account];
+  // A multi-account family puts "#<slot>" in the title, so repeating it in the
+  // meta line would print the same label twice on one row.
+  const meta = options.accountInTitle ? [] : [provider.account];
   if (provider.plan) meta.push(`plan ${provider.plan}`);
   // Claude has two stores, and a broken one is the first thing to rule out when
   // the percentage looks wrong, so the panel names the store it actually read.
@@ -285,9 +310,27 @@ export function renderPanel(providers, paint, meta = {}) {
   const terminalWidth = typeof process?.stdout?.columns === "number" ? process.stdout.columns : MAX_WIDTH;
   const hardMax = Math.max(MIN_WIDTH, Math.min(meta.maxWidth ?? MAX_WIDTH, terminalWidth - 2, MAX_WIDTH));
 
+  // A family with several accounts gets one row per account, and the row title
+  // carries the account label ("OpenCode Go (Pi) #2") so the list stays scannable.
+  /** @type {Map<string, number>} */
+  const familyCounts = new Map();
+  for (const provider of providers ?? []) {
+    familyCounts.set(provider.family, (familyCounts.get(provider.family) ?? 0) + 1);
+  }
+  /** @param {import("../model.js").QuotaResult} provider */
+  const accountTitle = (provider) =>
+    (familyCounts.get(provider.family) ?? 0) > 1 && typeof provider.account === "string" && provider.account.startsWith("#")
+      ? `${FAMILY_TITLE[provider.family] ?? provider.label} ${provider.account}`
+      : null;
+
   // Render once at the hard maximum, then settle on the natural width of the
   // content so long degradation messages cannot stretch every other row.
-  const firstPass = providers.flatMap((provider) => renderProviderLines(provider, paint, hardMax - BOX_PADDING));
+  const firstPass = providers.flatMap((provider) =>
+    renderProviderLines(provider, paint, hardMax - BOX_PADDING, {
+      title: accountTitle(provider),
+      accountInTitle: accountTitle(provider) !== null,
+    }),
+  );
   const natural = Math.max(...firstPass.map((line) => visibleLength(line)), MIN_WIDTH - BOX_PADDING);
   const contentWidth = Math.max(MIN_WIDTH - BOX_PADDING, Math.min(natural, hardMax - BOX_PADDING));
 
@@ -298,7 +341,8 @@ export function renderPanel(providers, paint, meta = {}) {
   out.push(paint("accent", `╭─${title}${"─".repeat(Math.max(0, contentWidth - 9))}╮`));
 
   for (const provider of providers) {
-    for (const line of renderProviderLines(provider, paint, contentWidth)) {
+    const title = accountTitle(provider);
+    for (const line of renderProviderLines(provider, paint, contentWidth, { title, accountInTitle: title !== null })) {
       out.push(`${paint("accent", "│")} ${padVisible(clip(line, contentWidth), contentWidth)} ${paint("accent", "│")}`);
     }
   }
@@ -347,7 +391,7 @@ export function padVisible(text, width) {
  * @returns {string[]}
  */
 export function renderCompact(providers, paint) {
-  return providers.map((provider) => {
+  return firstPerFamily(providers).map((provider) => {
     const window = headlineWindow(provider);
     const remaining = window?.remainingPercent ?? null;
     const key = provider.ok ? thresholdKey(remaining) : "unknown";

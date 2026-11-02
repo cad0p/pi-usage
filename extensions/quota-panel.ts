@@ -200,6 +200,22 @@ function headline(provider: QuotaProvider): QuotaWindow | null {
   });
 }
 
+/**
+ * Compact surfaces show the first account per family, because a fourteenth
+ * OpenCode Go account must not push Claude out of the footer. The full panel is
+ * the one place that lists every account.
+ */
+function firstPerFamily(providers: QuotaProvider[]): QuotaProvider[] {
+  const seen = new Set<string>();
+  const out: QuotaProvider[] = [];
+  for (const provider of providers) {
+    if (seen.has(provider.family)) continue;
+    seen.add(provider.family);
+    out.push(provider);
+  }
+  return out;
+}
+
 function bar(usedPercent: number | null, width = 10): string {
   if (usedPercent === null) return "·".repeat(width);
   const filled = Math.round((Math.max(0, Math.min(100, usedPercent)) / 100) * width);
@@ -301,7 +317,7 @@ function errorCaption(error: string | null | undefined): string {
 function renderLine(report: QuotaReport, theme: Theme): string {
   // Only display providers that are configured in Pi.
   // A provider that is simply not configured does not belong in the editor line.
-  const active = report.providers.filter((provider) => provider.notConfigured !== true);
+  const active = firstPerFamily(report.providers.filter((provider) => provider.notConfigured !== true));
   if (active.length === 0) return theme.fg("dim", "quota: no providers configured in Pi");
 
   const renderToken = (provider: QuotaProvider, label: string, window: QuotaWindow | null, color = BRAND[provider.family] ?? "#8B949E"): string => {
@@ -467,15 +483,27 @@ function renderSidebarCard(report: QuotaReport | null, theme: Theme, width: numb
   ];
 }
 
-/** The detailed panel: every window, with a used-fraction bar. */
+/** The detailed panel: every account and every window, with a used-fraction bar. */
 function renderPanel(report: QuotaReport, theme: Theme): string[] {
   const lines: string[] = [];
   const active = report.providers.filter((provider) => provider.notConfigured !== true);
   const unconfigured = report.providers.filter((provider) => provider.notConfigured === true);
 
+  const familyCounts = new Map<string, number>();
+  for (const provider of active) familyCounts.set(provider.family, (familyCounts.get(provider.family) ?? 0) + 1);
+
   for (const provider of active) {
-    const name = paint(BRAND[provider.family] ?? "#8B949E", provider.label);
-    const meta = [provider.account];
+    // A multi-account family gets one row per account. The title carries the
+    // label ("OP-Go #2") so the account is not repeated in the meta line.
+    const multi = (familyCounts.get(provider.family) ?? 0) > 1
+      && typeof provider.account === "string"
+      && provider.account.startsWith("#");
+    const title = multi
+      ? `${SHORT_NAME[provider.family] ?? provider.label} ${provider.account}`
+      : provider.label;
+    const name = paint(BRAND[provider.family] ?? "#8B949E", title);
+    const meta: string[] = [];
+    if (!multi) meta.push(provider.account);
     if (provider.plan) meta.push(`plan ${provider.plan}`);
     // Two stores can back Claude, and this is the one place that says which.
     if (provider.sourceKind === "claude-code") meta.push("Claude Code CLI");
@@ -486,7 +514,7 @@ function renderPanel(report: QuotaReport, theme: Theme): string[] {
           : theme.fg("dim", `token ${provider.expiresInMin}m`),
       );
     }
-    lines.push(`${name} ${theme.fg("dim", `· ${meta.join(" · ")}`)}`);
+    lines.push(meta.length > 0 ? `${name} ${theme.fg("dim", `· ${meta.join(" · ")}`)}` : name);
 
     if (!provider.ok) {
       const kind = errorKind(provider.error);
@@ -878,7 +906,7 @@ export default function quotaPanelExtension(pi: ExtensionAPI): void {
       ctx.ui.notify(`Quota unavailable: ${lastError}`, "error");
       return;
     }
-    const active = report.providers.filter((provider) => provider.notConfigured !== true);
+    const active = firstPerFamily(report.providers.filter((provider) => provider.notConfigured !== true));
     const summary = active
       .map((provider) => {
         const name = SHORT_NAME[provider.family] ?? provider.family;
