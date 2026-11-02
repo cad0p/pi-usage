@@ -39,6 +39,24 @@ test("readAuthStore normalizes all four Pi providers", () => {
   assert.equal(byFamily["opencode-go"].label, "OpenCode Go (Pi)");
 });
 
+test("Pi's google-antigravity login maps to the antigravity family", () => {
+  const directory = mkdtempSync(join(tmpdir(), "pi-quota-auth-"));
+  const path = join(directory, "auth.json");
+  writeFileSync(
+    path,
+    JSON.stringify({
+      "google-antigravity": { type: "oauth", access: "ya29.fixture", refresh: "1//fixture", expires: 4102444800000, projectId: "agy-project" },
+    }),
+  );
+  const { credentials, warnings } = readAuthStore(path);
+  assert.deepEqual(warnings, []);
+  assert.equal(credentials.length, 1);
+  assert.equal(credentials[0].provider, "google-antigravity");
+  assert.equal(credentials[0].family, "antigravity");
+  assert.equal(credentials[0].projectId, "agy-project");
+  assert.equal(credentials[0].label, "Antigravity (Pi)");
+});
+
 test("stored credentials never carry an unknown provider", () => {
   const directory = mkdtempSync(join(tmpdir(), "pi-quota-auth-"));
   const path = join(directory, "auth.json");
