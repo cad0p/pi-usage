@@ -1,12 +1,22 @@
-# pi-quota
+# pi-usage
 
 One source of truth for quota: **the credentials Pi already owns**.
+
+> [!NOTE]
+> `@cad0p/pi-usage` is a fork of [J3pf/piQuota](https://github.com/J3pf/piQuota) (`@j3pf/piquota`). It adds:
+>
+> * **OpenCode Go from the API key**: `GET https://opencode.ai/zen/go/v1/usage` returns the rolling (5h), weekly and monthly windows for the key Pi already stores, so no browser session is needed.
+> * **Numbered accounts**: `auth.json` entries such as `opencode-go-2` … `opencode-go-14` (the [pi-fallback-provider](https://github.com/cad0p/pi-fallback-provider) sibling convention) are read as extra accounts of their base provider.
+> * **One Omarchy tab per provider**: a multi-account provider shows each account's binding window (`#2 · Monthly`) in a single tab, and summarises failed accounts.
+> * **`/usage` on demand**: the Pi command is `/usage` only, and nothing is pinned above the editor or in the footer unless you ask for it.
+>
+> Everything below still applies; the CLI is still called `piquota`.
 
 `pi-quota` is a standalone project. It does not import, invoke or modify
 shuvquota, and it never writes to a credential file.
 
 > [!TIP]
-> **Working with AI Agents?** See [AGENTS.md](AGENTS.md) for architectural boundaries, test runner commands, and hard invariants for AI coding agents.
+> **Working with AI Agents?** See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for architectural boundaries, test runner commands, and hard invariants for AI coding agents.
 
 | Surface | Command |
 | --- | --- |
@@ -121,7 +131,7 @@ the `read:org`, `repo`, and `workflow` scopes may be required.
 
 ## Prerequisites & Installation
 
-* **Node.js >= 20.0.0** (native `node:sqlite` and global `fetch` support; zero npm dependencies).
+* **Node.js >= 22.19.0** (native `node:sqlite` and global `fetch` support; zero npm dependencies).
 * **[Pi Coding Agent](https://github.com/earendil-works/pi)** (`pi`).
 * **[Gentle AI](https://github.com/Gentleman-Programming/gentle-pi)** (`gentle-pi`).
 * Platform support: Linux, WSL2, macOS. See [docs/OS-COMPATIBILITY.md](docs/OS-COMPATIBILITY.md) for OS-specific details.
@@ -129,13 +139,13 @@ the `read:org`, `repo`, and `workflow` scopes may be required.
 ### 1-Line Quick Install
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/J3fp/piQuota/master/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/cad0p/pi-usage/main/install.sh | bash
 ```
 
 ### Install the Pi extension from npm
 
 ```bash
-pi install npm:@j3pf/piquota
+pi install npm:@cad0p/pi-usage
 ```
 
 Loads both Pi extensions straight from the package. The quota panel resolves
@@ -159,8 +169,8 @@ sync while Pi is not running.
 ### Manual Install / Development
 
 ```bash
-git clone https://github.com/J3fp/piQuota.git
-cd piQuota
+git clone https://github.com/cad0p/pi-usage.git
+cd pi-usage
 ./install.sh                 # --link for development, --uninstall to remove
 ./install.sh --no-extension  # CLI only; keep the Pi extension installed as a package
 ```

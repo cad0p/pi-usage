@@ -6,7 +6,7 @@
 # shuvquota, and never writes to any credential file.
 #
 # What it does:
-#   1. validates prerequisites: Node.js >= 20, Pi Coding Agent, Gentle AI
+#   1. validates prerequisites: Node.js >= 22.19, Pi Coding Agent, Gentle AI
 #   2. detects operating system and platform nuances
 #   3. copies src/, bin/ and package.json to ~/.local/share/pi-quota
 #   4. symlinks ~/.local/bin/piquota
@@ -25,9 +25,9 @@ if [[ ! -f "${HERE:-}/package.json" ]]; then
   TMP_DIR="$(mktemp -d /tmp/pi-quota-install-XXXXXX)"
   trap 'rm -rf "$TMP_DIR"' EXIT
   if command -v git >/dev/null 2>&1; then
-    git clone --depth 1 https://github.com/J3fp/piQuota.git "$TMP_DIR" >/dev/null 2>&1
+    git clone --depth 1 https://github.com/cad0p/pi-usage.git "$TMP_DIR" >/dev/null 2>&1
   else
-    curl -fsSL https://github.com/J3fp/piQuota/archive/refs/heads/master.tar.gz | tar -xz -C "$TMP_DIR" --strip-components=1
+    curl -fsSL https://github.com/cad0p/pi-usage/archive/refs/heads/main.tar.gz | tar -xz -C "$TMP_DIR" --strip-components=1
   fi
   exec bash "$TMP_DIR/install.sh" "$@"
 fi
@@ -57,7 +57,7 @@ Usage: ./install.sh [--copy|--link|--uninstall] [--omarchy-timer] [--no-extensio
                Omarchy timer (its pi-*.json records are removed too)
   --no-extension
                Install only the CLI. Use this when the Pi extension is installed as a
-               pi package (`pi install npm:@j3pf/piquota`); nothing is copied or
+               pi package (`pi install npm:@cad0p/pi-usage`); nothing is copied or
                symlinked into ~/.pi/agent/extensions
   --omarchy-timer
                Also install and enable a systemd user timer that runs `piquota omarchy`
@@ -111,15 +111,15 @@ echo "=========================================="
 
 # --- 1. Validate Node.js version ---
 if ! command -v node >/dev/null 2>&1; then
-  fail "Node.js is not installed. Node.js >= 20.0.0 is required."
+  fail "Node.js is not installed. Node.js >= 22.19.0 is required."
 fi
 
 NODE_VERSION="$(node -v | sed 's/^v//')"
 NODE_MAJOR="$(echo "$NODE_VERSION" | cut -d. -f1)"
-if [[ "$NODE_MAJOR" -lt 20 ]]; then
-  fail "Node.js v$NODE_VERSION found. Node.js >= 20.0.0 is required (native node:sqlite & fetch support)."
+if [[ "$NODE_MAJOR" -lt 22 ]]; then
+  fail "Node.js v$NODE_VERSION found. Node.js >= 22.19.0 is required (native node:sqlite & fetch support)."
 fi
-ok "Node.js v$NODE_VERSION (>= 20.0.0)"
+ok "Node.js v$NODE_VERSION (>= 22.19.0)"
 
 # --- 2. Validate Pi Coding Agent ---
 PI_FOUND=false
@@ -252,7 +252,7 @@ if [[ "$INSTALL_EXTENSION" == "true" ]]; then
   fi
 else
   log "skipping the Pi extension and its gentle-pi rail slot (--no-extension)"
-  log "  install it as a package instead: pi install npm:@j3pf/piquota"
+  log "  install it as a package instead: pi install npm:@cad0p/pi-usage"
 fi
 
 # --- Omarchy Agents panel timer (opt-in) ---

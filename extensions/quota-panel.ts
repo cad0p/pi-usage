@@ -156,6 +156,7 @@ function resolveCliPath(): string | null {
   for (const candidate of [
     join(homedir(), ".local", "share", "pi-quota", "bin", "piquota.js"),
     join(homedir(), ".local", "bin", "piquota"),
+    join(homedir(), ".pi", "agent", "npm", "node_modules", "@cad0p", "pi-usage", "bin", "piquota.js"),
     join(homedir(), ".pi", "agent", "npm", "node_modules", "@j3pf", "piquota", "bin", "piquota.js"),
   ]) {
     if (existsSync(candidate)) return candidate;
