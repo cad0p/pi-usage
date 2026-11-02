@@ -65,7 +65,7 @@ shuvquota, and it never writes to a credential file.
 | --- | --- | --- | --- |
 | Claude | Claude Code CLI store, else `anthropic.access` | `GET api.anthropic.com/api/oauth/usage` | ✅ 5h + weekly + plan |
 | Codex | `openai-codex.access` + `accountId` | `GET chatgpt.com/backend-api/wham/usage` | ✅ 5h + weekly + plan |
-| Antigravity | `antigravity.access` + `projectId` | `POST cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary` | ✅ Gemini + Claude/GPT buckets, **with in-memory refresh** |
+| Antigravity | `google-antigravity.access` (or legacy `antigravity`) + `projectId` | `POST cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary` | ✅ Gemini + Claude/GPT buckets, **with in-memory refresh** |
 | OpenCode Go | `opencode-go.key`, numbered siblings included | `GET opencode.ai/zen/go/v1/usage` | ✅ 5h + weekly + monthly per account; the session cookie and SSR dashboard are a base-account fallback |
 | GitHub Actions (opt-in) | Authenticated `gh` CLI | `gh api /organizations/<org>/settings/billing/usage/summary?product=Actions` | ✅ org-wide monthly Linux minutes, plan-derived allowance |
 
@@ -499,7 +499,7 @@ extensions/quota-panel.ts      Pi TUI line and /usage
 ## Tests
 
 ```bash
-node --test tests/*.test.mjs     # 266 tests, fake tokens only, no network
+node --test tests/*.test.mjs     # 267 tests, fake tokens only, no network
 ```
 
 Modules covered: `auth.json` parsing and de-duplication, the Claude Code store

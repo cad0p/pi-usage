@@ -24,6 +24,9 @@ export const FAMILY_BY_PROVIDER = {
   "openai-codex": "codex",
   anthropic: "claude",
   antigravity: "antigravity",
+  // Pi's built-in /login stores Antigravity under this key; `antigravity` is
+  // kept for stores written by older Pi releases and third-party plugins.
+  "google-antigravity": "antigravity",
   "opencode-go": "opencode-go",
 };
 
