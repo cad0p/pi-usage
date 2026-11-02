@@ -171,7 +171,8 @@ const PROVIDERS = {
  * @property {Record<string, import("./local/pi-sessions.js").LocalFamilyStats>} localStats
  *           Tokens Pi's own session files recorded, per family. Empty when the
  *           scan is disabled, still warming up or has nothing to report.
- * @property {{ files: number, scanned: number, reused: number, bytesRead: number, durationMs: number, partial: boolean, budgetMs: number } | null} localStatsMeta
+ * @property {import("./local/pi-sessions.js").LocalScanMeta | null} localStatsMeta
+ *           How the token scan went, including `partial` and `locked`.
  */
 
 /**

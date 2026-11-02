@@ -51,6 +51,16 @@ test("--rebuild-totals is an owned boolean flag, not a typo", () => {
   assert.equal(parseArgs(["stats"]).rebuildTotals, false);
 });
 
+test("--rebuild-totals is refused outside \`piquota stats\`", () => {
+  // The flag repairs the token-history rollup and reads nothing else, so it must
+  // not silently stand in for the command the user asked for.
+  for (const argv of [["--rebuild-totals"], ["claude", "--rebuild-totals"], ["omarchy", "--rebuild-totals"]]) {
+    const run = spawnSync(process.execPath, [CLI, ...argv], { encoding: "utf-8", timeout: 30_000 });
+    assert.equal(run.status, 2, `argv ${argv.join(" ")}: ${run.stderr}`);
+    assert.match(run.stderr, /--rebuild-totals only works with .piquota stats./);
+  }
+});
+
 test("subcommand value flags stay out of both positionals and unknown", () => {
   const auth = parseArgs(["auth", "opencode", "--wait", "180"]);
   assert.deepEqual(auth.positionals, ["auth", "opencode"]);

@@ -37,13 +37,28 @@
  * usage (the conservative direction) instead of hiding it.
  */
 
-import { createReadStream, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import {
+  closeSync,
+  createReadStream,
+  mkdirSync,
+  openSync,
+  readSync,
+  readdirSync,
+  readFileSync,
+  realpathSync,
+  renameSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 
 import { FAMILY_BY_PROVIDER, resolveProviderSlot } from "../auth/pi-auth.js";
 import { redact } from "../http.js";
 import {
+  acquireHistoryLock,
   addToModels,
   applyDurable,
   bucketMessages,
@@ -54,6 +69,7 @@ import {
   familyRowTokens,
   loadTotals,
   loadWindowDays,
+  releaseHistoryLock,
   resolveHistoryDir,
 } from "./history.js";
 
@@ -101,6 +117,21 @@ const RECENT_DAYS = 7;
  */
 
 /**
+ * How the scan went, for `localStatsMeta` in the report.
+ *
+ * @typedef {Object} LocalScanMeta
+ * @property {number} files      Session files found.
+ * @property {number} scanned    Files (re)read in this run.
+ * @property {number} reused     Files whose cached offsets still matched.
+ * @property {number} bytesRead  Bytes parsed in this run.
+ * @property {number} durationMs Scan wall time.
+ * @property {boolean} partial   The budget stopped the scan; nothing was frozen.
+ * @property {number} budgetMs   The budget that applied.
+ * @property {number} frozenDays Days moved into the durable history by this run.
+ * @property {boolean} locked    Another run held the history lock; nothing was written.
+ */
+
+/**
  * Options for a local-stats scan, as accepted by the engine's `localStats` option.
  *
  * @typedef {Object} LocalStatsOptions
@@ -130,6 +161,8 @@ const RECENT_DAYS = 7;
  * @property {number} ino
  * @property {number} offset
  * @property {boolean} complete
+ * @property {string} [fingerprint] Copy fingerprint of the content at `size`
+ *                                  (see fingerprintFile), only set after a full read.
  * @property {Record<string, Array<[string, string, string, number, number, number, number, number]>>} days
  */
 
@@ -562,6 +595,56 @@ async function scanFile(input) {
   return { offset: result.offset, complete: !result.aborted };
 }
 
+/** Bytes hashed from each end of a session file for the copy fingerprint. */
+const FINGERPRINT_BYTES = 32 * 1024;
+
+/**
+ * Fingerprint a session file as (size, first 32 KB, last 32 KB).
+ *
+ * This exists to recognise a byte-identical copy of a session that is already
+ * counted: a `cp`, a restored backup or a sync tool would otherwise add the
+ * same messages a second time, and for today's messages that is a real
+ * overcount (a frozen day is protected by the frozen-day rule instead).
+ *
+ * Only two small reads, so a duplicate 240 MB session costs 64 KB rather than
+ * a full parse. A *fork* (which copies a prefix and then diverges) has a
+ * different size and tail, so it is never mistaken for a copy and never loses
+ * the messages it added after forking.
+ *
+ * @param {string} path
+ * @param {number} size
+ * @returns {string | null} Hex digest, or null when the file cannot be read.
+ */
+function fingerprintFile(path, size) {
+  let fd = null;
+  try {
+    fd = openSync(path, "r");
+    const head = Buffer.alloc(Math.min(FINGERPRINT_BYTES, size));
+    if (head.length > 0) readSync(fd, head, 0, head.length, 0);
+    const tailLength = Math.min(FINGERPRINT_BYTES, Math.max(0, size - head.length));
+    let tail = Buffer.alloc(0);
+    if (tailLength > 0) {
+      tail = Buffer.alloc(tailLength);
+      readSync(fd, tail, 0, tailLength, size - tailLength);
+    }
+    const hash = createHash("sha256");
+    hash.update(`${size}\u0000`);
+    hash.update(head);
+    hash.update(tail);
+    return hash.digest("hex").slice(0, 32);
+  } catch {
+    return null;
+  } finally {
+    if (fd !== null) {
+      try {
+        closeSync(fd);
+      } catch {
+        // The fingerprint is an optimization; a close failure changes nothing.
+      }
+    }
+  }
+}
+
 /**
  * @param {string[]} roots
  * @returns {string[]}
@@ -619,14 +702,17 @@ function readCacheFile(path) {
   try {
     parsed = JSON.parse(readFileSync(path, "utf-8"));
   } catch {
-    return { files: {}, hit: false };
+    return { files: {}, hit: false, historyWatermark: "" };
   }
   if (!parsed || typeof parsed !== "object" || parsed.schemaVersion !== LOCAL_STATS_SCHEMA_VERSION) {
-    return { files: {}, hit: false };
+    return { files: {}, hit: false, historyWatermark: "" };
   }
   if (!parsed.files || typeof parsed.files !== "object" || Array.isArray(parsed.files)) {
-    return { files: {}, hit: false };
+    return { files: {}, hit: false, historyWatermark: "" };
   }
+  // The last `lastFrozenDay` this cache was written against. An empty rollup
+  // next to a non-empty watermark is a lost history, not a fresh one.
+  const historyWatermark = typeof parsed.historyWatermark === "string" ? parsed.historyWatermark : "";
 
   /** @type {Record<string, SessionFileEntry>} */
   const files = {};
@@ -643,19 +729,23 @@ function readCacheFile(path) {
       ino: typeof entry.ino === "number" && Number.isFinite(entry.ino) ? entry.ino : 0,
       offset: Math.max(0, entry.offset),
       complete: entry.complete !== false,
+      ...(typeof entry.fingerprint === "string" && entry.fingerprint !== "" ? { fingerprint: entry.fingerprint } : {}),
       days: /** @type {SessionFileEntry["days"]} */ (entry.days),
     };
   }
-  return { files, hit: true };
+  return { files, hit: true, historyWatermark };
 }
 
 /**
  * @param {string} path
  * @param {Record<string, SessionFileEntry>} files
+ * @param {string} historyWatermark The `lastFrozenDay` this cache is written against.
  * @returns {{ ok: boolean, error?: string }}
  */
-function writeCacheFile(path, files) {
-  const payload = `${JSON.stringify({ schemaVersion: LOCAL_STATS_SCHEMA_VERSION, files })}\n`;
+function writeCacheFile(path, files, historyWatermark = "") {
+  // `historyWatermark` records which `lastFrozenDay` this cache belongs to, so a
+  // later run can tell a lost rollup from a fresh install.
+  const payload = `${JSON.stringify({ schemaVersion: LOCAL_STATS_SCHEMA_VERSION, historyWatermark, files })}\n`;
   const temporary = `${path}.${process.pid}.tmp`;
   try {
     mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
@@ -822,8 +912,13 @@ export function buildLocalStats(input = {}) {
     const dayTokens = new Map();
     const dayModels = new Map();
     const daySlots = new Map();
+    const frozenThrough = totals.lastFrozenDay;
     for (const date of recentDates) {
-      const rows = openRows[date] ?? windowDays[date];
+      // A frozen day belongs to the month file, which carries its late writes;
+      // an open day belongs to the cache. Preferring the cache for a frozen day
+      // would hide a late append until the day left the window.
+      const frozen = frozenThrough !== "" && date <= frozenThrough;
+      const rows = frozen ? (windowDays[date] ?? openRows[date]) : (openRows[date] ?? windowDays[date]);
       const familyRow = rows?.[family];
       if (!familyRow) {
         dayTokens.set(date, 0);
@@ -956,10 +1051,9 @@ export function buildLocalStats(input = {}) {
  * @returns {Promise<{
  *   byFamily: Record<string, LocalFamilyStats>,
  *   warnings: string[],
- *   scan: { files: number, scanned: number, reused: number, bytesRead: number, durationMs: number, partial: boolean, budgetMs: number, frozenDays: number },
+ *   scan: LocalScanMeta,
  * }>}
- */
-export async function collectLocalStats(options = {}) {
+ */export async function collectLocalStats(options = {}) {
   const clock = options.clock ?? Date.now;
   const startedAt = clock();
   const now = options.now ?? Date.now();
@@ -970,177 +1064,275 @@ export async function collectLocalStats(options = {}) {
   const historyDir = options.historyDir ?? resolveHistoryDir(options);
   /** @type {string[]} */
   const warnings = [];
-
-  // A missing history or a missing cache every day still on disk has to be
-  // rebuildable, so both force a rescan. Frozen days are skipped in that case:
-  // they were already counted and a rescan must never add them again.
-  const history = loadTotals({ historyDir, warnings });
-  const cached = readCacheFile(cachePath);
-  const rescanAll = !cached.hit || history.rescanAll;
-  const lastFrozenDay = history.totals.lastFrozenDay;
-
-  const overBudget = () => clock() - startedAt > budgetMs;
   const listen = listSessionFiles(roots);
-  const listedSet = new Set(listen);
 
-  /** @type {Record<string, SessionFileEntry>} */
-  const next = {};
-  /** @type {Record<string, DayRows>} */
-  const lateRows = {};
-  let changed = !cached.hit;
-  let scanned = 0;
-  let reused = 0;
-  let bytesRead = 0;
-  let partial = overBudget();
-
-  for (const path of listen) {
-    if (!partial && overBudget()) partial = true;
-    if (partial) break;
-
-    let stats;
-    try {
-      stats = statSync(path);
-    } catch (error) {
-      if (cached.files[path]) next[path] = cached.files[path];
-      warnings.push(`local token stats: could not stat ${path}: ${redact(/** @type {{ message?: string }} */ (error)?.message)}`);
-      continue;
-    }
-
-    // Reuse only a file that was read to its last complete line at exactly
-    // this size and mtime. `offset < size` means a trailing partial line (or
-    // bytes that arrived after the read reached EOF), and those must be
-    // re-examined before the run can call the file unchanged.
-    const previous = cached.files[path];
-    if (
-      previous &&
-      !rescanAll &&
-      previous.size === stats.size &&
-      previous.mtimeMs === stats.mtimeMs &&
-      previous.ino === (stats.ino ?? 0) &&
-      previous.complete &&
-      previous.offset === previous.size
-    ) {
-      next[path] = previous;
-      reused += 1;
-      continue;
-    }
-
-    const replaced = previous ? previous.ino !== (stats.ino ?? 0) || stats.size < previous.offset : false;
-    const rescan = rescanAll || replaced;
-    const reset = !previous || rescan;
-    const days = reset ? emptyDays() : decodeDays(previous.days);
-    const startOffset = reset ? 0 : previous.offset;
-    let offset;
-    let complete;
-    try {
-      const result = await scanFile({
-        path,
-        startOffset,
-        days,
-        now,
-        shouldStop: overBudget,
-        onUsage: (usage) => {
-          if (lastFrozenDay && usage.day <= lastFrozenDay) {
-            // Frozen days are never recomputed. A first-time read (append) of
-            // bytes belonging to one is a late write and goes to history.
-            if (rescan) return;
-            addLateUsage(lateRows, usage);
-            return;
-          }
-          addUsage(days, usage);
-        },
-      });
-      offset = result.offset;
-      complete = result.complete;
-      bytesRead += offset - startOffset;
-    } catch (error) {
-      // A transient read error keeps the last known contribution instead of
-      // silently deleting history for that session.
-      if (previous) next[path] = previous;
-      warnings.push(`local token stats: could not read ${path}: ${redact(/** @type {{ message?: string }} */ (error)?.message)}`);
-      continue;
-    }
-
-    let finalStats = stats;
-    if (complete) {
-      try {
-        finalStats = statSync(path);
-      } catch {
-        // Keep the pre-scan stat; the next run detects the change.
-      }
-    }
-    next[path] = {
-      size: finalStats.size,
-      mtimeMs: finalStats.mtimeMs,
-      ino: finalStats.ino ?? 0,
-      offset,
-      complete,
-      days: encodeDays(days),
-    };
-    changed = true;
-    scanned += 1;
-    if (!complete) {
-      partial = true;
-      break;
-    }
-  }
-
-  // Files the budget skipped keep their previous entry; files that are gone
-  // lose theirs on this run.
-  for (const path of listen) {
-    if (!next[path] && cached.files[path]) next[path] = cached.files[path];
-  }
-  for (const path of Object.keys(cached.files)) {
-    if (!listedSet.has(path)) changed = true;
-  }
-
-  const openRows = buildOpenRows(next);
-  const applied = applyDurable({
-    historyDir,
-    totals: history.totals,
-    openRows,
-    lateRows,
-    today,
-    partial,
-    writable: history.writable,
-    ensure: !history.exists,
-    warnings,
-  });
-
-  // A day that is in the rollup (frozen now, or already frozen before a crash)
-  // must leave the disposable cache; otherwise a rescan would see it twice.
-  if (applied.droppedDays.size > 0) {
-    for (const entry of Object.values(next)) {
-      for (const day of applied.droppedDays) {
-        if (entry.days && day in entry.days) delete entry.days[day];
-      }
-    }
-    for (const day of applied.droppedDays) delete openRows[day];
-    changed = true;
-  }
-
-  if (changed) {
-    const written = writeCacheFile(cachePath, next);
-    if (!written.ok) {
-      warnings.push(`local token stats: could not write the scan cache at ${cachePath}: ${written.error}`);
-    }
-  }
-
-  const recentDates = recentLocalDates(now, RECENT_DAYS);
-  const windowDays = loadWindowDays({ historyDir, dates: recentDates, warnings });
-
-  return {
-    byFamily: buildLocalStats({ totals: history.totals, openRows, windowDays, now }),
-    warnings,
-    scan: {
-      files: listen.length,
-      scanned,
-      reused,
-      bytesRead,
-      durationMs: clock() - startedAt,
-      partial,
-      budgetMs,
-      frozenDays: applied.frozenDays.length,
-    },
+  /** @type {LocalScanMeta} */
+  const emptyScan = {
+    files: listen.length,
+    scanned: 0,
+    reused: 0,
+    bytesRead: 0,
+    durationMs: clock() - startedAt,
+    partial: false,
+    budgetMs,
+    frozenDays: 0,
+    locked: false,
   };
+
+  // The lock comes before the reads, not after: two writers (the systemd timer
+  // and /usage) that both read then both write would apply the same late-write
+  // delta twice. A run that cannot take it still answers, from what is on disk.
+  const lockPath = `${cachePath}.lock`;
+  const lock = acquireHistoryLock({ lockPath, now: clock() });
+  if (!lock.acquired) {
+    const history = loadTotals({ historyDir, warnings });
+    const cached = readCacheFile(cachePath);
+    warnings.push(
+      lock.reason
+        ? `local token stats: could not take the history lock (${lock.reason}); showing the numbers already on disk and writing nothing`
+        : "local token stats: another piquota run is updating the token history; showing the numbers already on disk",
+    );
+    return {
+      byFamily: buildLocalStats({
+        totals: history.totals,
+        openRows: buildOpenRows(cached.files),
+        windowDays: loadWindowDays({ historyDir, dates: recentLocalDates(now, RECENT_DAYS), warnings }),
+        now,
+      }),
+      warnings,
+      scan: { ...emptyScan, locked: true },
+    };
+  }
+
+  try {
+    // A missing history or a missing cache means every day still on disk has to
+    // be rebuildable, so both force a rescan. Frozen days are skipped in that
+    // case: they were already counted and a rescan must never add them again.
+    const history = loadTotals({ historyDir, warnings });
+    const cached = readCacheFile(cachePath);
+    // A rollup that lost its numbers while the cache remembers having seen
+    // frozen days is a lost history: rebuild whatever the session files still
+    // hold instead of leaving the all-time totals empty.
+    const lostHistory =
+      history.totals.families.size === 0 &&
+      history.totals.lastFrozenDay === "" &&
+      typeof cached.historyWatermark === "string" &&
+      cached.historyWatermark !== "";
+    const rescanAll = !cached.hit || history.rescanAll || lostHistory;
+    const lastFrozenDay = history.totals.lastFrozenDay;
+
+    const overBudget = () => clock() - startedAt > budgetMs;
+    const listedSet = new Set(listen);
+
+    // Fingerprint -> the live path already counted under it. Built from the
+    // cache (so a copy made after the original was scanned is still caught) and
+    // only for files that still exist: restoring a backup *after* deleting the
+    // original must count, not be discarded as a duplicate of a ghost.
+    /** @type {Map<string, string>} */
+    const counted = new Map();
+    for (const path of listen) {
+      const entry = cached.files[path];
+      if (entry?.fingerprint) counted.set(entry.fingerprint, path);
+    }
+
+    /** @type {Record<string, SessionFileEntry>} */
+    const next = {};
+    /** @type {Record<string, DayRows>} */
+    const lateRows = {};
+    let changed = !cached.hit;
+    let scanned = 0;
+    let reused = 0;
+    let bytesRead = 0;
+    let partial = overBudget();
+
+    for (const path of listen) {
+      if (!partial && overBudget()) partial = true;
+      if (partial) break;
+
+      let stats;
+      try {
+        stats = statSync(path);
+      } catch (error) {
+        if (cached.files[path]) next[path] = cached.files[path];
+        warnings.push(`local token stats: could not stat ${path}: ${redact(/** @type {{ message?: string }} */ (error)?.message)}`);
+        continue;
+      }
+
+      // Reuse only a file that was read to its last complete line at exactly
+      // this size and mtime. `offset < size` means a trailing partial line (or
+      // bytes that arrived after the read reached EOF), and those must be
+      // re-examined before the run can call the file unchanged.
+      const previous = cached.files[path];
+      if (
+        previous &&
+        !rescanAll &&
+        previous.size === stats.size &&
+        previous.mtimeMs === stats.mtimeMs &&
+        previous.ino === (stats.ino ?? 0) &&
+        previous.complete &&
+        previous.offset === previous.size
+      ) {
+        next[path] = previous;
+        reused += 1;
+        continue;
+      }
+
+      // Reading from zero is the rescan case, and every one of these reasons
+      // means "count the open days again, never the frozen ones":
+      //   - the cache is gone or unreadable (rescanAll);
+      //   - the file is a different inode or now shorter than what was read
+      //     (replaced, truncated);
+      //   - the cache has never seen this path. A copy, a move or a restored
+      //     backup looks exactly like a brand-new session, and its old-dated
+      //     messages were already frozen under the path it came from;
+      //   - the size is unchanged but the mtime moved: an in-place rewrite of
+      //     the same length, which reading from the old offset would miss.
+      const seen = previous !== undefined;
+      const replaced = seen && (previous.ino !== (stats.ino ?? 0) || stats.size < previous.offset);
+      const rewritten = seen && previous.size === stats.size && previous.mtimeMs !== stats.mtimeMs;
+      const rescan = rescanAll || !seen || replaced || rewritten;
+
+      // A byte-identical copy of a file that is already counted contributes
+      // nothing: its messages sit in the original's rows. The entry is still
+      // recorded at the copy's end so anything appended to it later is counted.
+      const fingerprint = rescan ? fingerprintFile(path, stats.size) : (previous?.fingerprint ?? null);
+      // Its own fingerprint in the map is not a copy: a rescan of the same file
+      // (a lost history, a rewritten file) must fold its days again.
+      const twin = rescan && fingerprint ? counted.get(fingerprint) : undefined;
+      const duplicateOf = twin === path ? undefined : twin;
+      if (rescan && fingerprint && duplicateOf === undefined) counted.set(fingerprint, path);
+      if (duplicateOf !== undefined) {
+        next[path] = {
+          size: stats.size,
+          mtimeMs: stats.mtimeMs,
+          ino: stats.ino ?? 0,
+          offset: stats.size,
+          complete: true,
+          fingerprint,
+          days: {},
+        };
+        changed = true;
+        reused += 1;
+        continue;
+      }
+
+      const days = rescan ? emptyDays() : decodeDays(previous.days);
+      const startOffset = rescan ? 0 : previous.offset;
+      let offset;
+      let complete;
+      try {
+        const result = await scanFile({
+          path,
+          startOffset,
+          days,
+          now,
+          shouldStop: overBudget,
+          onUsage: (usage) => {
+            if (lastFrozenDay && usage.day <= lastFrozenDay) {
+              // Frozen days are never recomputed. A first-time read (append) of
+              // bytes belonging to one is a late write and goes to history.
+              if (rescan) return;
+              addLateUsage(lateRows, usage);
+              return;
+            }
+            addUsage(days, usage);
+          },
+        });
+        offset = result.offset;
+        complete = result.complete;
+        bytesRead += offset - startOffset;
+      } catch (error) {
+        // A transient read error keeps the last known contribution instead of
+        // silently deleting history for that session.
+        if (previous) next[path] = previous;
+        warnings.push(`local token stats: could not read ${path}: ${redact(/** @type {{ message?: string }} */ (error)?.message)}`);
+        continue;
+      }
+
+      let finalStats = stats;
+      if (complete) {
+        try {
+          finalStats = statSync(path);
+        } catch {
+          // Keep the pre-scan stat; the next run detects the change.
+        }
+      }
+      next[path] = {
+        size: finalStats.size,
+        mtimeMs: finalStats.mtimeMs,
+        ino: finalStats.ino ?? 0,
+        offset,
+        complete,
+        ...(fingerprint ? { fingerprint } : {}),
+        days: encodeDays(days),
+      };
+      changed = true;
+      scanned += 1;
+      if (!complete) {
+        partial = true;
+        break;
+      }
+    }
+
+    // Files the budget skipped keep their previous entry; files that are gone
+    // lose theirs on this run.
+    for (const path of listen) {
+      if (!next[path] && cached.files[path]) next[path] = cached.files[path];
+    }
+    for (const path of Object.keys(cached.files)) {
+      if (!listedSet.has(path)) changed = true;
+    }
+
+    const openRows = buildOpenRows(next);
+    const applied = applyDurable({
+      historyDir,
+      totals: history.totals,
+      openRows,
+      lateRows,
+      today,
+      partial,
+      writable: history.writable,
+      ensure: !history.exists,
+      warnings,
+    });
+
+    // A day that is in the rollup (frozen now, or already frozen before a crash)
+    // must leave the disposable cache; otherwise a rescan would see it twice.
+    if (applied.droppedDays.size > 0) {
+      for (const entry of Object.values(next)) {
+        for (const day of applied.droppedDays) {
+          if (entry.days && day in entry.days) delete entry.days[day];
+        }
+      }
+      for (const day of applied.droppedDays) delete openRows[day];
+      changed = true;
+    }
+
+    if (changed) {
+      const written = writeCacheFile(cachePath, next, history.totals.lastFrozenDay);
+      if (!written.ok) {
+        warnings.push(`local token stats: could not write the scan cache at ${cachePath}: ${written.error}`);
+      }
+    }
+
+    const windowDays = loadWindowDays({ historyDir, dates: recentLocalDates(now, RECENT_DAYS), warnings });
+
+    return {
+      byFamily: buildLocalStats({ totals: history.totals, openRows, windowDays, now }),
+      warnings,
+      scan: {
+        files: listen.length,
+        scanned,
+        reused,
+        bytesRead,
+        durationMs: clock() - startedAt,
+        partial,
+        budgetMs,
+        frozenDays: applied.frozenDays.length,
+        locked: false,
+      },
+    };
+  } finally {
+    releaseHistoryLock(lockPath);
+  }
 }

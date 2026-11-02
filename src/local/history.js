@@ -34,7 +34,7 @@
  * still in history even when its session file is gone.
  */
 
-import { mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { closeSync, mkdirSync, openSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 
@@ -135,6 +135,20 @@ export function resolveTotalsPath(historyDir) {
  */
 export function resolveMonthPath(historyDir, month) {
   return join(historyDir, `tokens-${month}.json`);
+}
+
+/**
+ * Whether the history directory holds any frozen month file at all.
+ *
+ * @param {string} historyDir
+ * @returns {boolean}
+ */
+export function hasMonthFiles(historyDir) {
+  try {
+    return readdirSync(historyDir).some((name) => MONTH_FILE.test(name));
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -489,6 +503,84 @@ export function quarantine(path, warnings, label) {
   }
 }
 
+/** How long a lock file may sit there before another run treats it as abandoned. */
+export const DEFAULT_LOCK_STALE_MS = 120_000;
+
+/**
+ * Take an exclusive lock for one history write.
+ *
+ * Two writers are routine on this machine — the systemd timer that publishes
+ * Omarchy records and the /usage panel asking for a report — and both would
+ * otherwise load the same totals, apply the same late-write delta and write it
+ * twice. The lock is an `O_EXCL` file next to the disposable cache (never inside
+ * `~/.pi`, which is a git repository), holding the pid for debugging. A lock
+ * whose mtime is older than `staleMs` was left by a killed run and is taken
+ * over; a negative age (the clock moved backwards) is never treated as stale.
+ *
+ * @param {{
+ *   lockPath: string,
+ *   now?: number,
+ *   staleMs?: number,
+ * }} input
+ * @returns {{ acquired: boolean, path: string, stale: boolean, reason?: string }}
+ */
+export function acquireHistoryLock(input) {
+  const now = input.now ?? Date.now();
+  const staleMs = Number.isFinite(input.staleMs) ? /** @type {number} */ (input.staleMs) : DEFAULT_LOCK_STALE_MS;
+  const lockPath = input.lockPath;
+
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      mkdirSync(dirname(lockPath), { recursive: true, mode: 0o700 });
+    } catch (error) {
+      return { acquired: false, path: lockPath, stale: false, reason: `cannot create the lock directory: ${redact(/** @type {{ message?: string }} */ (error)?.message)}` };
+    }
+    try {
+      const fd = openSync(lockPath, "wx", 0o600);
+      try {
+        writeFileSync(fd, `${process.pid}\n`, "utf-8");
+      } finally {
+        closeSync(fd);
+      }
+      return { acquired: true, path: lockPath, stale: false };
+    } catch (error) {
+      if (/** @type {{ code?: string }} */ (error)?.code !== "EEXIST") {
+        return {
+          acquired: false,
+          path: lockPath,
+          stale: false,
+          reason: redact(/** @type {{ message?: string }} */ (error)?.message ?? String(error)),
+        };
+      }
+      let age = 0;
+      try {
+        age = now - statSync(lockPath).mtimeMs;
+      } catch {
+        // It vanished between open and stat: try once more.
+        continue;
+      }
+      if (age > staleMs) {
+        rmSync(lockPath, { force: true });
+        continue;
+      }
+      return { acquired: false, path: lockPath, stale: false };
+    }
+  }
+  return { acquired: false, path: lockPath, stale: true };
+}
+
+/**
+ * @param {string} lockPath
+ * @returns {void}
+ */
+export function releaseHistoryLock(lockPath) {
+  try {
+    rmSync(lockPath, { force: true });
+  } catch {
+    // A lock that cannot be removed is reclaimed by the stale timeout.
+  }
+}
+
 /**
  * @param {string} path
  * @param {unknown} value
@@ -541,6 +633,15 @@ export function loadTotals(input) {
   if (!totals) {
     const writable = quarantine(path, input.warnings, "local token history");
     return { totals: emptyTotals(), rescanAll: true, writable, path, exists: true };
+  }
+  // An empty rollup is either a fresh install (nothing has closed yet) or a
+  // rollup that lost its numbers (`stats --rebuild-totals` over a directory
+  // whose month files are gone). Month files on disk settle it: they are the
+  // evidence that something was frozen, so the session files are the only
+  // remaining source and the run has to rebuild from them.
+  if (totals.families.size === 0 && totals.lastFrozenDay === "" && hasMonthFiles(input.historyDir)) {
+    input.warnings.push("local token stats: the history rollup is empty but month files exist; rebuilding from the session files");
+    return { totals, rescanAll: true, writable: true, path, exists: true };
   }
   return { totals, rescanAll: false, writable: true, path, exists: true };
 }
@@ -763,6 +864,26 @@ export function rebuildTotalsFromMonths(input) {
     .filter((match) => match !== null)
     .map((match) => /** @type {RegExpExecArray} */ (match)[1])
     .sort();
+
+  // Refuse to zero a rollup that still has numbers when the month files it
+  // should be rebuilt from are gone: that turns one missing directory into
+  // permanently lost history. The caller reports it and exits non-zero.
+  if (months.length === 0) {
+    const existing = loadTotals({ historyDir: input.historyDir, warnings: [] });
+    if (existing.totals.families.size > 0) {
+      return {
+        ok: false,
+        error:
+          `no tokens-YYYY-MM.json under ${input.historyDir} while ${resolveTotalsPath(input.historyDir)} still has data; ` +
+          "refusing to replace it with an empty rollup",
+        months: 0,
+        days: 0,
+        families: 0,
+        lastFrozenDay: existing.totals.lastFrozenDay,
+        path: resolveTotalsPath(input.historyDir),
+      };
+    }
+  }
 
   const totals = emptyTotals();
   let days = 0;

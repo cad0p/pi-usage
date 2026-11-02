@@ -7,7 +7,21 @@
  */
 
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
+import {
+  copyFileSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  renameSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+  unlinkSync,
+  utimesSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
@@ -475,6 +489,252 @@ test("a corrupt history file is moved aside, warned about, and rebuilt from disk
   assert.equal(second.byFamily.claude.totalPrompts, 2);
 });
 
+test("a copied session file does not add its frozen days a second time", async () => {
+  const tree = tempTree();
+  const file = writeSession(tree.sessions, "a.jsonl", [
+    assistantLine({ ts: tsForDay(-1), usage: { input: 1_000, output: 0, cacheRead: 0, cacheWrite: 0 } }),
+    assistantLine({ ts: tsForDay(0), usage: { input: 1_000, output: 0, cacheRead: 0, cacheWrite: 0 } }),
+  ]);
+  await scan(tree);
+  const frozen = totalsOf(tree);
+  const day = localDayKey(Date.parse(tsForDay(-1)));
+  assert.equal(frozen.families.claude.totalPrompts, 1, "only the closed day is frozen");
+  assert.equal(monthOf(tree).days[day].claude.slots[""].models["claude-opus-5-5"].input, 1_000);
+
+  // A backup restore, a sync tool or a manual cp: the same history under a new
+  // path. It is new to the cache, so it must be read as a rescan (frozen days
+  // skipped), not as a late write into the day it copies.
+  copyFileSync(file, join(tree.sessions, "a-copy.jsonl"));
+  const after = await scan(tree);
+  assert.equal(after.byFamily.claude.totalPrompts, 2, "the frozen prompt plus today's, each once");
+  assert.equal(after.byFamily.claude.todayTotalTokens, 1_000, "today is not doubled by the copy");
+  assert.equal(monthOf(tree).days[day].claude.slots[""].models["claude-opus-5-5"].input, 1_000, "the frozen day is untouched");
+  assert.deepEqual(totalsOf(tree), frozen, "all-time totals are untouched");
+
+  // The copy is recorded at its own end, so what the copy's session does next
+  // is counted normally: only the duplicated prefix is ignored.
+  appendSession(join(tree.sessions, "a-copy.jsonl"), [
+    assistantLine({ ts: tsForDay(0), usage: { input: 20, output: 0, cacheRead: 0, cacheWrite: 0 } }),
+  ]);
+  const continued = await scan(tree);
+  assert.equal(continued.byFamily.claude.todayTotalTokens, 1_020);
+  assert.equal(continued.byFamily.claude.totalPrompts, 3);
+});
+
+test("a forked session that diverges from its parent is still counted", async () => {
+  const tree = tempTree();
+  const first = writeSession(tree.sessions, "a.jsonl", [
+    assistantLine({ ts: tsForDay(-1), usage: { input: 1_000, output: 0, cacheRead: 0, cacheWrite: 0 } }),
+    assistantLine({ ts: tsForDay(0), usage: { input: 1_000, output: 0, cacheRead: 0, cacheWrite: 0 } }),
+  ]);
+  await scan(tree);
+
+  // A fork copies the parent's lines and then appends its own: same head, a
+  // different size and tail, so the copy fingerprint must not swallow it.
+  writeSession(tree.sessions, "a-fork.jsonl", [
+    ...readFileSync(first, "utf-8").trimEnd().split("\n"),
+    assistantLine({ ts: tsForDay(0), usage: { input: 30, output: 0, cacheRead: 0, cacheWrite: 0 } }),
+  ]);
+  const after = await scan(tree);
+  // The fork's copied lines are counted again — the documented limitation: a
+  // divergent file is not a byte-identical copy, and dropping its prefix would
+  // also drop whatever it added. Only its *own* extra message is new.
+  assert.equal(after.byFamily.claude.todayTotalTokens, 2_030, "the parent, the copied line, and the fork's own message");
+  assert.equal(after.byFamily.claude.totalPrompts, 4);
+  assert.equal(after.byFamily.claude.recentDays.at(-2).messageCount, 1_000, "the frozen day is not touched by the fork");
+});
+
+test("a renamed session file keeps its frozen day and is not counted twice", async () => {
+  const tree = tempTree();
+  const file = writeSession(tree.sessions, "a.jsonl", [
+    assistantLine({ ts: tsForDay(-1), usage: { input: 1_000, output: 0, cacheRead: 0, cacheWrite: 0 } }),
+    assistantLine({ ts: tsForDay(0), usage: { input: 1_000, output: 0, cacheRead: 0, cacheWrite: 0 } }),
+  ]);
+  await scan(tree);
+  const frozen = totalsOf(tree);
+  const day = localDayKey(Date.parse(tsForDay(-1)));
+
+  renameSync(file, join(tree.sessions, "a-renamed.jsonl"));
+  const after = await scan(tree);
+  assert.equal(after.byFamily.claude.totalPrompts, 2, "one frozen prompt plus today's, not two of each");
+  assert.equal(after.byFamily.claude.todayTotalTokens, 1_000);
+  assert.deepEqual(totalsOf(tree), frozen, "a move is not a new day of history");
+  assert.equal(monthOf(tree).days[day].claude.slots[""].models["claude-opus-5-5"].input, 1_000);
+  assert.deepEqual(Object.keys(readJson(tree.cachePath).files), [join(tree.sessions, "a-renamed.jsonl")]);
+});
+
+test("a same-size in-place rewrite is rescanned instead of read from the old offset", async () => {
+  const tree = tempTree();
+  const before = assistantLine({ usage: { input: 1_000, output: 0, cacheRead: 0, cacheWrite: 0 } });
+  const file = writeSession(tree.sessions, "a.jsonl", [before]);
+  await scan(tree);
+  assert.equal((await scan(tree)).scan.reused, 1, "an untouched file is reused");
+
+  // Same byte length, different numbers, new mtime: truncate + rewrite. Reading
+  // from the cached offset would return nothing and keep the stale numbers.
+  const after = before.replace('"input":1000', '"input":7777');
+  assert.equal(Buffer.byteLength(after), Buffer.byteLength(before), "the rewrite must keep the size");
+  writeFileSync(file, `${after}\n`, "utf-8");
+  const result = await scan(tree);
+  assert.equal(result.scan.reused, 0);
+  assert.equal(result.byFamily.claude.todayTotalTokens, 7_777);
+  assert.equal(result.byFamily.claude.todayPrompts, 1);
+});
+
+test("a late write to a frozen day reaches the seven-day window", async () => {
+  const tree = tempTree();
+  const yesterday = localDayKey(Date.parse(tsForDay(-1)));
+  const file = writeSession(tree.sessions, "a.jsonl", [
+    assistantLine({ ts: tsForDay(-1), usage: { input: 1_000, output: 0, cacheRead: 0, cacheWrite: 0 } }),
+  ]);
+  await scan(tree);
+  assert.equal(monthOf(tree).days[yesterday].claude.slots[""].models["claude-opus-5-5"].input, 1_000);
+
+  // A cache written before the freeze still holds the day as open, while the
+  // month file has moved on. The window must trust the month file, or the day's
+  // late write stays invisible for the whole week.
+  const cache = readJson(tree.cachePath);
+  cache.files[file].days = {
+    [yesterday]: [["claude", "", "claude-opus-5-5", 1_000, 0, 0, 0, 1]],
+  };
+  writeFileSync(tree.cachePath, JSON.stringify(cache), "utf-8");
+  appendSession(file, [assistantLine({ ts: tsForDay(-1), usage: { input: 500, output: 0, cacheRead: 0, cacheWrite: 0 } })]);
+
+  const result = await scan(tree);
+  assert.equal(result.byFamily.claude.recentDays.at(-2).date, yesterday);
+  assert.equal(result.byFamily.claude.recentDays.at(-2).messageCount, 1_500, "the month file carries the late write");
+  assert.equal(result.byFamily.claude.todayTotalTokens, 0);
+  assert.equal(result.byFamily.claude.totalPrompts, 2, "the frozen message plus the late one, each once");
+  assert.equal(monthOf(tree).days[yesterday].claude.slots[""].models["claude-opus-5-5"].input, 1_500);
+});
+
+test("two concurrent scans apply a late write exactly once", async () => {
+  const tree = tempTree();
+  const yesterday = localDayKey(Date.parse(tsForDay(-1)));
+  const file = writeSession(tree.sessions, "a.jsonl", [
+    assistantLine({ ts: tsForDay(-1), usage: { input: 1_000, output: 0, cacheRead: 0, cacheWrite: 0 } }),
+  ]);
+  await scan(tree);
+  appendSession(file, [assistantLine({ ts: tsForDay(-1), usage: { input: 5_000, output: 0, cacheRead: 0, cacheWrite: 0 } })]);
+
+  // The systemd timer and /usage both fire; without the lock both would apply
+  // the same late delta and the frozen day would gain 10 000.
+  const [first, second] = await Promise.all([scan(tree), scan(tree)]);
+  const model = monthOf(tree).days[yesterday].claude.slots[""].models["claude-opus-5-5"];
+  assert.equal(model.input, 6_000, "the delta is applied once");
+  assert.equal(model.messages, 2);
+  assert.equal(totalsOf(tree).families.claude.modelUsage["claude-opus-5-5"].input, 6_000);
+  assert.equal([first.scan.locked, second.scan.locked].filter(Boolean).length, 1, "exactly one run took the read-only path");
+});
+
+test("a run that cannot take the history lock reports from disk and writes nothing", async () => {
+  const tree = tempTree();
+  writeSession(tree.sessions, "a.jsonl", [
+    assistantLine({ ts: tsForDay(-1), usage: { input: 1_000, output: 0, cacheRead: 0, cacheWrite: 0 } }),
+  ]);
+  const first = await scan(tree);
+  const frozen = totalsOf(tree);
+  const cacheBefore = readFileSync(tree.cachePath, "utf-8");
+
+  // Another run holds the lock; this one must answer and touch nothing.
+  const lockPath = `${tree.cachePath}.lock`;
+  writeFileSync(lockPath, "999999\n", "utf-8");
+  const blocked = await scan(tree);
+  assert.equal(blocked.scan.locked, true);
+  assert.equal(blocked.scan.scanned, 0);
+  assert.equal(blocked.byFamily.claude.totalPrompts, first.byFamily.claude.totalPrompts, "the numbers still come from disk");
+  assert.ok(blocked.warnings.some((warning) => warning.includes("another piquota run")), blocked.warnings.join(" | "));
+  assert.deepEqual(totalsOf(tree), frozen);
+  assert.equal(readFileSync(tree.cachePath, "utf-8"), cacheBefore);
+
+  // A lock left behind by a killed run is reclaimed once it is old enough.
+  const old = new Date(Date.now() - 10 * 60_000);
+  utimesSync(lockPath, old, old);
+  const taken = await scan(tree);
+  assert.equal(taken.scan.locked, false);
+  assert.ok(!existsSync(lockPath), "the lock is released when the run ends");
+});
+
+test("rebuild-totals refuses to zero a rollup whose month files are gone", async () => {
+  const tree = tempTree();
+  writeSession(tree.sessions, "a.jsonl", [
+    assistantLine({ ts: tsForDay(-1), usage: { input: 1_000, output: 0, cacheRead: 0, cacheWrite: 0 } }),
+  ]);
+  await scan(tree);
+  const frozen = totalsOf(tree);
+  const monthPath = resolveMonthPath(tree.historyDir, MONTH);
+  rmSync(monthPath, { force: true });
+
+  const warnings = [];
+  const rebuilt = rebuildTotalsFromMonths({ historyDir: tree.historyDir, warnings });
+  assert.equal(rebuilt.ok, false);
+  assert.match(rebuilt.error, /refusing to replace it with an empty rollup/);
+  assert.deepEqual(totalsOf(tree), frozen, "the existing rollup is left alone");
+
+  const original = process.stderr.write;
+  let stderr = "";
+  process.stderr.write = (chunk) => {
+    stderr += String(chunk);
+    return true;
+  };
+  try {
+    assert.equal(runStatsCommand({ rebuild: true, historyDir: tree.historyDir, cachePath: tree.cachePath }), 1);
+  } finally {
+    process.stderr.write = original;
+  }
+  assert.match(stderr, /could not rebuild the history totals/);
+});
+
+test("a lost rollup is rebuilt from the session files on the next scan", async () => {
+  const tree = tempTree();
+  writeSession(tree.sessions, "a.jsonl", [
+    assistantLine({ ts: tsForDay(-1), usage: { input: 1_000, output: 0, cacheRead: 0, cacheWrite: 0 } }),
+  ]);
+  await scan(tree);
+  assert.equal(totalsOf(tree).families.claude.totalPrompts, 1);
+
+  // What a rebuild over an empty month directory used to leave behind.
+  writeJsonAtomic(tree.totalsPath, { schemaVersion: 1, lastFrozenDay: "", families: {} });
+  const recovered = await scan(tree);
+  assert.equal(recovered.scan.scanned, 1, "the cache still remembers frozen days, so the run rescans");
+  assert.equal(recovered.byFamily.claude.totalPrompts, 1, "the day is frozen again from the session file");
+  assert.equal(totalsOf(tree).families.claude.totalPrompts, 1);
+});
+
+test("a fresh install with no closed days does not rescan on every run", async () => {
+  const tree = tempTree();
+  writeSession(tree.sessions, "a.jsonl", [
+    assistantLine({ ts: tsForDay(0), usage: { input: 10, output: 0, cacheRead: 0, cacheWrite: 0 } }),
+  ]);
+  const first = await scan(tree);
+  assert.equal(first.scan.scanned, 1);
+  assert.equal(totalsOf(tree).lastFrozenDay, "", "an empty rollup is written, nothing is frozen");
+
+  const second = await scan(tree);
+  assert.equal(second.scan.scanned, 0, "an empty rollup with no month files is not a lost history");
+  assert.equal(second.scan.reused, 1);
+  assert.equal(second.byFamily.claude.todayTotalTokens, 10);
+});
+
+test("a session that spans midnight counts one session-day per day", async () => {
+  const tree = tempTree();
+  const at = (day, hour) => {
+    const [year, month, date] = day.split("-").map(Number);
+    return new Date(year, month - 1, date, hour, 0, 0, 0).toISOString();
+  };
+  const yesterday = localDayKey(Date.parse(tsForDay(-1)));
+  writeSession(tree.sessions, "spanning.jsonl", [
+    assistantLine({ ts: at(yesterday, 23), usage: { input: 10, output: 0, cacheRead: 0, cacheWrite: 0 } }),
+    assistantLine({ ts: at(TODAY, 1), usage: { input: 20, output: 0, cacheRead: 0, cacheWrite: 0 } }),
+  ]);
+  const result = await scan(tree);
+  // Documented semantics: session counts are session-days, because a day is
+  // frozen without its session list.
+  assert.equal(result.byFamily.claude.totalSessions, 2);
+  assert.equal(result.byFamily.claude.todaySessions, 1);
+  assert.equal(result.byFamily.claude.totalPrompts, 2);
+});
+
 test("history is partitioned by local month", async () => {
   const tree = tempTree();
   writeSession(tree.sessions, "a.jsonl", [
@@ -613,10 +873,12 @@ test("a budget that expires mid-file keeps the bytes it read and resumes there",
   }
   const file = writeSession(tree.sessions, "big.jsonl", lines);
 
-  // Three clock reads fit the budget (start, initial check, first file); the
-  // 16384-line check inside readLines is the one that runs out.
+  // The scan reads the clock a fixed number of times before it starts parsing
+  // (start, meta, lock, loop top); the 16384-line check inside readLines is the
+  // one that must run out. If that count ever changes the test fails loudly on
+  // the "stopped inside the file" assertion below.
   let reads = 0;
-  const clock = () => (reads++ < 3 ? 0 : 1_000_000);
+  const clock = () => (reads++ < 5 ? 0 : 1_000_000);
   const partial = await collectLocalStats({
     roots: [tree.sessions],
     cachePath: tree.cachePath,
@@ -626,8 +888,11 @@ test("a budget that expires mid-file keeps the bytes it read and resumes there",
     clock,
   });
   assert.equal(partial.scan.partial, true);
-  assert.equal(partial.byFamily.claude.totalPrompts, 16_384);
   assert.equal(partial.scan.scanned, 1);
+  assert.ok(
+    partial.byFamily.claude.totalPrompts > 0 && partial.byFamily.claude.totalPrompts < 20_000,
+    `the budget must stop inside the file, not before it (read ${partial.byFamily.claude?.totalPrompts ?? 0} lines)`,
+  );
 
   const full = await scan(tree);
   assert.equal(full.scan.partial, false);

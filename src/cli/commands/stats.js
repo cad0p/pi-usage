@@ -5,7 +5,8 @@
  * the read-only view of it and the recovery path for a lost `totals.json`.
  */
 
-import { loadTotals, rebuildTotalsFromMonths, resolveHistoryDir } from "../../local/history.js";
+import { acquireHistoryLock, loadTotals, rebuildTotalsFromMonths, releaseHistoryLock, resolveHistoryDir } from "../../local/history.js";
+import { resolveLocalStatsCachePath } from "../../local/pi-sessions.js";
 import { redact } from "../../http.js";
 import { err, out } from "../output.js";
 
@@ -15,6 +16,7 @@ import { err, out } from "../output.js";
  *   env?: Record<string, string | undefined>,
  *   home?: string,
  *   historyDir?: string,
+ *   cachePath?: string,
  * }} [options]
  * @returns {number} Exit code.
  */
@@ -25,7 +27,20 @@ export function runStatsCommand(options = {}) {
   const warnings = [];
 
   if (options.rebuild) {
-    const result = rebuildTotalsFromMonths({ historyDir, warnings });
+    // The rebuild rewrites the same file a scan freezes into, so it takes the
+    // same lock: a concurrent scan must not interleave its freeze with it.
+    const lockPath = `${options.cachePath ?? resolveLocalStatsCachePath({ env, home: options.home })}.lock`;
+    const lock = acquireHistoryLock({ lockPath });
+    if (!lock.acquired) {
+      err(`stats: another piquota run holds the history lock (${lock.path}); try again in a moment`);
+      return 1;
+    }
+    let result;
+    try {
+      result = rebuildTotalsFromMonths({ historyDir, warnings });
+    } finally {
+      releaseHistoryLock(lockPath);
+    }
     for (const warning of warnings) err(`warning: ${warning}`);
     if (!result.ok) {
       err(`stats: could not rebuild the history totals: ${redact(result.error ?? "unknown error")}`);

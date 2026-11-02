@@ -152,8 +152,17 @@ async function main() {
     return runGentlePiCommand(sub);
   }
 
-  if (command === "stats" || args.rebuildTotals) {
-    return runStatsCommand({ rebuild: command === "stats" ? args.rebuildTotals : true, env: process.env });
+  if (args.rebuildTotals && command !== "stats") {
+    // The flag repairs one thing (the all-time rollup) and reads nothing else,
+    // so running it beside `piquota` or `piquota omarchy` would silently skip
+    // the command the user asked for.
+    err("--rebuild-totals only works with `piquota stats`\n");
+    process.stdout.write(HELP);
+    return 2;
+  }
+
+  if (command === "stats") {
+    return runStatsCommand({ rebuild: args.rebuildTotals, env: process.env });
   }
 
   if (command === "omarchy") {

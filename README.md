@@ -442,7 +442,7 @@ seven entries, oldest first, today last):
       "byAccount": { "#1": { "todayTokens": 14172, "weekTokens": 118422, "todayPrompts": 3, "totalPrompts": 1200, "totalTokens": 48812210 } }
     }
   },
-  "localStatsMeta": { "files": 604, "scanned": 1, "reused": 603, "bytesRead": 3042, "durationMs": 9, "partial": false, "budgetMs": 12000, "frozenDays": 0 }
+  "localStatsMeta": { "files": 604, "scanned": 1, "reused": 603, "bytesRead": 3042, "durationMs": 9, "partial": false, "budgetMs": 12000, "frozenDays": 0, "locked": false }
 }
 ```
 
@@ -527,7 +527,7 @@ history is Pi data, so it lives next to Pi's agent directory:
 | --- | --- |
 | `${PI_CODING_AGENT_DIR:-~/.pi/agent}/pi-usage/totals.json` | all-time rollup per family and account (models, prompts, session-days, active dates) plus `lastFrozenDay` |
 | `${PI_CODING_AGENT_DIR:-~/.pi/agent}/pi-usage/tokens-YYYY-MM.json` | the frozen days of one local month, keyed day → family → slot → model |
-| `~/.cache/pi-quota/local-sessions.json` | per-session-file size, mtime and byte offset, plus open days only |
+| `~/.cache/pi-quota/local-sessions.json` | per-session-file size, mtime, byte offset and copy fingerprint, plus open days only |
 
 > `~/.pi` is often a git repository. Add `agent/pi-usage/` to that repo's
 > `.gitignore` if you do not want your token counts committed.
@@ -547,28 +547,55 @@ loss; a lost or corrupt `totals.json` is moved aside as
 frozen days are never recomputed, so a replaced session file cannot rewrite them
 either. A lost *month* file loses only that month's daily detail — the all-time
 totals stay — and `piquota stats --rebuild-totals` recomputes `totals.json` from
-every month file, recovering days whose session files are already gone. A normal
-run reads only `totals.json` plus the month files covering the last seven days
-(current month, and the previous one early in a month), so years of history
-never slow a run: on this machine 45 frozen days cost ~28 KB in total —
-`totals.json` 6.9 KB and two month files of 5.4 KB and 16 KB.
+every month file, recovering days whose session files are already gone — and it
+refuses to run when there is no month file at all while `totals.json` still has
+data, because replacing that rollup with an empty one turns a missing directory
+into permanently lost history. A normal run reads only `totals.json` plus the
+month files covering the last seven days (current month, and the previous one
+early in a month), so years of history never slow a run: on this machine 45
+frozen days cost ~28 KB in total — `totals.json` 6.9 KB and two month files of
+5.4 KB and 16 KB. A day inside that window is read from its month file once it is
+frozen, so a late write to it shows up in "tokens by day" immediately instead of
+waiting for the week to roll over.
 
 Cost: the first run streams each session file once — 1.56 GB across 608 files
 in 3.0 s here; later runs read only the bytes appended since the previous scan
 (59 ms of scanning for the whole store, ~20 KB read), and every byte is parsed
 once in normal operation. The CLI's own wall time is dominated by the provider
 calls either way.
-The cache is atomic and `0600`; a rewrite or shrink rescans that file, a
-corrupt cache is a cache miss, and frozen days are skipped in either case. The
-scan has a wall-clock budget (12 s, or `PI_QUOTA_LOCAL_STATS_BUDGET_MS`) so the
-first run cannot push `/usage` past its 30 s exec timeout; when it runs out the
-report carries `localStatsMeta.partial`, the panel marks the numbers
+
+What forces a file to be read from its first byte (a *rescan*, in which frozen
+days are skipped and only open days are rebuilt): the cache missing or corrupt,
+the file replaced or now shorter, a path the cache has never seen (a copy, a
+move, a restored backup — its old days were already frozen under its previous
+path), or the same size with a new mtime (an in-place rewrite of the same
+length). An append only reads the new bytes. The one rewrite this cannot see is
+one that restores both the size *and* the mtime, which no stat-based check can
+detect. The cache is atomic and `0600`.
+
+Two writers are routine here (the systemd timer and `/usage`), so a run takes an
+exclusive lock — `local-sessions.json.lock`, with a 2-minute stale timeout —
+before it reads the history, and a run that cannot take it reports the numbers
+already on disk and writes nothing. Duplicate *sessions* are handled two ways. A
+byte-identical copy of a session file (a copy, a restored backup, a sync tool) is
+recognised by a (size, first 32 KB, last 32 KB) fingerprint and contributes
+nothing; anything appended to it later is counted normally. A *fork* that copies
+a prefix and then diverges has its own size and tail, so it is counted as a
+session of its own, duplicated prefix included: on this machine (611 files,
+186,443 assistant messages) only 11 message ids appeared in more than one file
+(0.006%), none of them on today, so message-id de-duplication would cost
+megabytes to correct a handful of tokens and is not implemented.
+
+The scan has a wall-clock budget (12 s, or `PI_QUOTA_LOCAL_STATS_BUDGET_MS`) so
+the first run cannot push `/usage` past its 30 s exec timeout; when it runs out
+the report carries `localStatsMeta.partial`, the panel marks the numbers
 `scan partial`, and nothing is frozen that run. `PI_QUOTA_LOCAL_STATS=0` turns
 the scan off.
 
-Forked sessions are not de-duplicated: on a 1.5 GB store (603 files, 185,626
-assistant messages) only 11 message ids appeared in more than one file (0.006%),
-so an id index would cost megabytes to correct a handful of tokens.
+Session counts are **session-days**, not distinct session files: a day is frozen
+as aggregate rows, without the list of files that fed it, so a session that runs
+past midnight counts once on each day it appears in. `todaySessions` is exact
+(those files are still open); `totalSessions` is the sum of the per-day counts.
 
 ## Layout
 
@@ -622,7 +649,7 @@ extensions/quota-panel.ts      Pi TUI line and /usage
 ## Tests
 
 ```bash
-node --test tests/*.test.mjs     # 303 tests, fake tokens only, no network
+node --test tests/*.test.mjs     # 315 tests, fake tokens only, no network
 ```
 
 Modules covered: `auth.json` parsing and de-duplication, the Claude Code store

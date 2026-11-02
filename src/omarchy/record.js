@@ -393,6 +393,11 @@ function buildFamilyRecord(family, providers, options = {}) {
  * The optional token fields Omarchy's Agents panel reads. Only aggregate counts
  * are copied: no prompt text, no session path, no account identity.
  *
+ * `totalSessions` counts session-DAYS, not distinct session files: a session
+ * that runs past midnight is one session in 20 files of `sessions/` but two
+ * rows here, because history is frozen per local day and a session's identity is
+ * gone once its day is (see the README's token-stats section).
+ *
  * @param {import("../local/pi-sessions.js").LocalFamilyStats | undefined} stats
  * @returns {Record<string, unknown>}
  */
