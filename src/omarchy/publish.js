@@ -81,7 +81,28 @@ function copyIfChanged(srcPath, dstPath) {
 }
 
 /**
+ * This package's own Omarchy plugin. It ships its marks inside the package and
+ * is normally a symlink into it, so copying into it would write into the
+ * installed package (or a git checkout) on every run.
+ */
+export const OWN_PLUGIN_ID = "cad0p.pi-usage";
+
+/**
+ * @param {string} manifestPath
+ * @returns {string}
+ */
+function manifestId(manifestPath) {
+  try {
+    const parsed = JSON.parse(readFileSync(manifestPath, "utf-8"));
+    return parsed && typeof parsed.id === "string" ? parsed.id : "";
+  } catch {
+    return "";
+  }
+}
+
+/**
  * Synchronize provider SVG icons into Omarchy plugin assets directories if present.
+ * This package's own plugin is skipped: it already carries the marks.
  *
  * @param {{ env?: Record<string, string | undefined>, home?: string }} [options]
  * @returns {string[]} Paths of written assets.
@@ -101,6 +122,7 @@ export function syncOmarchyAssets(options = {}) {
       const pluginDir = join(pluginsDir, plugin);
       const manifestPath = join(pluginDir, "manifest.json");
       if (!existsSync(manifestPath)) continue;
+      if (manifestId(manifestPath) === OWN_PLUGIN_ID) continue;
       const targetAssetsDir = join(pluginDir, "assets");
       if (!existsSync(targetAssetsDir)) {
         mkdirSync(targetAssetsDir, { recursive: true });

@@ -479,3 +479,17 @@ test("syncOmarchyAssets copies SVG marks into Omarchy plugin asset directories i
     rmSync(home, { recursive: true, force: true });
   }
 });
+
+test("syncOmarchyAssets leaves this package's own plugin alone", () => {
+  const home = tempDir();
+  try {
+    const ownDir = join(home, ".config", "omarchy", "plugins", "cad0p.pi-usage");
+    mkdirSync(ownDir, { recursive: true });
+    writeFileSync(join(ownDir, "manifest.json"), JSON.stringify({ id: "cad0p.pi-usage" }));
+    assert.deepEqual(syncOmarchyAssets({ home }), []);
+    assert.equal(existsSync(join(ownDir, "assets")), false, "the symlinked package must not be written into");
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
