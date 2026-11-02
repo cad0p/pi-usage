@@ -486,26 +486,146 @@ function renderSidebarCard(report: QuotaReport | null, theme: Theme, width: numb
 }
 
 /** The detailed panel: every account and every window, with a used-fraction bar. */
+/**
+ * Clip one line to `width` visible columns, keeping SGR sequences intact. Every
+ * glyph this extension paints is one column wide, so code points are columns.
+ */
+function clipToWidth(line: string, width: number): string {
+  let visible = 0;
+  let out = "";
+  let styled = false;
+  for (let index = 0; index < line.length; ) {
+    const sgr = /^\u001b\[[0-9;]*m/.exec(line.slice(index));
+    if (sgr) {
+      out += sgr[0];
+      styled = true;
+      index += sgr[0].length;
+      continue;
+    }
+    const char = String.fromCodePoint(line.codePointAt(index) as number);
+    // Close any open style so a cut line cannot bleed colour into the next one.
+    if (visible + 1 > width) return styled ? `${out}\u001b[0m` : out;
+    out += char;
+    visible += 1;
+    index += char.length;
+  }
+  return out;
+}
+
+/**
+ * The panel as a component rather than a string array: Pi caps string-array
+ * widgets at ten lines, and a multi-account family alone can exceed that.
+ */
+function panelComponent(lines: string[]) {
+  return () => ({
+    render: (width: number) => lines.map((line) => ` ${clipToWidth(line, Math.max(0, width - 1))}`),
+    invalidate() {},
+  });
+}
+
+/**
+ * The one-line notify summary. A multi-account family reports how many accounts
+ * answer and the account with the most room, not whichever key happens to be #1.
+ */
+function summarize(report: QuotaReport): string {
+  const active = report.providers.filter((provider) => provider.notConfigured !== true);
+  return firstPerFamily(active)
+    .map((provider) => {
+      const name = SHORT_NAME[provider.family] ?? provider.family;
+      if (isMultiAccount(active, provider)) {
+        const accounts = active.filter((other) => other.family === provider.family);
+        const scored = accounts
+          .filter((account) => account.ok)
+          .map((account) => ({ account, used: usedOf(bindingWindow(account)) }))
+          .filter((entry): entry is { account: QuotaProvider; used: number } => entry.used !== null);
+        const counted = `${accounts.filter((account) => account.ok).length}/${accounts.length} ok`;
+        if (scored.length === 0) return `${name}: ${counted}`;
+        const lowest = scored.reduce((best, entry) => (entry.used < best.used ? entry : best));
+        return `${name}: ${counted} · lowest ${Math.round(lowest.used)}% (${lowest.account.account})`;
+      }
+      if (!provider.ok) return `${name}: ${errorCaption(provider.error)}`;
+      const used = usedOf(headline(provider));
+      return `${name}: ${used === null ? "n/a" : `${Math.round(used)}% used`}`;
+    })
+    .join(" · ");
+}
+
+/** The account's fullest window: the one that stops its next prompt. */
+function bindingWindow(provider: QuotaProvider): QuotaWindow | null {
+  let best: QuotaWindow | null = null;
+  for (const window of provider.windows) {
+    const used = usedOf(window);
+    if (used === null) continue;
+    if (best === null || used > (usedOf(best) as number)) best = window;
+  }
+  return best;
+}
+
+/** Short per-account failure reason; mirrors src/omarchy/record.js. */
+function accountReason(error: string | null | undefined): string {
+  const text = String(error ?? "");
+  if (/key rejected|key was rejected/i.test(text)) return "key rejected";
+  if (/Go plan not active|Workspace access denied/i.test(text)) return "no Go plan";
+  return errorCaption(error);
+}
+
+/** `#N` accounts of one family, i.e. a family Pi holds several credentials for. */
+function isMultiAccount(providers: QuotaProvider[], provider: QuotaProvider): boolean {
+  return typeof provider.account === "string"
+    && provider.account.startsWith("#")
+    && providers.filter((other) => other.family === provider.family).length > 1;
+}
+
+/**
+ * One family, many accounts: a header plus one line per account with only its
+ * binding window, so fourteen keys stay fourteen lines instead of fifty-six.
+ */
+function renderAccountRows(accounts: QuotaProvider[], theme: Theme): string[] {
+  const family = accounts[0].family;
+  const healthy = accounts.filter((account) => account.ok).length;
+  const header = `${paint(BRAND[family] ?? "#8B949E", SHORT_NAME[family] ?? accounts[0].label)} ${theme.fg("dim", `· ${healthy} of ${accounts.length} accounts ok`)}`;
+  const lines = [header];
+  const width = Math.max(...accounts.map((account) => account.account.length));
+  for (const account of accounts) {
+    const label = theme.fg("dim", account.account.padEnd(width));
+    if (!account.ok) {
+      const kind = errorKind(account.error);
+      const color = kind === "transient" || kind === "throttle" ? "warning" : kind === "expired" || kind === "auth" ? "error" : "dim";
+      lines.push(`  ${label}  ${theme.fg(color, errorGlyph(account.error))} ${theme.fg("warning", accountReason(account.error))}`);
+      continue;
+    }
+    const window = bindingWindow(account);
+    const used = usedOf(window);
+    if (window === null || used === null) {
+      lines.push(`  ${label}  ${theme.fg("dim", "no rate-limit windows reported")}`);
+      continue;
+    }
+    const band = bandFor(used);
+    const reset = window.resetsInSec === null ? "" : theme.fg("dim", ` · reset in ${humanDuration(window.resetsInSec)}`);
+    lines.push(
+      `  ${label}  ${paint(band.color, band.glyph)} ${paint(band.color, bar(used))} ` +
+        `${paint(band.color, `${used.toFixed(used < 10 ? 1 : 0)}%`.padStart(5))} ` +
+        `${theme.fg("dim", window.id)}${reset}`,
+    );
+  }
+  return lines;
+}
+
 function renderPanel(report: QuotaReport, theme: Theme): string[] {
   const lines: string[] = [];
   const active = report.providers.filter((provider) => provider.notConfigured !== true);
   const unconfigured = report.providers.filter((provider) => provider.notConfigured === true);
-
-  const familyCounts = new Map<string, number>();
-  for (const provider of active) familyCounts.set(provider.family, (familyCounts.get(provider.family) ?? 0) + 1);
+  const renderedFamilies = new Set<string>();
 
   for (const provider of active) {
-    // A multi-account family gets one row per account. The title carries the
-    // label ("OP-Go #2") so the account is not repeated in the meta line.
-    const multi = (familyCounts.get(provider.family) ?? 0) > 1
-      && typeof provider.account === "string"
-      && provider.account.startsWith("#");
-    const title = multi
-      ? `${SHORT_NAME[provider.family] ?? provider.label} ${provider.account}`
-      : provider.label;
-    const name = paint(BRAND[provider.family] ?? "#8B949E", title);
-    const meta: string[] = [];
-    if (!multi) meta.push(provider.account);
+    if (isMultiAccount(active, provider)) {
+      if (renderedFamilies.has(provider.family)) continue;
+      renderedFamilies.add(provider.family);
+      lines.push(...renderAccountRows(active.filter((other) => other.family === provider.family), theme));
+      continue;
+    }
+    const name = paint(BRAND[provider.family] ?? "#8B949E", provider.label);
+    const meta: string[] = [provider.account];
     if (provider.plan) meta.push(`plan ${provider.plan}`);
     // Two stores can back Claude, and this is the one place that says which.
     if (provider.sourceKind === "claude-code") meta.push("Claude Code CLI");
@@ -647,7 +767,7 @@ export default function quotaPanelExtension(pi: ExtensionAPI): void {
     }
 
     if (panelVisible && report) {
-      ctx.ui.setWidget(WIDGET_KEY, renderPanel(report, theme), { placement: "aboveEditor" });
+      ctx.ui.setWidget(WIDGET_KEY, panelComponent(renderPanel(report, theme)), { placement: "aboveEditor" });
       return;
     }
 
@@ -939,16 +1059,7 @@ export default function quotaPanelExtension(pi: ExtensionAPI): void {
       ctx.ui.notify(`Quota unavailable: ${lastError}`, "error");
       return;
     }
-    const active = firstPerFamily(report.providers.filter((provider) => provider.notConfigured !== true));
-    const summary = active
-      .map((provider) => {
-        const name = SHORT_NAME[provider.family] ?? provider.family;
-        if (!provider.ok) return `${name}: ${errorCaption(provider.error)}`;
-        const used = usedOf(headline(provider));
-        return `${name}: ${used === null ? "n/a" : `${Math.round(used)}% used`}`;
-      })
-      .join(" · ");
-    ctx.ui.notify(summary || "No active providers configured in Pi", "info");
+    ctx.ui.notify(summarize(report) || "No active providers configured in Pi", "info");
   };
 
   pi.registerCommand("usage", {

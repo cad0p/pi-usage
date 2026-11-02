@@ -175,6 +175,28 @@ test("withCache refreshes once and then serves the cached copy", async () => {
   assert.equal(loads, 2);
 });
 
+test("withCache treats a report saved under another key as a miss", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "pi-quota-cache-key-"));
+  const path = join(directory, "usage.json");
+  const { fetchFn } = fullRoutes();
+  let loads = 0;
+  const loader = async () => {
+    loads += 1;
+    return collectQuota({ paths: [FIXTURE], claudeCodePaths: [], now: NOW, fetchFn, env: {}, stores: [], allowBrowser: false });
+  };
+
+  await withCache({ path, now: NOW, ttlMs: 60_000, key: "claude-source:auto" }, loader);
+  const sameKey = await withCache({ path, now: NOW + 5000, ttlMs: 60_000, key: "claude-source:auto" }, loader);
+  assert.equal(sameKey.cached, true);
+  const otherKey = await withCache({ path, now: NOW + 5000, ttlMs: 60_000, key: "claude-source:pi" }, loader);
+  assert.equal(otherKey.cached, false, "a Claude source switch must refetch");
+  assert.equal(loads, 2);
+  assert.equal(JSON.parse(readFileSync(path, "utf-8")).key, "claude-source:pi");
+  const partial = await withCache({ path, now: NOW + 6000, ttlMs: 60_000, key: "claude-source:auto", families: ["codex"] }, loader);
+  assert.equal(partial.cached, false);
+  assert.equal(JSON.parse(readFileSync(path, "utf-8")).key, "claude-source:auto", "a partial write under a new key replaces, never merges");
+});
+
 test("withCache merges a partial family query without poisoning the full cache", async () => {
   const directory = mkdtempSync(join(tmpdir(), "pi-quota-cache-partial-"));
   const path = join(directory, "usage.json");
@@ -259,7 +281,7 @@ test("with no Claude Code store, Pi's own anthropic entry is used", async () => 
   assert.equal(calls[0].init.headers.Authorization, "Bearer sk-ant-oat01-FAKE-access-for-fixtures-only");
 });
 
-test("an expired Claude Code token is not silently replaced by Pi's anthropic token", async () => {
+test("auto passes over an expired Claude Code token when Pi's anthropic login is fresh, and says so", async () => {
   const home = mkdtempSync(join(tmpdir(), "pi-quota-claude-src-"));
   const usersRoot = join(home, "no-windows-profiles");
   mkdirSync(join(home, ".claude"), { recursive: true });
@@ -271,9 +293,48 @@ test("an expired Claude Code token is not silently replaced by Pi's anthropic to
   const { fetchFn, calls } = fullRoutes();
   const report = await collectQuota({ paths: [FIXTURE], now: NOW, fetchFn, families: ["claude"], env: {}, home, usersRoot, stores: [], allowBrowser: false });
 
-  assert.equal(report.providers[0].sourceKind, "claude-code", "the preferred source is the only one tried");
+  assert.equal(report.providers[0].sourceKind, "pi");
+  assert.equal(report.claudeSource.mode, "pi");
+  assert.equal(calls.length, 1, "only one Claude source is queried");
+  assert.equal(calls[0].init.headers.Authorization, "Bearer sk-ant-oat01-FAKE-access-for-fixtures-only");
+  assert.ok(report.warnings.some((warning) => /claude: the Claude Code token expired 1m ago; using Pi's anthropic login instead/.test(warning)));
+});
+
+test("an expired Claude Code token is still used when Pi has no fresh anthropic login", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-quota-claude-src-"));
+  const usersRoot = join(home, "no-windows-profiles");
+  mkdirSync(join(home, ".claude"), { recursive: true });
+  writeFileSync(
+    join(home, ".claude", ".credentials.json"),
+    JSON.stringify({ claudeAiOauth: { accessToken: "sk-ant-oat01-FAKE-expired", expiresAt: NOW - 60_000, subscriptionType: "pro" } }),
+  );
+  const emptyStore = join(home, "empty-auth.json");
+  writeFileSync(emptyStore, "{}");
+
+  const { fetchFn, calls } = fullRoutes();
+  const report = await collectQuota({ paths: [emptyStore], now: NOW, fetchFn, families: ["claude"], env: {}, home, usersRoot, stores: [], allowBrowser: false });
+
+  assert.equal(report.providers[0].sourceKind, "claude-code");
   assert.equal(calls[0].init.headers.Authorization, "Bearer sk-ant-oat01-FAKE-expired");
   assert.ok(report.warnings.some((warning) => /claude: the Claude Code token expired/.test(warning)));
+});
+
+test("PI_QUOTA_CLAUDE_SOURCE=claude-code keeps an expired Claude Code token even when Pi's is fresh", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-quota-claude-src-"));
+  const usersRoot = join(home, "no-windows-profiles");
+  mkdirSync(join(home, ".claude"), { recursive: true });
+  writeFileSync(
+    join(home, ".claude", ".credentials.json"),
+    JSON.stringify({ claudeAiOauth: { accessToken: "sk-ant-oat01-FAKE-expired", expiresAt: NOW - 60_000, subscriptionType: "pro" } }),
+  );
+
+  const { fetchFn, calls } = fullRoutes();
+  const report = await collectQuota({
+    paths: [FIXTURE], now: NOW, fetchFn, families: ["claude"], env: { PI_QUOTA_CLAUDE_SOURCE: "claude-code" }, home, usersRoot, stores: [], allowBrowser: false,
+  });
+
+  assert.equal(report.providers[0].sourceKind, "claude-code");
+  assert.equal(calls[0].init.headers.Authorization, "Bearer sk-ant-oat01-FAKE-expired");
 });
 
 test("PI_QUOTA_CLAUDE_SOURCE=pi overrides the default preference", async () => {

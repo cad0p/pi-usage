@@ -100,6 +100,26 @@ export function resolveClaudeCredentials(input) {
     now: input.now,
   });
 
+  // `auto` prefers the Claude Code CLI only while its token is still usable. A
+  // leftover store from an uninstalled CLI never refreshes again, so once it has
+  // expired Pi's own login is the better source whenever Pi still has a fresh one.
+  if (claudeCode.ok && mode === "auto" && !checkFreshness(claudeCode.credential, input.now ?? Date.now()).fresh) {
+    const freshPi = fromPi.filter((credential) => checkFreshness(credential, input.now ?? Date.now()).fresh);
+    if (freshPi.length > 0) {
+      const expiredMin = Math.abs(checkFreshness(claudeCode.credential, input.now ?? Date.now()).expiresInMin ?? 0);
+      return {
+        credentials: freshPi,
+        mode: "pi",
+        unavailable: null,
+        // Said out loud so the switch is never silent: the report names the source
+        // it used and why the preferred one was passed over.
+        notice: `claude: the Claude Code token expired ${expiredMin}m ago; using Pi's anthropic login instead`,
+        claudeCodePaths: claudeCode.paths,
+        recoveredLock: claudeCode.recoveredLock ?? null,
+      };
+    }
+  }
+
   if (claudeCode.ok) {
     return {
       credentials: [claudeCode.credential],
@@ -191,6 +211,7 @@ export async function collectQuota(options = {}) {
     platform: options.platform,
     usersRoot: options.usersRoot,
     claudeCodePaths: options.claudeCodePaths,
+    now,
   });
 
   /**
@@ -207,6 +228,7 @@ export async function collectQuota(options = {}) {
   const byFamily = {};
   /** @type {string[]} */
   const warnings = [...loaded.warnings];
+  if (claude.notice) warnings.push(claude.notice);
   if (claude.recoveredLock) {
     warnings.push(
       `claude: removed abandoned OAuth refresh lock (${Math.round((claude.recoveredLock.ageMs ?? 0) / 1000)}s old) at ${claude.recoveredLock.lockPath}`,

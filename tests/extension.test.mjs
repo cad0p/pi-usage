@@ -255,12 +255,61 @@ test("the full panel lists every account while the box and the line keep one per
   const usage = harness.commands.find((command) => command.name === "usage");
   await usage.definition.handler("", harness.ctx);
   const panelWidget = harness.widgets.at(-1);
-  const panel = plain((Array.isArray(panelWidget) ? panelWidget : panelWidget.render(100)).join("\n"));
-  assert.match(panel, /OP-Go #1/);
-  assert.match(panel, /OP-Go #2/);
-  assert.match(panel, /Monthly window/);
+  const panel = plain(renderWidget(panelWidget).join("\n"));
+  assert.match(panel, /OP-Go · 2 of 2 accounts ok/);
+  assert.match(panel, /#1 .*100% monthly/, "each account shows only its fullest window");
+  assert.match(panel, /#2 .*100% monthly/);
+  assert.equal(/5h window/.test(panel), false, "per-account windows are not listed one by one");
+  assert.match(harness.notifications.at(-1), /OP-Go: 2\/2 ok · lowest 100% \(#1\)/);
 
   assert.equal((harness.notifications.at(-1).match(/OP-Go/g) ?? []).length, 1, "the summary names each family once");
+});
+
+test("a fourteen-account panel is a component, so Pi's ten-line cap never truncates it", async () => {
+  const module = await import(EXTENSION);
+  /** @param {number} slot */
+  const account = (slot) => {
+    const ok = slot <= 7;
+    return {
+      family: "opencode-go",
+      label: "OpenCode Go (Pi)",
+      account: `#${slot}`,
+      plan: "Go plan",
+      windows: ok
+        ? [
+            { id: "5h", label: "5h window", usedPercent: 0, remainingPercent: 100, resetsAt: null, resetsInSec: 600, note: null },
+            { id: "monthly", label: "Monthly window", usedPercent: 10 + slot * 10, remainingPercent: 90 - slot * 10, resetsAt: null, resetsInSec: 900000, note: null },
+          ]
+        : [],
+      error: ok ? null : slot <= 10 ? "OpenCode Go key rejected (401); reconnect that account in Pi" : "Go plan not active for this workspace (403 Workspace access denied)",
+      ok,
+      updatedAt: "2030-01-01T00:00:00.000Z",
+      expiresInMin: null,
+    };
+  };
+  const harness = makeHarness({
+    report: {
+      generatedAt: "2030-01-01T00:00:00.000Z",
+      sources: [],
+      warnings: [],
+      providers: [structuredClone(REPORT.providers[0]), ...Array.from({ length: 14 }, (_, index) => account(index + 1))],
+    },
+  });
+  module.default(harness.pi);
+  const usage = harness.commands.find((command) => command.name === "usage");
+  await usage.definition.handler("", harness.ctx);
+
+  const widget = harness.widgets.at(-1);
+  assert.equal(typeof widget, "function", "a string array would be capped at ten lines by Pi");
+  const lines = renderWidget(widget, undefined, 40);
+  assert.ok(lines.length > 15, `every account has its own line (${lines.length})`);
+  assert.ok(lines.every((line) => plain(line).length <= 40), "no line is wider than the widget");
+  const panel = plain(renderWidget(widget).join("\n"));
+  assert.match(panel, /OP-Go · 7 of 14 accounts ok/);
+  assert.match(panel, /#14 .*no Go plan/);
+  assert.match(panel, /#8 .*key rejected/);
+  assert.match(panel, /#7 .*80% monthly/);
+  assert.match(harness.notifications.at(-1), /OP-Go: 7\/14 ok · lowest 20% \(#1\)/);
 });
 
 test("no surface is pinned at session start and the footer is left alone", async () => {
@@ -499,8 +548,8 @@ test("the bare command reveals the full panel and summarises used percent", asyn
   const usage = harness.commands.find((command) => command.name === "usage");
   await usage.definition.handler("", harness.ctx);
 
-  const widget = harness.widgets.at(-1);
-  assert.ok(Array.isArray(widget) && widget.length > 1, "the panel lists every window");
+  const widget = renderWidget(harness.widgets.at(-1));
+  assert.ok(widget.length > 1, "the panel lists every window");
   const text = plain(widget.join("\n"));
   assert.match(text, /5h window/);
   assert.match(text, /Weekly window/);
@@ -518,7 +567,7 @@ test("subcommands toggle the line, the panel, the footer and hide everything", a
   const usage = harness.commands.find((command) => command.name === "usage");
 
   await usage.definition.handler("panel", harness.ctx);
-  assert.ok(harness.widgets.at(-1).length > 1);
+  assert.ok(renderWidget(harness.widgets.at(-1)).length > 1);
 
   await usage.definition.handler("line", harness.ctx);
   assert.equal(renderWidget(harness.widgets.at(-1)).length, 1);
@@ -580,7 +629,7 @@ test("the panel is only painted after /usage asks for it", async () => {
 
   const usage = harness.commands.find((command) => command.name === "usage");
   await usage.definition.handler("panel", harness.ctx);
-  const panel = plain(harness.widgets.at(-1).join("\n"));
+  const panel = plain(renderWidget(harness.widgets.at(-1)).join("\n"));
   assert.match(panel, /Claude/);
   assert.match(panel, /5h window/, "the panel shows the fetched windows, not a loading placeholder");
 });
@@ -742,7 +791,7 @@ test("when mergeLastGood restores a transient failure, the line paints the carri
   assert.equal(line.includes("Claude:!"), false);
   const usage = harness.commands.find((command) => command.name === "usage");
   await usage.definition.handler("", harness.ctx);
-  assert.match(plain(harness.widgets.at(-1).join("\n")), /last known values, 1 min old/);
+  assert.match(plain(renderWidget(harness.widgets.at(-1)).join("\n")), /last known values, 1 min old/);
 });
 
 test("renderPanel footer lists notConfigured providers using the flag", async () => {
@@ -762,7 +811,7 @@ test("renderPanel footer lists notConfigured providers using the flag", async ()
   const usage = harness.commands.find((command) => command.name === "usage");
   await usage.definition.handler("panel", harness.ctx);
 
-  const panel = plain(harness.widgets.at(-1).join("\n"));
+  const panel = plain(renderWidget(harness.widgets.at(-1)).join("\n"));
   assert.match(panel, /Codex/);
   assert.match(panel, /not configured in Pi: Codex/);
   assert.equal(/not configured in Pi: Claude/.test(panel), false);
@@ -820,7 +869,7 @@ test("the panel names the Claude store, and the line never does", async () => {
 
   const usage = harness.commands.find((command) => command.name === "usage");
   await usage.definition.handler("", harness.ctx);
-  const panel = plain(harness.widgets.at(-1).join("\n"));
+  const panel = plain(renderWidget(harness.widgets.at(-1)).join("\n"));
   assert.match(panel, /Claude Code CLI/, "the panel says which store was read");
 });
 
