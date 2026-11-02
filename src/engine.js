@@ -8,6 +8,8 @@
 
 import { checkFreshness, LABEL_BY_FAMILY, loadPiCredentials, resolveAuthPaths } from "./auth/pi-auth.js";
 import { loadClaudeCodeCredential } from "./auth/claude-code-auth.js";
+import { redact } from "./http.js";
+import { collectLocalStats } from "./local/pi-sessions.js";
 import { degradedResult, displayIdentity, selectPrimaryWindow } from "./model.js";
 import { backoffState, clearBackoff, isAuthFailure, isThrottled, recordBackoff, retryAfterFromError } from "./providers/backoff.js";
 import { fetchQuota as fetchClaude } from "./providers/claude.js";
@@ -166,6 +168,10 @@ const PROVIDERS = {
  * @property {string[]} warnings
  * @property {import("./model.js").QuotaResult[]} providers   Flattened, family-ordered.
  * @property {Record<string, import("./model.js").QuotaResult[]>} byFamily
+ * @property {Record<string, import("./local/pi-sessions.js").LocalFamilyStats>} localStats
+ *           Tokens Pi's own session files recorded, per family. Empty when the
+ *           scan is disabled, still warming up or has nothing to report.
+ * @property {{ files: number, scanned: number, reused: number, bytesRead: number, durationMs: number, partial: boolean, budgetMs: number } | null} localStatsMeta
  */
 
 /**
@@ -186,6 +192,11 @@ const PROVIDERS = {
  *   stores?: import("./browser/cookies.js").CookieStore[],
  *   allowBrowser?: boolean,
  *   claudeCodePaths?: string[] | null,
+ *   localStats?: boolean | import("./local/pi-sessions.js").LocalStatsOptions,
+ *     Local token statistics from Pi's session files. Off unless asked for, so
+ *     tests and library callers never read a real home directory; the CLI turns
+ *     it on with a time budget. Pass an object to inject session roots or a
+ *     cache path, or false to disable it explicitly.
  * }} [options]
  * @returns {Promise<PiQuotaReport>}
  */
@@ -238,6 +249,17 @@ export async function collectQuota(options = {}) {
   const familyWarnings = {};
 
   const hasOpenAi = loaded.rawProviders?.includes("openai") || Boolean(env.OPENAI_API_KEY);
+
+  // The local scan runs beside the network calls: a first full scan of the
+  // session store costs seconds, and adding that to the quota round-trip would
+  // push the /usage extension closer to its 30 s exec timeout.
+  const localStatsOptions = typeof options.localStats === "object" && options.localStats !== null ? options.localStats : {};
+  const localStatsTask =
+    options.localStats === undefined || options.localStats === false
+      ? null
+      : collectLocalStats({ env, home: options.home, now, ...localStatsOptions }).catch(
+          (error) => /** @type {{ error: unknown }} */ ({ error }),
+        );
 
   await Promise.all(
     families.map(async (family) => {
@@ -364,6 +386,25 @@ export async function collectQuota(options = {}) {
     provider.primaryWindowId = selectPrimaryWindow(provider.windows ?? [])?.id ?? null;
   }
 
+  // Local statistics are a bonus, never a reason for a provider to fail: a
+  // rejected scan is reported as one warning and the report carries no numbers.
+  /** @type {Record<string, import("./local/pi-sessions.js").LocalFamilyStats>} */
+  let localStats = {};
+  /** @type {PiQuotaReport["localStatsMeta"]} */
+  let localStatsMeta = null;
+  if (localStatsTask) {
+    const local = await localStatsTask;
+    if ("error" in local) {
+      warnings.push(
+        `local token stats: ${redact(/** @type {{ message?: string }} */ (local.error)?.message ?? String(local.error))}`,
+      );
+    } else {
+      localStats = local.byFamily;
+      localStatsMeta = local.scan;
+      warnings.push(...local.warnings);
+    }
+  }
+
   return {
     engine: "pi-quota",
     schemaVersion: 1,
@@ -376,6 +417,8 @@ export async function collectQuota(options = {}) {
     warnings,
     providers,
     byFamily,
+    localStats,
+    localStatsMeta,
   };
 }
 

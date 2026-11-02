@@ -67,6 +67,12 @@ Any modification to this codebase MUST uphold these non-negotiable guarantees:
 1. **Read-Only Credential Access**:
    - `~/.pi/agent/auth.json` is opened strictly with `flag: "r"`. It must never be written, synced, or modified.
    - `~/.claude/.credentials.json` is opened read-only.
+   - Pi's session files (`~/.pi/agent/sessions/**/*.jsonl`,
+     `$PI_CODING_AGENT_DIR/sessions`, `~/.omp/agent/sessions`) are opened read-only
+     for the local token scan. The scan cache keys each file by path, size and
+     byte offset and stores only aggregate counts (tokens per local day and
+     model, prompt totals) and model names; a record and the report never carry
+     a session path, prompt text or tool output.
 2. **Token Refresh Invariants**:
    - **Antigravity**: Access tokens may be refreshed in memory using Google's public client, because Google refresh tokens do not rotate. The refreshed token must NEVER be written back to disk.
    - **Claude and Codex**: NEVER refresh access tokens. Both Anthropic and OpenAI rotate refresh tokens; refreshing a token would invalidate the credentials owned by external CLI tools.
@@ -75,9 +81,9 @@ Any modification to this codebase MUST uphold these non-negotiable guarantees:
    - Never print, log, cache, or transmit tokens, refresh tokens, session keys, or API keys.
    - Redact email addresses and identity markers in exported JSON artifacts via `src/http.js:redact`.
 4. **Filesystem Boundaries**:
-   - Caches and state files are restricted to `~/.cache/pi-quota/` and `~/.local/state/pi-quota/`.
+   - Caches and state files are restricted to `~/.cache/pi-quota/` (report cache, refresh/sticky state, and `local-sessions.json` for the token scan) and `~/.local/state/pi-quota/`.
    - File writes must be atomic (write to temporary file, then `renameSync`).
-   - Explicit opt-in exception: `piquota omarchy` may write (and remove stale) `pi-*.json` records, and only those, in Omarchy's agents usage directory (`${XDG_STATE_HOME:-~/.local/state}/omarchy/agents/usage/` or `PI_QUOTA_OMARCHY_DIR`), atomically. Records contain plan names, percentages, window labels and reset times, never tokens or account identifiers. Omarchy's own records are never touched.
+   - Explicit opt-in exception: `piquota omarchy` may write (and remove stale) `pi-*.json` records, and only those, in Omarchy's agents usage directory (`${XDG_STATE_HOME:-~/.local/state}/omarchy/agents/usage/` or `PI_QUOTA_OMARCHY_DIR`), atomically. Records contain plan names, percentages, window labels, reset times and, when the token scan has run, aggregate token counts per local day and model — never prompt text, session paths or account identifiers. Omarchy's own records are never touched.
 5. **Graceful Degradation**:
    - Provider failures (network timeouts, 401s, 429 rate limits, malformed payloads) must degrade gracefully into typed error states (`isTransient`, `isAuthFailure`, `isThrottled`, `notConfigured`), never throwing unhandled exceptions that crash the CLI or the Pi TUI.
 

@@ -8,6 +8,7 @@ One source of truth for quota: **the credentials Pi already owns**.
 > * **OpenCode Go from the API key**: `GET https://opencode.ai/zen/go/v1/usage` returns the rolling (5h), weekly and monthly windows for the key Pi already stores, so no browser session is needed.
 > * **Numbered accounts**: `auth.json` entries such as `opencode-go-2` … `opencode-go-14` (the [pi-fallback-provider](https://github.com/cad0p/pi-fallback-provider) sibling convention) are read as extra accounts of their base provider.
 > * **One Omarchy tab per provider**: a multi-account provider shows each account's binding window (`#2 · Monthly`) in a single tab, and summarises failed accounts.
+> * **Tokens by day and by model**: the tokens Pi's own session files recorded are folded per provider and shown in `/usage`, in `--json` (`localStats`) and in the Omarchy records, at a bounded scan cost.
 > * **`/usage` on demand**: the Pi command is `/usage` only, and nothing is pinned above the editor or in the footer unless you ask for it. A multi-account provider gets one line per account in the panel.
 > * **No dead Claude store**: `auto` passes over an expired Claude Code token when Pi's own `anthropic` login is fresh, and says so in the warnings.
 >
@@ -49,11 +50,16 @@ shuvquota, and it never writes to a credential file.
   endpoint is gone and no session cookie is configured.
 * `/usage` never injects quota into the LLM context: the extension only calls
   `ui.setStatus`, `ui.setWidget` and `ui.notify`.
+* Pi's session files (`~/.pi/agent/sessions/**/*.jsonl`) are opened read-only, to
+  count tokens per day and per model. The scan cache keys each file by its path,
+  size and byte offset and stores only aggregate counts and model names; no
+  prompt text or tool output is read into a cache, a record or the report.
 * Nothing is written outside these paths:
 
   | Path | What |
   | --- | --- |
   | `~/.cache/pi-quota/usage.json` | the report cache |
+  | `~/.cache/pi-quota/local-sessions.json` | per-session-file token scan cache |
   | `~/.cache/pi-quota/refresh-state.json` | each family's own refresh clock |
   | `~/.cache/pi-quota/last-published.json`, `last-good.json`, `backoff.json` | sticky snapshots and throttle state |
   | `~/.config/pi-quota/opencode-cookie` | only after `piquota auth opencode`, mode `600` |
@@ -364,6 +370,10 @@ Rp suite) without external network daemons or closed-source intermediaries:
 * **`notConfigured` vs `ok`**: unconfigured providers report `notConfigured: true`,
   allowing consumers to cleanly omit them without displaying false-positive
   error indicators.
+* **`localStats`**: the tokens Pi's own session files recorded, per family,
+  shaped exactly like the fields Omarchy's Agents panel reads (today, the last
+  seven local days, all-time per-model buckets) plus a `byAccount` breakdown for
+  numbered siblings. `localStatsMeta` says how the scan went.
 
 ```json
 {
@@ -404,6 +414,33 @@ Rp suite) without external network daemons or closed-source intermediaries:
 }
 ```
 
+The token part of the same report is abridged here (`recentDays` always carries
+seven entries, oldest first, today last):
+
+```json
+{
+  "localStats": {
+    "codex": {
+      "hasLocalStats": true,
+      "hasPromptStats": true,
+      "todayTotalTokens": 14172,
+      "todayPrompts": 3,
+      "todaySessions": 1,
+      "todayTokensByModel": { "gpt-5.1-codex": 14172 },
+      "weekTokensByModel": { "gpt-5.1-codex": 118422 },
+      "recentDays": [{ "date": "2026-10-27", "messageCount": 0 }],
+      "totalPrompts": 1200,
+      "totalSessions": 42,
+      "activeDays": 11,
+      "activeDates": ["2026-10-27"],
+      "modelUsage": { "gpt-5.1-codex": { "inputTokens": 4, "outputTokens": 425, "cacheReadInputTokens": 6838, "cacheCreationInputTokens": 6905 } },
+      "byAccount": { "#1": { "todayTokens": 14172, "weekTokens": 118422, "todayPrompts": 3, "totalPrompts": 1200, "totalTokens": 48812210 } }
+    }
+  },
+  "localStatsMeta": { "files": 604, "scanned": 1, "reused": 603, "bytesRead": 3042, "durationMs": 9, "partial": false, "budgetMs": 12000 }
+}
+```
+
 ### Each provider refreshes on its own clock
 
 Anthropic's usage endpoint answers `429` when polled every minute; Codex,
@@ -435,7 +472,9 @@ piquota omarchy                  # write pi-claude.json, pi-codex.json, ... once
 
 - Records are named `pi-<family>.json`, so they never overwrite Omarchy's own
   `claude.json` / `codex.json`. They hold plan names, used percentages, window
-  labels and reset times only; no tokens, accounts or e-mail addresses.
+  labels, reset times, and — when the token scan has run — aggregate token counts
+  per local day and per model (`hasLocalStats`, `recentDays`, `modelUsage`).
+  No prompt text, session path, account or e-mail address is copied.
 - A provider with a failing sign-in shows a status and a help line instead of
   limits. A provider that is not configured gets no record, and a stale
   `pi-*.json` is removed on the next run.
@@ -449,6 +488,44 @@ piquota omarchy                  # write pi-claude.json, pi-codex.json, ... once
   files when `claude.json` exists in the usage directory (override with `PI_QUOTA_OMARCHY_SKIP`).
 - `PI_QUOTA_OMARCHY_DIR` overrides the output directory. `./install.sh --uninstall`
   removes the timer and the `pi-*.json` records.
+
+## Token stats from Pi's own sessions
+
+Pi writes every assistant message's `usage` block into
+`~/.pi/agent/sessions/**.jsonl` (plus `~/.omp/agent/sessions` when the omp fork
+is installed; `PI_CODING_AGENT_DIR` relocates the Pi agent directory). piQuota
+folds those messages into tokens per local day and per model, per provider, and
+shows them next to the quota:
+
+| Where | What |
+| --- | --- |
+| `piquota --json` | `localStats.<family>` — the Omarchy-shaped counters plus `byAccount` |
+| `/usage` panel | a `tokens` row per provider: today, 7 days, prompts, then the top 3 models of the week |
+| `piquota omarchy` | the optional fields Omarchy's Agents panel draws as "Tokens by day" and "Tokens by model" |
+
+What counts: one assistant message with a non-zero token count is one prompt,
+and its tokens are `input + output + cacheRead + cacheWrite` — the same sum the
+Omarchy panel renders. Messages are bucketed by **local** date (the panel calls
+the last row "Today"). Only providers piQuota can bill are counted:
+`anthropic`, `openai-codex`, `antigravity`, `opencode-go` and their numbered
+siblings, so `opencode-go-7` is account `#7`. Providers it does not manage
+(`deepinfra`, `xai`, ...) are ignored, and so is the custom `claude-bridge`
+provider: its tokens are not a Pi subscription.
+
+Cost: the first run streams each session file once (1.5 GB ≈ 3 s here); later
+runs read only the bytes appended since the previous scan (≈ 10 ms when nothing
+changed). The per-file cache is `~/.cache/pi-quota/local-sessions.json`
+(atomic, `0600`), keyed by each file's size, mtime and last-read byte offset, so
+an append is read incrementally, a rewritten or shrinking file is rescanned, a
+deleted file drops its contribution, and a corrupt cache is a cache miss. The
+scan has a wall-clock budget (12 s, or `PI_QUOTA_LOCAL_STATS_BUDGET_MS`) so the
+first run cannot push `/usage` past its 30 s exec timeout; when it runs out the
+report carries `localStatsMeta.partial` and the panel marks the numbers
+`scan partial`. `PI_QUOTA_LOCAL_STATS=0` turns the scan off.
+
+Forked sessions are not de-duplicated: on a 1.5 GB store (603 files, 185,626
+assistant messages) only 11 message ids appeared in more than one file (0.006%),
+so an id index would cost megabytes to correct a handful of tokens.
 
 ## Layout
 
@@ -466,6 +543,7 @@ src/providers/antigravity-oauth.js  in-memory refresh with Google's public clien
 src/providers/backoff.js       per-family throttle state
 src/sticky.js                  last published / last good snapshots and throttle recovery
 src/engine.js                  collectQuota() -> one normalized report
+src/local/pi-sessions.js       token counts from Pi's session files, incremental scan cache
 src/model.js                   window normalization, percent and reset parsing
 src/render/{theme,panel}.js    colors, thresholds, rings, bars, boxed panel
 src/cache.js                   report cache at ~/.cache/pi-quota/usage.json
@@ -499,7 +577,7 @@ extensions/quota-panel.ts      Pi TUI line and /usage
 ## Tests
 
 ```bash
-node --test tests/*.test.mjs     # 267 tests, fake tokens only, no network
+node --test tests/*.test.mjs     # 291 tests, fake tokens only, no network
 ```
 
 Modules covered: `auth.json` parsing and de-duplication, the Claude Code store
@@ -509,9 +587,11 @@ Actions plan resolution, opt-in gating and degradation, the two Antigravity
 failures and the OpenCode degradation), the dashboard parser's three
 strategies, the Firefox cookie reader against a synthetic SQLite database, the
 Antigravity refresh (in-memory only), sticky and last-good snapshots resilience,
-the Omarchy record mapping and atomic writer, the renderers, the Pi
-extension contract, the per-family refresh clocks, argument parsing, and the
-structure of these documents themselves (tables, fences, links, anchors).
+the Omarchy record mapping and atomic writer, the local token scan (family and
+slot mapping, incremental append, shrink, deletion, local-day bucketing, cache
+corruption), the renderers, the Pi extension contract, the per-family refresh
+clocks, argument parsing, and the structure of these documents themselves
+(tables, fences, links, anchors).
 
 ## Acknowledgments & Prior Art
 

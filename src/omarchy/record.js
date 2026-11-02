@@ -10,9 +10,10 @@
  *
  * Record contract (see Omarchy's plugins/agents/Main.qml):
  *   id, name, ready, updatedAt, schemaVersion, tierLabel, usageStatusText,
- *   authHelpText and `limits[{label, title, percent, resetsAt}]`. The local
- *   token statistics are optional and are deliberately left out; the panel
- *   treats their absence as "no local stats".
+ *   authHelpText and `limits[{label, title, percent, resetsAt}]`. When the
+ *   report carries local token statistics for the family, the panel's optional
+ *   stats fields are merged in (today's tokens and prompts, the last seven
+ *   days, all-time per-model buckets) and `hasLocalStats` says they are there.
  *
  * `percent` is a FRACTION in 0..1 (the panel multiplies it by 100), so 40.3% used
  * is written as 0.403.
@@ -382,8 +383,48 @@ function buildFamilyRecord(family, providers, options = {}) {
       authHelpText: failures.length > 0 ? compactFailureList(failures) : status.authHelpText,
       hasLocalStats: false,
       hasPromptStats: false,
+      ...localStatsFields(options.localStats),
       updatedAt: new Date(now).toISOString(),
     },
+  };
+}
+
+/**
+ * The optional token fields Omarchy's Agents panel reads. Only aggregate counts
+ * are copied: no prompt text, no session path, no account identity.
+ *
+ * @param {import("../local/pi-sessions.js").LocalFamilyStats | undefined} stats
+ * @returns {Record<string, unknown>}
+ */
+function localStatsFields(stats) {
+  if (!stats || stats.hasLocalStats !== true) return {};
+  const modelUsage = {};
+  for (const [model, bucket] of Object.entries(stats.modelUsage ?? {})) {
+    modelUsage[model] = {
+      inputTokens: Number(bucket?.inputTokens) || 0,
+      outputTokens: Number(bucket?.outputTokens) || 0,
+      cacheReadInputTokens: Number(bucket?.cacheReadInputTokens) || 0,
+      cacheCreationInputTokens: Number(bucket?.cacheCreationInputTokens) || 0,
+    };
+  }
+  return {
+    hasLocalStats: true,
+    hasPromptStats: true,
+    todayPrompts: Number(stats.todayPrompts) || 0,
+    todaySessions: Number(stats.todaySessions) || 0,
+    todayTotalTokens: Number(stats.todayTotalTokens) || 0,
+    todayTokensByModel: Object.fromEntries(
+      Object.entries(stats.todayTokensByModel ?? {}).map(([model, tokens]) => [model, Number(tokens) || 0]),
+    ),
+    recentDays: (stats.recentDays ?? []).map((day) => ({
+      date: String(day?.date ?? ""),
+      messageCount: Number(day?.messageCount) || 0,
+    })),
+    totalPrompts: Number(stats.totalPrompts) || 0,
+    totalSessions: Number(stats.totalSessions) || 0,
+    activeDays: Number(stats.activeDays) || 0,
+    activeDates: [...(stats.activeDates ?? [])],
+    modelUsage,
   };
 }
 
@@ -393,7 +434,7 @@ function buildFamilyRecord(family, providers, options = {}) {
  * (and any record from an earlier run is removed by the publisher).
  *
  * @param {import("../model.js").QuotaResult} provider
- * @param {{ now?: number }} [options]
+ * @param {{ now?: number, localStats?: import("../local/pi-sessions.js").LocalFamilyStats }} [options]
  * @returns {{ id: string, record: Record<string, unknown> } | null}
  */
 export function buildRecord(provider, options = {}) {
@@ -421,6 +462,7 @@ export function buildRecord(provider, options = {}) {
       authHelpText: status.authHelpText,
       hasLocalStats: false,
       hasPromptStats: false,
+      ...localStatsFields(options.localStats),
       updatedAt: new Date(now).toISOString(),
     },
   };
@@ -434,7 +476,7 @@ export function buildRecord(provider, options = {}) {
  * Never throws: a malformed provider entry is skipped.
  *
  * @param {import("../engine.js").PiQuotaReport} report
- * @param {{ now?: number }} [options]
+ * @param {{ now?: number, localStats?: Record<string, import("../local/pi-sessions.js").LocalFamilyStats> }} [options]
  * @returns {Array<{ id: string, record: Record<string, unknown> }>}
  */
 export function buildRecords(report, options = {}) {
@@ -450,9 +492,12 @@ export function buildRecords(report, options = {}) {
   const records = [];
   for (const [family, providers] of groups) {
     try {
+      // Local stats belong to the family, not to one account: Omarchy's panel
+      // draws one token section per tab.
+      const familyOptions = { ...options, localStats: report?.localStats?.[family] };
       const built = providers.length > 1
-        ? buildFamilyRecord(family, providers, options)
-        : buildRecord(providers[0], options);
+        ? buildFamilyRecord(family, providers, familyOptions)
+        : buildRecord(providers[0], familyOptions);
       if (built) records.push(built);
     } catch {
       // A broken entry must not take the other providers' records down with it.

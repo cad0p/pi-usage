@@ -35,6 +35,20 @@ const VERSION = JSON.parse(readFileSync(new URL("../package.json", import.meta.u
  */
 const CACHE_KEY = `claude-source:${normalizeClaudeSourceMode(process.env.PI_QUOTA_CLAUDE_SOURCE)}`;
 
+/**
+ * Local token statistics from Pi's session files are on for the CLI: the Omarchy
+ * records and /usage both show them. `PI_QUOTA_LOCAL_STATS=0` turns the scan
+ * off (e.g. on a machine where the session store is huge and network quota is
+ * all that matters), and the budget keeps a first full scan from delaying a
+ * report past the 30 s the /usage extension allows.
+ */
+const LOCAL_STATS_BUDGET_MS = Number(process.env.PI_QUOTA_LOCAL_STATS_BUDGET_MS);
+const LOCAL_STATS = process.env.PI_QUOTA_LOCAL_STATS === "0"
+  ? false
+  : LOCAL_STATS_BUDGET_MS > 0
+    ? { budgetMs: LOCAL_STATS_BUDGET_MS }
+    : {};
+
 const HELP = `piquota ${VERSION} — read-only quota from Pi's provider credentials
 
 Usage:
@@ -71,13 +85,21 @@ Omarchy:
                                    (dir: $PI_QUOTA_OMARCHY_DIR or $XDG_STATE_HOME/omarchy/agents/usage)
                                    run it on a timer: ./install.sh --omarchy-timer
 
+Environment:
+  PI_QUOTA_LOCAL_STATS=0          skip the token scan of Pi's session files
+  PI_QUOTA_LOCAL_STATS_BUDGET_MS  wall-clock budget for that scan (default 12000)
+
 Guarantees:
   * ~/.pi/agent/auth.json is opened read-only. Never written, synced or refreshed.
+  * Pi's session files are opened read-only too; the token scan keeps only
+    aggregate counts per day and model, never prompt text or session paths.
   * Antigravity's access token may be refreshed in memory; it is never persisted.
   * Browser cookie databases are copied and opened read-only; values are never logged.
-  * Only percentages, window labels, reset times and plan names leave this machine.
+  * Only percentages, window labels, reset times, plan names and aggregate token
+    counts leave this machine.
   * \`omarchy\` (opt-in) writes only pi-*.json records, atomically, into Omarchy's usage dir;
-    records hold plan names, percentages, window labels and reset times, never accounts.
+    records hold plan names, percentages, window labels, reset times and aggregate
+    token counts, never prompt text or accounts.
   * \`gentle-pi\` is the one file this tool edits outside its own state: it appends
     piQuota's part to gentle-pi's rail allowlist so the card can be painted there.
     The edit is one array literal, it is reversible with \`piquota gentle-pi revert\`,
@@ -125,7 +147,8 @@ async function main() {
   if (command === "omarchy") {
     const load = async () => {
       const everyFamily = enabledFamilies({ env: process.env });
-      const loadFresh = () => collectQuota({ families: everyFamily, timeoutMs: args.timeoutMs, refresh, force: args.force });
+      const loadFresh = () =>
+        collectQuota({ families: everyFamily, timeoutMs: args.timeoutMs, refresh, force: args.force, localStats: LOCAL_STATS });
       const fresh = args.noCache
         ? await loadFresh()
         : (await withCache({ ttlMs: args.ttlMs, force: args.force, families: everyFamily, key: CACHE_KEY }, loadFresh)).report;
@@ -149,7 +172,8 @@ async function main() {
     requested: families.length > 0 ? families : undefined,
     explicit,
   });
-  const load = () => collectQuota({ families: selected, explicit, timeoutMs: args.timeoutMs, refresh, force: args.force });
+  const load = () =>
+    collectQuota({ families: selected, explicit, timeoutMs: args.timeoutMs, refresh, force: args.force, localStats: LOCAL_STATS });
 
   let report;
   let cached = false;
