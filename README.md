@@ -9,6 +9,7 @@ One source of truth for quota: **the credentials Pi already owns**.
 > * **Numbered accounts**: `auth.json` entries such as `opencode-go-2` … `opencode-go-14` (the [pi-fallback-provider](https://github.com/cad0p/pi-fallback-provider) sibling convention) are read as extra accounts of their base provider.
 > * **One Omarchy tab per provider**: a multi-account provider shows each account's binding window (`#2 · Monthly`) in a single tab, and summarises failed accounts.
 > * **`/usage` on demand**: the Pi command is `/usage` only, and nothing is pinned above the editor or in the footer unless you ask for it.
+> * **No dead Claude store**: `auto` passes over an expired Claude Code token when Pi's own `anthropic` login is fresh, and says so in the warnings.
 >
 > Everything below still applies; the CLI is still called `piquota`.
 
@@ -97,9 +98,12 @@ There are two ways to be signed in to Claude, and a user may have either or both
 | Claude Code CLI | `~/.claude/.credentials.json` (honours `CLAUDE_CONFIG_DIR`); on macOS, when that file is absent, the `Claude Code-credentials` login Keychain item (read-only, via `security find-generic-password`; macOS may ask once to allow access) | What `npm:pi-claude-code-provider` drives. A subscription with usage credits disabled answers `400` on Pi's own entry for every request, and this is the source that still works. |
 | Pi's own entry | `~/.pi/agent/auth.json` → `anthropic` | `/login anthropic` in Pi, without the plugin installed. |
 
-**The Claude Code CLI wins when both are present.** The choice is a *preference, not
-a fallback*: only the selected source is tried, so a broken preferred source is
-reported rather than silently masked by the other one. Override it with
+**The Claude Code CLI wins when both are present and its token is still valid.** The
+choice is a *preference, not a fallback*: only the selected source is tried, so a
+broken preferred source is reported rather than silently masked by the other one.
+The one exception is an expired Claude Code token next to a fresh Pi login: a store
+left behind by an uninstalled CLI never refreshes again, so `auto` reads Pi's login
+instead and adds a warning naming the switch. Override it with
 `PI_QUOTA_CLAUDE_SOURCE=pi` or `=claude-code`; `--explain` prints which one was used
 and why.
 
@@ -477,7 +481,7 @@ extensions/quota-panel.ts      Pi TUI line and /usage
 | `no claude credential in the Pi store or from the Claude Code CLI` | Neither Claude source is configured. `/login anthropic` in Pi, or install Claude Code and run `claude` once. |
 | `Claude Code CLI has no readable credentials; looked for …` | The store is missing, empty or corrupt. `piquota --explain` prints every path that was tried. |
 | `Claude Code token expired or rejected; run \`claude\` once` | Claude Code's own access token lapsed. Run any `claude` command; piQuota never refreshes it. |
-| Claude reports `plan pro` but the window looks wrong | The store is chosen by preference, not by success. `PI_QUOTA_CLAUDE_SOURCE=pi piquota` forces the other source. |
+| Claude reports `plan pro` but the window looks wrong | The store is chosen by preference, not by success. `PI_QUOTA_CLAUDE_SOURCE=pi piquota` forces the other source; the cache is keyed by that setting, so the switch refetches. |
 | `rate limited (HTTP 429); retry in Ns` | The vendor throttled the usage endpoint. Wait, or raise `--ttl`. |
 | `Antigravity token rejected` | Refresh failed; `/login antigravity` in Pi. `--no-refresh` disables the attempt. |
 | `no "auth" cookie for opencode.ai in N readable store(s)` | Run `piquota auth opencode`, or paste the cookie. |
@@ -488,7 +492,7 @@ extensions/quota-panel.ts      Pi TUI line and /usage
 ## Tests
 
 ```bash
-node --test tests/*.test.mjs     # 261 tests, fake tokens only, no network
+node --test tests/*.test.mjs     # 264 tests, fake tokens only, no network
 ```
 
 Modules covered: `auth.json` parsing and de-duplication, the Claude Code store

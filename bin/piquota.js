@@ -12,6 +12,8 @@
  *                                the rail slot gentle-pi needs to paint the quota card
  */
 
+import { readFileSync } from "node:fs";
+
 import { clearCache, withCache } from "../src/cache.js";
 import { parseArgs } from "../src/cli/args.js";
 import { runAuthCommand } from "../src/cli/commands/auth.js";
@@ -19,13 +21,19 @@ import { runGentlePiCommand } from "../src/cli/commands/gentle-pi.js";
 import { runOmarchyCommand } from "../src/cli/commands/omarchy.js";
 import { explainLines, resolveFamilies } from "../src/cli/explain.js";
 import { err, out } from "../src/cli/output.js";
-import { collectQuota, enabledFamilies } from "../src/engine.js";
+import { collectQuota, enabledFamilies, normalizeClaudeSourceMode } from "../src/engine.js";
 import { redact } from "../src/http.js";
 import { mergeLastGood } from "../src/sticky.js";
 import { renderBoxWidget, renderCompact, renderPanel, renderStatusLine } from "../src/render/panel.js";
 import { ansiPalette } from "../src/render/theme.js";
 
-const VERSION = "0.11.1";
+const VERSION = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf-8")).version;
+
+/**
+ * The cache answers for the settings it was collected under: a Claude source
+ * switch must refetch instead of serving the other source's result.
+ */
+const CACHE_KEY = `claude-source:${normalizeClaudeSourceMode(process.env.PI_QUOTA_CLAUDE_SOURCE)}`;
 
 const HELP = `piquota ${VERSION} — read-only quota from Pi's provider credentials
 
@@ -120,7 +128,7 @@ async function main() {
       const loadFresh = () => collectQuota({ families: everyFamily, timeoutMs: args.timeoutMs, refresh, force: args.force });
       const fresh = args.noCache
         ? await loadFresh()
-        : (await withCache({ ttlMs: args.ttlMs, force: args.force, families: everyFamily }, loadFresh)).report;
+        : (await withCache({ ttlMs: args.ttlMs, force: args.force, families: everyFamily, key: CACHE_KEY }, loadFresh)).report;
       return mergeLastGood(fresh, {}).report;
     };
     return runOmarchyCommand({ load });
@@ -149,7 +157,7 @@ async function main() {
   if (args.noCache) {
     report = await load();
   } else {
-    const result = await withCache({ ttlMs: args.ttlMs, force: args.force, families: selected }, load);
+    const result = await withCache({ ttlMs: args.ttlMs, force: args.force, families: selected, key: CACHE_KEY }, load);
     report = result.report;
     cached = result.cached;
     ageMs = result.ageMs;

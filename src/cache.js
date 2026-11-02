@@ -69,6 +69,7 @@ export function resolveCachePath(options = {}) {
  *   now?: number,
  *   env?: Record<string, string | undefined>,
  *   home?: string,
+ *   key?: string,       Settings fingerprint; a cached report saved under another key is a miss.
  * }} [options]
  * @returns {{ report: import("./engine.js").PiQuotaReport, ageMs: number, path: string } | null}
  */
@@ -100,6 +101,9 @@ export function readCache(options = {}) {
   if (savedAt === null) return null;
   const ageMs = now - savedAt;
   if (ageMs > ttlMs) return null;
+  // A report collected under other settings (e.g. another Claude source) answers a
+  // different question, so it is a miss rather than a stale hit.
+  if (options.key !== undefined && /** @type {{ key?: unknown }} */ (parsed).key !== options.key) return null;
 
   for (const provider of report.providers) {
     for (const win of provider.windows ?? []) {
@@ -122,6 +126,8 @@ export function readCache(options = {}) {
  *   now?: number,
  *   env?: Record<string, string | undefined>,
  *   home?: string,
+ *   merge?: boolean,
+ *   key?: string,
  * }} [options]
  * @returns {{ ok: boolean, path: string, error?: string }}
  */
@@ -135,7 +141,11 @@ export function writeCache(report, options = {}) {
       finalReport = mergeReportIntoCache(existing.report, report);
     }
   }
-  const payload = JSON.stringify({ savedAt: now, report: finalReport }, null, 2);
+  const payload = JSON.stringify(
+    options.key === undefined ? { savedAt: now, report: finalReport } : { savedAt: now, key: options.key, report: finalReport },
+    null,
+    2,
+  );
 
   try {
     mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
@@ -191,6 +201,7 @@ export function describeCache(options = {}) {
  *   path?: string,
  *   families?: string[],
  *   merge?: boolean,
+ *   key?: string,
  *   env?: Record<string, string | undefined>,
  *   home?: string,
  * }} options
