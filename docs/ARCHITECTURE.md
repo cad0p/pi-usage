@@ -58,6 +58,7 @@ The project uses Node.js's built-in test runner (`node:test` and `node:assert/st
 ### Test Invariants
 - Tests must **never access live external network services**. All HTTP requests are mocked or intercepted.
 - SQLite operations in tests run against temporary, synthetic in-memory or fixture databases.
+- The local token scan is injected with a temp `roots`, `cachePath` and `historyDir`; the suite never reads the real session store, writes under the real `~/.pi`, or touches the real `~/.cache`.
 - All tests must pass cleanly before any code is committed.
 
 ## Hard Architectural Rules & Guarantees
@@ -69,10 +70,11 @@ Any modification to this codebase MUST uphold these non-negotiable guarantees:
    - `~/.claude/.credentials.json` is opened read-only.
    - Pi's session files (`~/.pi/agent/sessions/**/*.jsonl`,
      `$PI_CODING_AGENT_DIR/sessions`, `~/.omp/agent/sessions`) are opened read-only
-     for the local token scan. The scan cache keys each file by path, size and
-     byte offset and stores only aggregate counts (tokens per local day and
-     model, prompt totals) and model names; a record and the report never carry
-     a session path, prompt text or tool output.
+     for the local token scan. The scan cache keeps per-file offsets and open
+     days; the durable history keeps frozen days. Both hold only aggregate
+     counts (tokens per local day and model, prompt totals) and model names; a
+     record and the report never carry a session path, prompt text or tool
+     output.
 2. **Token Refresh Invariants**:
    - **Antigravity**: Access tokens may be refreshed in memory using Google's public client, because Google refresh tokens do not rotate. The refreshed token must NEVER be written back to disk.
    - **Claude and Codex**: NEVER refresh access tokens. Both Anthropic and OpenAI rotate refresh tokens; refreshing a token would invalidate the credentials owned by external CLI tools.
@@ -82,6 +84,7 @@ Any modification to this codebase MUST uphold these non-negotiable guarantees:
    - Redact email addresses and identity markers in exported JSON artifacts via `src/http.js:redact`.
 4. **Filesystem Boundaries**:
    - Caches and state files are restricted to `~/.cache/pi-quota/` (report cache, refresh/sticky state, and `local-sessions.json` for the token scan) and `~/.local/state/pi-quota/`.
+   - The durable token history is the one write outside those directories that happens by default: `${PI_CODING_AGENT_DIR:-~/.pi/agent}/pi-usage/totals.json`, its `tokens-YYYY-MM.json` month files, and `.corrupt-<ts>` siblings when an unreadable one has to be moved aside. It holds frozen local-day aggregate counts and model names only — no prompt text, tool output, session path or account identity — and `PI_QUOTA_LOCAL_STATS=0` disables the scan that writes it.
    - File writes must be atomic (write to temporary file, then `renameSync`).
    - Explicit opt-in exception: `piquota omarchy` may write (and remove stale) `pi-*.json` records, and only those, in Omarchy's agents usage directory (`${XDG_STATE_HOME:-~/.local/state}/omarchy/agents/usage/` or `PI_QUOTA_OMARCHY_DIR`), atomically. Records contain plan names, percentages, window labels, reset times and, when the token scan has run, aggregate token counts per local day and model — never prompt text, session paths or account identifiers. Omarchy's own records are never touched.
 5. **Graceful Degradation**:

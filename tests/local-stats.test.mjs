@@ -1,18 +1,31 @@
 /**
  * Local token statistics tests.
  *
- * Every scan runs against a synthetic session tree in a temp directory with its
- * own cache path: no test reads the real Pi store or writes outside its fixture.
+ * Every scan runs against a synthetic session tree, a temp cache and a temp
+ * history directory: no test reads the real Pi store, writes under the real
+ * `~/.pi`, or touches `~/.cache`.
  */
 
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
+import { runStatsCommand } from "../src/cli/commands/stats.js";
 import { collectQuota } from "../src/engine.js";
+import {
+  emptyTotals,
+  applyDayToTotals,
+  loadTotals,
+  rebuildTotalsFromMonths,
+  resolveHistoryDir,
+  resolveMonthPath,
+  resolveTotalsPath,
+  totalsToJson,
+  writeJsonAtomic,
+} from "../src/local/history.js";
 import {
   collectLocalStats,
   localDayKey,
@@ -25,8 +38,24 @@ import { claudeUsageBody, jsonResponse, routedFetch } from "./helpers.mjs";
 
 const FIXTURE = fileURLToPath(new URL("./fixtures/fake-auth.json", import.meta.url));
 const NOW = Date.parse("2026-11-02T18:00:00.000Z");
+const TODAY = localDayKey(NOW);
+const MONTH = TODAY.slice(0, 7);
 
 let entrySequence = 0;
+
+/** ISO timestamp at local noon, `offset` days from the report time's local day. */
+function tsForDay(offset) {
+  const date = new Date(NOW);
+  date.setHours(12, 0, 0, 0);
+  date.setDate(date.getDate() + offset);
+  return date.toISOString();
+}
+
+/** Local-noon epoch for an explicit local date, independent of the machine's zone. */
+function noonOf(day) {
+  const [year, month, date] = day.split("-").map(Number);
+  return new Date(year, month - 1, date, 12, 0, 0, 0).getTime();
+}
 
 /** One JSONL assistant message, exactly as Pi writes it. */
 function assistantLine(input = {}) {
@@ -35,7 +64,7 @@ function assistantLine(input = {}) {
   return JSON.stringify({
     type: "message",
     id: `entry-${entrySequence}`,
-    timestamp: input.ts ?? "2026-11-02T10:00:00.000Z",
+    timestamp: input.ts ?? tsForDay(0),
     message: {
       role: input.role ?? "assistant",
       // `provider: null` omits the key, which is how a session written by an
@@ -52,7 +81,26 @@ function tempTree() {
   const dir = mkdtempSync(join(tmpdir(), "pi-quota-local-stats-"));
   const sessions = join(dir, "sessions");
   mkdirSync(sessions, { recursive: true });
-  return { dir, sessions, cachePath: join(dir, "cache", "local-sessions.json") };
+  const agentDir = join(dir, "agent");
+  return {
+    dir,
+    sessions,
+    agentDir,
+    cachePath: join(dir, "cache", "local-sessions.json"),
+    historyDir: join(agentDir, "pi-usage"),
+    totalsPath: join(agentDir, "pi-usage", "totals.json"),
+  };
+}
+
+function scan(tree, options = {}) {
+  return collectLocalStats({
+    roots: [tree.sessions],
+    cachePath: tree.cachePath,
+    historyDir: tree.historyDir,
+    now: NOW,
+    budgetMs: 60_000,
+    ...options,
+  });
 }
 
 function writeSession(dir, name, lines) {
@@ -66,8 +114,16 @@ function appendSession(path, lines) {
   writeFileSync(path, lines.map((line) => `${line}\n`).join(""), { flag: "a", encoding: "utf-8" });
 }
 
-function scan(options) {
-  return collectLocalStats({ now: NOW, budgetMs: 60_000, ...options });
+function readJson(path) {
+  return JSON.parse(readFileSync(path, "utf-8"));
+}
+
+function totalsOf(tree) {
+  return readJson(tree.totalsPath);
+}
+
+function monthOf(tree, month = MONTH) {
+  return readJson(resolveMonthPath(tree.historyDir, month));
 }
 
 /** Synthetic local stats, shaped like the builder's output. */
@@ -78,6 +134,7 @@ const LOCAL = {
   todaySessions: 2,
   todayTotalTokens: 34_567,
   todayTokensByModel: { "claude-opus-5-5": 30_000, "claude-sonnet-5": 4_567 },
+  weekTokensByModel: { "claude-opus-5-5": 118_422 },
   recentDays: [
     { date: "2026-10-27", messageCount: 0 },
     { date: "2026-10-28", messageCount: 1_000 },
@@ -114,15 +171,15 @@ function provider(overrides = {}) {
 }
 
 test("assistant messages map to families and siblings, and unknown providers are ignored", async () => {
-  const { sessions, cachePath } = tempTree();
-  writeSession(sessions, "--work--/a.jsonl", [
+  const tree = tempTree();
+  writeSession(tree.sessions, "--work--/a.jsonl", [
     assistantLine({ provider: "anthropic", model: "claude-opus-5-5", usage: { input: 4, output: 425, cacheRead: 6838, cacheWrite: 6905, totalTokens: 14172 } }),
     assistantLine({ provider: "opencode-go-7", model: "deepseek-v4.1-flash", usage: { input: 100, output: 10, cacheRead: 0, cacheWrite: 0, totalTokens: 110 } }),
     assistantLine({ provider: "deepinfra", model: "deepseek-ai/DeepSeek", usage: { input: 999, output: 999, cacheRead: 0, cacheWrite: 0, totalTokens: 1998 } }),
     assistantLine({ provider: "claude-bridge", model: "claude-opus-5-5", usage: { input: 999, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 999 } }),
   ]);
 
-  const result = await scan({ roots: [sessions], cachePath });
+  const result = await scan(tree);
 
   assert.deepEqual(Object.keys(result.byFamily).sort(), ["claude", "opencode-go"]);
   assert.equal(result.byFamily.claude.todayTotalTokens, 14_172);
@@ -130,27 +187,27 @@ test("assistant messages map to families and siblings, and unknown providers are
   assert.deepEqual(result.byFamily.claude.todayTokensByModel, { "claude-opus-5-5": 14_172 });
   assert.deepEqual(Object.keys(result.byFamily["opencode-go"].byAccount), ["#7"]);
   assert.equal(result.byFamily["opencode-go"].byAccount["#7"].todayTokens, 110);
-  assert.equal(result.byFamily.claude.recentDays.at(-1).date, localDayKey(NOW));
+  assert.equal(result.byFamily.claude.recentDays.at(-1).date, TODAY);
   assert.equal(result.byFamily.claude.recentDays.length, 7);
 });
 
 test("the api field identifies the family when the provider field is missing", async () => {
-  const { sessions, cachePath } = tempTree();
-  writeSession(sessions, "a.jsonl", [
+  const tree = tempTree();
+  writeSession(tree.sessions, "a.jsonl", [
     assistantLine({ provider: null, api: "openai-codex-responses", model: "gpt-5.1-codex", usage: { input: 7, output: 3, cacheRead: 0, cacheWrite: 0, totalTokens: 10 } }),
   ]);
-  const result = await scan({ roots: [sessions], cachePath });
+  const result = await scan(tree);
   assert.deepEqual(Object.keys(result.byFamily), ["codex"]);
   assert.equal(result.byFamily.codex.todayTotalTokens, 10);
 });
 
 test("assistant messages without any token count are not prompts", async () => {
-  const { sessions, cachePath } = tempTree();
-  writeSession(sessions, "a.jsonl", [
+  const tree = tempTree();
+  writeSession(tree.sessions, "a.jsonl", [
     assistantLine({ usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0 } }),
     assistantLine({ usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } }),
   ]);
-  const result = await scan({ roots: [sessions], cachePath });
+  const result = await scan(tree);
   assert.deepEqual(result.byFamily, {});
 });
 
@@ -162,19 +219,16 @@ test("usageFromLine rejects malformed lines, other roles and non-message entries
 });
 
 test("the base account is #1 and siblings sort numerically", async () => {
-  const { sessions, cachePath } = tempTree();
-  const today = "2026-11-02T10:00:00.000Z";
-  const yesterday = "2026-11-01T10:00:00.000Z";
-  const old = "2026-10-20T10:00:00.000Z";
-  writeSession(sessions, "a.jsonl", [
-    assistantLine({ ts: today, provider: "opencode-go", usage: { input: 11, output: 0, cacheRead: 0, cacheWrite: 0 } }),
-    assistantLine({ ts: today, provider: "opencode-go-2", usage: { input: 22, output: 0, cacheRead: 0, cacheWrite: 0 } }),
-    assistantLine({ ts: today, provider: "opencode-go-10", usage: { input: 110, output: 0, cacheRead: 0, cacheWrite: 0 } }),
-    assistantLine({ ts: yesterday, provider: "opencode-go-7", usage: { input: 70, output: 0, cacheRead: 0, cacheWrite: 0 } }),
-    assistantLine({ ts: old, provider: "opencode-go-2", usage: { input: 5_000, output: 0, cacheRead: 0, cacheWrite: 0 } }),
+  const tree = tempTree();
+  writeSession(tree.sessions, "a.jsonl", [
+    assistantLine({ ts: tsForDay(0), provider: "opencode-go", usage: { input: 11, output: 0, cacheRead: 0, cacheWrite: 0 } }),
+    assistantLine({ ts: tsForDay(0), provider: "opencode-go-2", usage: { input: 22, output: 0, cacheRead: 0, cacheWrite: 0 } }),
+    assistantLine({ ts: tsForDay(0), provider: "opencode-go-10", usage: { input: 110, output: 0, cacheRead: 0, cacheWrite: 0 } }),
+    assistantLine({ ts: tsForDay(-1), provider: "opencode-go-7", usage: { input: 70, output: 0, cacheRead: 0, cacheWrite: 0 } }),
+    assistantLine({ ts: tsForDay(-20), provider: "opencode-go-2", usage: { input: 5_000, output: 0, cacheRead: 0, cacheWrite: 0 } }),
   ]);
 
-  const result = await scan({ roots: [sessions], cachePath });
+  const result = await scan(tree);
   const stats = result.byFamily["opencode-go"];
 
   assert.deepEqual(Object.keys(stats.byAccount), ["#1", "#2", "#7", "#10"]);
@@ -188,15 +242,17 @@ test("the base account is #1 and siblings sort numerically", async () => {
   assert.equal(stats.byAccount["#10"].todayPrompts, 1);
   assert.equal(stats.todayTotalTokens, 143);
   assert.equal(stats.totalPrompts, 5);
-  assert.deepEqual(stats.weekTokensByModel, { "claude-opus-5-5": 213 }, "the 20-day-old message is outside the weekly per-model totals");
+  assert.equal(stats.weekTokensByModel["claude-opus-5-5"], 213);
+  assert.equal(stats.activeDates.length, 3);
+  assert.equal(result.scan.frozenDays, 2, "yesterday and the 20-day-old day are closed");
 });
 
 test("a grown session file is read from its last complete line", async () => {
-  const { sessions, cachePath } = tempTree();
-  const file = writeSession(sessions, "a.jsonl", [
+  const tree = tempTree();
+  const file = writeSession(tree.sessions, "a.jsonl", [
     assistantLine({ usage: { input: 10, output: 0, cacheRead: 0, cacheWrite: 0 } }),
   ]);
-  const first = await scan({ roots: [sessions], cachePath });
+  const first = await scan(tree);
   assert.equal(first.scan.scanned, 1);
   assert.equal(first.scan.bytesRead, statSync(file).size);
   assert.equal(first.byFamily.claude.todayTotalTokens, 10);
@@ -204,165 +260,395 @@ test("a grown session file is read from its last complete line", async () => {
   const appended = assistantLine({ usage: { input: 25, output: 0, cacheRead: 0, cacheWrite: 0 } });
   appendSession(file, [appended]);
 
-  const second = await scan({ roots: [sessions], cachePath });
+  const second = await scan(tree);
   assert.equal(second.scan.scanned, 1);
   assert.equal(second.scan.reused, 0);
   assert.equal(second.scan.bytesRead, Buffer.byteLength(appended) + 1, "only the appended line is read");
   assert.equal(second.byFamily.claude.todayTotalTokens, 35);
   assert.equal(second.byFamily.claude.todayPrompts, 2);
 
-  const third = await scan({ roots: [sessions], cachePath });
+  const third = await scan(tree);
   assert.equal(third.scan.reused, 1);
   assert.equal(third.scan.bytesRead, 0);
   assert.equal(third.byFamily.claude.todayTotalTokens, 35);
 });
 
 test("an unterminated last line is counted once it is completed", async () => {
-  const { sessions, cachePath } = tempTree();
-  const file = join(sessions, "a.jsonl");
-  const complete = assistantLine({ usage: { input: 40, output: 0, cacheRead: 0, cacheWrite: 0 } });
+  const tree = tempTree();
+  const file = join(tree.sessions, "a.jsonl");
   const partial = assistantLine({ usage: { input: 60, output: 0, cacheRead: 0, cacheWrite: 0 } });
   writeFileSync(file, `${assistantLine({ usage: { input: 1, output: 0, cacheRead: 0, cacheWrite: 0 } })}\n${partial.slice(0, 40)}`, "utf-8");
 
-  const first = await scan({ roots: [sessions], cachePath });
+  const first = await scan(tree);
   assert.equal(first.byFamily.claude.todayPrompts, 1, "the half-written line is not counted yet");
 
-  writeFileSync(file, `${assistantLine({ usage: { input: 2, output: 0, cacheRead: 0, cacheWrite: 0 } })}\n${complete}\n${partial}\n`, "utf-8");
-  const second = await scan({ roots: [sessions], cachePath });
-  // The rewrite shares the prefix, so the resumed read starts at the old
-  // partial line and sees both new messages exactly once.
-  assert.equal(second.byFamily.claude.todayPrompts, 3);
+  appendSession(file, [partial.slice(40)]);
+  // The appended chunk has no trailing newline of its own; write one.
+  writeFileSync(file, "\n", { flag: "a" });
+
+  const second = await scan(tree);
+  assert.equal(second.byFamily.claude.todayPrompts, 2);
+  assert.equal(second.byFamily.claude.todayTotalTokens, 61);
 });
 
 test("a session file that shrank is rescanned from zero", async () => {
-  const { sessions, cachePath } = tempTree();
-  const file = writeSession(sessions, "a.jsonl", [
+  const tree = tempTree();
+  const file = writeSession(tree.sessions, "a.jsonl", [
     assistantLine({ usage: { input: 500, output: 0, cacheRead: 0, cacheWrite: 0 } }),
     assistantLine({ usage: { input: 500, output: 0, cacheRead: 0, cacheWrite: 0 } }),
   ]);
-  const first = await scan({ roots: [sessions], cachePath });
+  const first = await scan(tree);
   assert.equal(first.byFamily.claude.todayTotalTokens, 1_000);
   assert.equal(first.byFamily.claude.totalSessions, 1);
 
-  writeSession(sessions, "a.jsonl", [assistantLine({ usage: { input: 7, output: 0, cacheRead: 0, cacheWrite: 0 } })]);
-  const second = await scan({ roots: [sessions], cachePath });
+  writeSession(tree.sessions, "a.jsonl", [assistantLine({ usage: { input: 7, output: 0, cacheRead: 0, cacheWrite: 0 } })]);
+  const second = await scan(tree);
   assert.ok(statSync(file).size < first.scan.bytesRead);
   assert.equal(second.byFamily.claude.todayTotalTokens, 7);
   assert.equal(second.byFamily.claude.todayPrompts, 1);
   assert.equal(second.byFamily.claude.totalPrompts, 1);
 });
 
-test("a deleted session file takes its contribution with it", async () => {
-  const { sessions, cachePath } = tempTree();
-  const kept = writeSession(sessions, "kept.jsonl", [assistantLine({ usage: { input: 10, output: 0, cacheRead: 0, cacheWrite: 0 } })]);
-  const removed = writeSession(sessions, "removed.jsonl", [assistantLine({ usage: { input: 90, output: 0, cacheRead: 0, cacheWrite: 0 } })]);
-  const first = await scan({ roots: [sessions], cachePath });
-  assert.equal(first.byFamily.claude.todayTotalTokens, 100);
-  assert.equal(first.byFamily.claude.totalSessions, 2);
-  assert.equal(first.byFamily.claude.todaySessions, 2);
+test("deleting a session file keeps the days already frozen in history", async () => {
+  const tree = tempTree();
+  const file = writeSession(tree.sessions, "a.jsonl", [
+    assistantLine({ ts: tsForDay(-1), usage: { input: 100, output: 0, cacheRead: 0, cacheWrite: 0 } }),
+    assistantLine({ ts: tsForDay(0), usage: { input: 50, output: 0, cacheRead: 0, cacheWrite: 0 } }),
+  ]);
+  const first = await scan(tree);
+  assert.equal(first.scan.frozenDays, 1);
+  assert.equal(first.byFamily.claude.totalPrompts, 2);
+  const frozenTotals = totalsOf(tree);
+  assert.equal(frozenTotals.lastFrozenDay, localDayKey(Date.parse(tsForDay(-1))));
 
-  unlinkSync(removed);
-  const second = await scan({ roots: [sessions], cachePath });
-  assert.equal(second.byFamily.claude.todayTotalTokens, 10);
-  assert.equal(second.byFamily.claude.totalSessions, 1);
-  assert.equal(second.byFamily.claude.todaySessions, 1);
-
-  const cached = JSON.parse(readFileSync(cachePath, "utf-8"));
-  assert.deepEqual(Object.keys(cached.files), [kept]);
+  unlinkSync(file);
+  const second = await scan(tree);
+  assert.equal(second.byFamily.claude.todayTotalTokens, 0, "the open day's contribution is gone with the file");
+  assert.equal(second.byFamily.claude.totalPrompts, 1, "the frozen day survives the deletion");
+  assert.equal(second.byFamily.claude.recentDays.at(-2).messageCount, 100);
+  assert.ok(second.byFamily.claude.activeDates.includes(localDayKey(Date.parse(tsForDay(-1)))));
+  assert.deepEqual(totalsOf(tree), frozenTotals, "totals are not rewritten by the deletion");
+  assert.equal(monthOf(tree).days[localDayKey(Date.parse(tsForDay(-1)))].claude.slots[""].models["claude-opus-5-5"].input, 100);
 });
 
-test("today is recomputed from the per-day aggregates when the clock moves on", async () => {
-  const { sessions, cachePath } = tempTree();
-  writeSession(sessions, "a.jsonl", [
-    assistantLine({ ts: "2026-11-02T10:00:00.000Z", usage: { input: 30, output: 0, cacheRead: 0, cacheWrite: 0 } }),
+test("deleting a session file only drops its open-day contribution", async () => {
+  const tree = tempTree();
+  const file = writeSession(tree.sessions, "a.jsonl", [
+    assistantLine({ ts: tsForDay(0), usage: { input: 50, output: 0, cacheRead: 0, cacheWrite: 0 } }),
   ]);
-  const first = await scan({ roots: [sessions], cachePath });
+  await scan(tree);
+  unlinkSync(file);
+  const result = await scan(tree);
+  assert.deepEqual(result.byFamily, {});
+  assert.equal(totalsOf(tree).lastFrozenDay, "");
+});
+
+test("two roots that resolve to the same directory are scanned once", async () => {
+  const tree = tempTree();
+  writeSession(tree.sessions, "a.jsonl", [
+    assistantLine({ usage: { input: 10, output: 0, cacheRead: 0, cacheWrite: 0 } }),
+  ]);
+  const alias = join(tree.dir, "sessions-alias");
+  symlinkSync(tree.sessions, alias);
+
+  const result = await scan(tree, { roots: [tree.sessions, alias] });
+  assert.equal(result.scan.files, 1, "the same directory twice is one root");
+  assert.equal(result.byFamily.claude.todayPrompts, 1);
+  assert.equal(result.byFamily.claude.todayTotalTokens, 10);
+});
+
+test("a removed session root removes its open-day contribution", async () => {
+  const tree = tempTree();
+  const other = join(tree.dir, "other-sessions");
+  mkdirSync(other, { recursive: true });
+  writeSession(tree.sessions, "a.jsonl", [assistantLine({ usage: { input: 3, output: 0, cacheRead: 0, cacheWrite: 0 } })]);
+  writeSession(other, "b.jsonl", [assistantLine({ usage: { input: 8, output: 0, cacheRead: 0, cacheWrite: 0 } })]);
+  const first = await scan(tree, { roots: [tree.sessions, other] });
+  assert.equal(first.byFamily.claude.todayTotalTokens, 11);
+
+  rmSync(other, { recursive: true, force: true });
+  const second = await scan(tree, { roots: [tree.sessions, other] });
+  assert.equal(second.byFamily.claude.todayTotalTokens, 3);
+  assert.equal(second.scan.files, 1);
+});
+
+test("today is recomputed from per-day aggregates, and the closed day freezes once", async () => {
+  const tree = tempTree();
+  writeSession(tree.sessions, "a.jsonl", [
+    assistantLine({ ts: tsForDay(0), usage: { input: 30, output: 0, cacheRead: 0, cacheWrite: 0 } }),
+  ]);
+  const first = await scan(tree);
   assert.equal(first.byFamily.claude.todayTotalTokens, 30);
   assert.equal(first.byFamily.claude.totalPrompts, 1);
+  assert.equal(first.scan.frozenDays, 0);
 
-  const tomorrow = Date.parse("2026-11-03T09:00:00.000Z");
-  const second = await collectLocalStats({ roots: [sessions], cachePath, now: tomorrow, budgetMs: 60_000 });
+  const tomorrow = Date.parse(tsForDay(1));
+  const second = await scan(tree, { now: tomorrow });
   assert.equal(second.scan.reused, 1, "the file did not change, so no bytes are re-read");
+  assert.equal(second.scan.frozenDays, 1);
   assert.equal(second.byFamily.claude.todayTotalTokens, 0);
   assert.equal(second.byFamily.claude.todayPrompts, 0);
   assert.equal(second.byFamily.claude.totalPrompts, 1, "history is intact");
   assert.equal(second.byFamily.claude.recentDays.at(-1).date, localDayKey(tomorrow));
   assert.equal(second.byFamily.claude.recentDays.at(-2).messageCount, 30, "yesterday keeps its tokens");
+  const frozen = totalsOf(tree);
+  assert.equal(frozen.lastFrozenDay, TODAY);
+
+  const third = await scan(tree, { now: tomorrow });
+  assert.deepEqual(totalsOf(tree), frozen, "a second run never freezes the day twice");
 });
 
-test("the scan budget returns partial numbers and flags them", async () => {
-  const { sessions, cachePath } = tempTree();
-  writeSession(sessions, "a.jsonl", [assistantLine()]);
-  writeSession(sessions, "b.jsonl", [assistantLine()]);
+test("a late append to a frozen day increments history, not the open cache", async () => {
+  const tree = tempTree();
+  const file = writeSession(tree.sessions, "a.jsonl", [
+    assistantLine({ ts: tsForDay(-1), usage: { input: 40, output: 0, cacheRead: 0, cacheWrite: 0 } }),
+  ]);
+  const first = await scan(tree);
+  assert.equal(first.scan.frozenDays, 1);
+  assert.equal(first.byFamily.claude.totalPrompts, 1);
 
-  const partial = await collectLocalStats({ roots: [sessions], cachePath, now: NOW, budgetMs: -1 });
+  appendSession(file, [assistantLine({ ts: tsForDay(-1), usage: { input: 60, output: 0, cacheRead: 0, cacheWrite: 0 } })]);
+  const second = await scan(tree);
+  assert.equal(second.scan.frozenDays, 0, "the day is already frozen");
+  assert.equal(second.byFamily.claude.totalPrompts, 2);
+  assert.equal(second.byFamily.claude.todayTotalTokens, 0);
+  assert.equal(second.byFamily.claude.recentDays.at(-2).messageCount, 100);
+  const day = localDayKey(Date.parse(tsForDay(-1)));
+  assert.equal(monthOf(tree).days[day].claude.slots[""].models["claude-opus-5-5"].input, 100);
+
+  const frozen = totalsOf(tree);
+  const third = await scan(tree);
+  assert.deepEqual(totalsOf(tree), frozen, "the offset was persisted, so the late lines are not applied twice");
+  assert.equal(third.byFamily.claude.totalPrompts, 2);
+});
+
+test("losing the disposable cache does not double count frozen days", async () => {
+  const tree = tempTree();
+  writeSession(tree.sessions, "a.jsonl", [
+    assistantLine({ ts: tsForDay(-1), usage: { input: 40, output: 0, cacheRead: 0, cacheWrite: 0 } }),
+    assistantLine({ ts: tsForDay(0), usage: { input: 10, output: 0, cacheRead: 0, cacheWrite: 0 } }),
+  ]);
+  await scan(tree);
+  const frozen = totalsOf(tree);
+  assert.equal(frozen.families.claude.totalPrompts, 1, "the rollup holds the frozen day only");
+
+  rmSync(tree.cachePath, { force: true });
+  const second = await scan(tree);
+  assert.equal(second.scan.scanned, 1, "the cache miss forces a rescan");
+  assert.equal(second.byFamily.claude.totalPrompts, 2, "the frozen day is skipped, not re-added");
+  assert.equal(second.byFamily.claude.todayTotalTokens, 10);
+  assert.deepEqual(totalsOf(tree), frozen);
+});
+
+test("a corrupt per-file cache is a cache miss while history survives", async () => {
+  const tree = tempTree();
+  writeSession(tree.sessions, "a.jsonl", [
+    assistantLine({ ts: tsForDay(-1), usage: { input: 12, output: 0, cacheRead: 0, cacheWrite: 0 } }),
+    assistantLine({ ts: tsForDay(0), usage: { input: 5, output: 0, cacheRead: 0, cacheWrite: 0 } }),
+  ]);
+  await scan(tree);
+  const frozen = totalsOf(tree);
+
+  mkdirSync(dirname(tree.cachePath), { recursive: true });
+  writeFileSync(tree.cachePath, "{not json", "utf-8");
+  const second = await scan(tree);
+  assert.equal(second.scan.scanned, 1);
+  assert.equal(second.byFamily.claude.totalPrompts, 2);
+  assert.equal(readJson(tree.cachePath).schemaVersion, 2);
+  assert.deepEqual(totalsOf(tree), frozen);
+});
+
+test("a corrupt history file is moved aside, warned about, and rebuilt from disk", async () => {
+  const tree = tempTree();
+  writeSession(tree.sessions, "a.jsonl", [
+    assistantLine({ ts: tsForDay(-1), usage: { input: 40, output: 0, cacheRead: 0, cacheWrite: 0 } }),
+    assistantLine({ ts: tsForDay(0), usage: { input: 10, output: 0, cacheRead: 0, cacheWrite: 0 } }),
+  ]);
+  await scan(tree);
+  const frozen = totalsOf(tree);
+
+  writeFileSync(tree.totalsPath, "{definitely not json", "utf-8");
+  const second = await scan(tree);
+  assert.ok(second.warnings.some((warning) => warning.includes("moved it to")), second.warnings.join(" | "));
+  assert.ok(readdirSync(tree.historyDir).some((name) => name.startsWith("totals.json.corrupt-")));
+  assert.deepEqual(totalsOf(tree), frozen, "the history is rebuilt from the session files still on disk");
+  assert.equal(second.byFamily.claude.totalPrompts, 2);
+});
+
+test("history is partitioned by local month", async () => {
+  const tree = tempTree();
+  writeSession(tree.sessions, "a.jsonl", [
+    assistantLine({ ts: new Date(noonOf("2026-01-31")).toISOString(), usage: { input: 100, output: 0, cacheRead: 0, cacheWrite: 0 } }),
+    assistantLine({ ts: new Date(noonOf("2026-02-01")).toISOString(), usage: { input: 200, output: 0, cacheRead: 0, cacheWrite: 0 } }),
+  ]);
+  const result = await scan(tree, { now: noonOf("2026-02-02") });
+
+  assert.ok(readdirSync(tree.historyDir).includes("tokens-2026-01.json"));
+  assert.ok(readdirSync(tree.historyDir).includes("tokens-2026-02.json"));
+  assert.deepEqual(Object.keys(readJson(resolveMonthPath(tree.historyDir, "2026-01")).days), ["2026-01-31"]);
+  assert.deepEqual(Object.keys(readJson(resolveMonthPath(tree.historyDir, "2026-02")).days), ["2026-02-01"]);
+  assert.equal(totalsOf(tree).lastFrozenDay, "2026-02-01");
+  assert.equal(result.byFamily.claude.totalPrompts, 2);
+  assert.equal(result.byFamily.claude.recentDays.find((day) => day.date === "2026-01-31").messageCount, 100);
+  assert.equal(result.byFamily.claude.recentDays.find((day) => day.date === "2026-02-01").messageCount, 200);
+});
+
+test("all-time totals do not read old month files", async () => {
+  const tree = tempTree();
+  writeSession(tree.sessions, "a.jsonl", [
+    assistantLine({ ts: new Date(noonOf("2026-08-15")).toISOString(), usage: { input: 300, output: 0, cacheRead: 0, cacheWrite: 0 } }),
+    assistantLine({ ts: tsForDay(0), usage: { input: 10, output: 0, cacheRead: 0, cacheWrite: 0 } }),
+  ]);
+  const first = await scan(tree);
+  assert.equal(first.byFamily.claude.totalPrompts, 2);
+  assert.ok(readdirSync(tree.historyDir).includes("tokens-2026-08.json"));
+
+  rmSync(resolveMonthPath(tree.historyDir, "2026-08"), { force: true });
+  const second = await scan(tree);
+  assert.equal(second.byFamily.claude.totalPrompts, 2, "the old day comes from totals, not from its month file");
+  assert.equal(second.byFamily.claude.modelUsage["claude-opus-5-5"].inputTokens, 310);
+});
+
+test("a crash between the month write and the totals write re-freezes the day exactly once", async () => {
+  const tree = tempTree();
+  writeSession(tree.sessions, "a.jsonl", [
+    assistantLine({ ts: tsForDay(0), usage: { input: 40, output: 0, cacheRead: 0, cacheWrite: 0 } }),
+  ]);
+  // Leave the day open in the cache (a scan at "today" never freezes it), then
+  // simulate the half-written state: month file present, totals still empty.
+  await scan(tree);
+  writeJsonAtomic(resolveMonthPath(tree.historyDir, MONTH), {
+    schemaVersion: 1,
+    month: MONTH,
+    days: { [TODAY]: { claude: { sessions: 1, slots: { "": { sessions: 1, models: { "claude-opus-5-5": { input: 40, output: 0, cacheRead: 0, cacheWrite: 0, messages: 1 } } } } } } },
+  });
+  writeJsonAtomic(tree.totalsPath, { schemaVersion: 1, lastFrozenDay: "", families: {} });
+
+  const tomorrow = Date.parse(tsForDay(1));
+  const result = await scan(tree, { now: tomorrow });
+  assert.equal(result.scan.frozenDays, 1);
+  assert.equal(totalsOf(tree).families.claude.totalPrompts, 1, "the re-freeze is a SET, not a second add");
+  assert.equal(totalsOf(tree).families.claude.modelUsage["claude-opus-5-5"].input, 40);
+  assert.equal(totalsOf(tree).lastFrozenDay, TODAY);
+
+  const once = totalsOf(tree);
+  await scan(tree, { now: tomorrow });
+  assert.deepEqual(totalsOf(tree), once);
+});
+
+test("rebuild-totals from the month files equals the incremental totals", async () => {
+  const tree = tempTree();
+  writeSession(tree.sessions, "a.jsonl", [
+    assistantLine({ ts: tsForDay(-3), provider: "anthropic", usage: { input: 10, output: 0, cacheRead: 0, cacheWrite: 0 } }),
+    assistantLine({ ts: tsForDay(-1), provider: "opencode-go-2", usage: { input: 20, output: 0, cacheRead: 0, cacheWrite: 0 } }),
+    assistantLine({ ts: tsForDay(0), provider: "anthropic", usage: { input: 30, output: 0, cacheRead: 0, cacheWrite: 0 } }),
+  ]);
+  await scan(tree);
+  const incremental = totalsOf(tree);
+  assert.ok(incremental.families.claude);
+  assert.ok(incremental.families["opencode-go"]);
+
+  const warnings = [];
+  const rebuilt = rebuildTotalsFromMonths({ historyDir: tree.historyDir, warnings });
+  assert.equal(rebuilt.ok, true, rebuilt.error);
+  assert.deepEqual(warnings, []);
+  assert.deepEqual(totalsOf(tree), incremental);
+
+  const loaded = loadTotals({ historyDir: tree.historyDir, warnings: [] });
+  assert.equal(loaded.rescanAll, false);
+  assert.equal(loaded.totals.families.get("opencode-go").totalPrompts, 1);
+});
+
+test("the stats command rebuilds the totals and reports it", async () => {
+  const tree = tempTree();
+  writeSession(tree.sessions, "a.jsonl", [
+    assistantLine({ ts: tsForDay(-1), usage: { input: 10, output: 0, cacheRead: 0, cacheWrite: 0 } }),
+  ]);
+  await scan(tree);
+
+  const original = process.stdout.write;
+  let output = "";
+  process.stdout.write = (chunk) => {
+    output += String(chunk);
+    return true;
+  };
+  try {
+    assert.equal(runStatsCommand({ rebuild: true, historyDir: tree.historyDir }), 0);
+  } finally {
+    process.stdout.write = original;
+  }
+  assert.match(output, /rebuilt .*totals\.json/);
+  assert.match(output, /1 frozen day\(s\)/);
+});
+
+test("a budget-truncated scan does not freeze an incomplete day", async () => {
+  const tree = tempTree();
+  writeSession(tree.sessions, "a.jsonl", [
+    assistantLine({ ts: tsForDay(-1), usage: { input: 10, output: 0, cacheRead: 0, cacheWrite: 0 } }),
+  ]);
+
+  const partial = await collectLocalStats({
+    roots: [tree.sessions],
+    cachePath: tree.cachePath,
+    historyDir: tree.historyDir,
+    now: NOW,
+    budgetMs: -1,
+  });
   assert.equal(partial.scan.partial, true);
-  assert.equal(partial.scan.scanned, 0);
-  assert.equal(partial.scan.files, 2);
-  assert.equal(partial.scan.budgetMs, -1);
+  assert.equal(partial.scan.frozenDays, 0);
   assert.deepEqual(partial.byFamily, {});
+  assert.ok(!readdirSync(tree.historyDir).some((name) => name.startsWith("tokens-")), "nothing was frozen");
 
-  const full = await scan({ roots: [sessions], cachePath });
-  assert.equal(full.scan.partial, false);
-  assert.equal(full.scan.scanned, 2);
-  assert.equal(full.byFamily.claude.todayPrompts, 2);
+  const full = await scan(tree);
+  assert.equal(full.scan.frozenDays, 1);
+  assert.equal(full.byFamily.claude.totalPrompts, 1);
+  assert.ok(readdirSync(tree.historyDir).some((name) => name.startsWith("tokens-")));
 });
 
 test("a budget that expires mid-file keeps the bytes it read and resumes there", async () => {
-  const { sessions, cachePath } = tempTree();
+  const tree = tempTree();
   const lines = [];
   for (let index = 0; index < 20_000; index += 1) {
     lines.push(assistantLine({ usage: { input: 1, output: 0, cacheRead: 0, cacheWrite: 0 } }));
   }
-  const file = writeSession(sessions, "big.jsonl", lines);
+  const file = writeSession(tree.sessions, "big.jsonl", lines);
 
   // Three clock reads fit the budget (start, initial check, first file); the
   // 16384-line check inside readLines is the one that runs out.
   let reads = 0;
   const clock = () => (reads++ < 3 ? 0 : 1_000_000);
-  const partial = await collectLocalStats({ roots: [sessions], cachePath, now: NOW, budgetMs: 5_000, clock });
+  const partial = await collectLocalStats({
+    roots: [tree.sessions],
+    cachePath: tree.cachePath,
+    historyDir: tree.historyDir,
+    now: NOW,
+    budgetMs: 5_000,
+    clock,
+  });
   assert.equal(partial.scan.partial, true);
   assert.equal(partial.byFamily.claude.totalPrompts, 16_384);
   assert.equal(partial.scan.scanned, 1);
 
-  const full = await scan({ roots: [sessions], cachePath });
+  const full = await scan(tree);
   assert.equal(full.scan.partial, false);
   assert.equal(full.byFamily.claude.totalPrompts, 20_000, "the second run resumes where the budget stopped");
   assert.ok(full.scan.bytesRead < statSync(file).size, "the completed prefix is not read again");
 });
 
-test("a corrupt or foreign cache is a cache miss, not a failure", async () => {
-  const { sessions, cachePath } = tempTree();
-  writeSession(sessions, "a.jsonl", [assistantLine({ usage: { input: 12, output: 0, cacheRead: 0, cacheWrite: 0 } })]);
-  mkdirSync(dirname(cachePath), { recursive: true });
-  writeFileSync(cachePath, "{not json", "utf-8");
-
-  const first = await scan({ roots: [sessions], cachePath });
-  assert.equal(first.byFamily.claude.todayTotalTokens, 12);
-  assert.equal(first.scan.scanned, 1);
-  const rewritten = JSON.parse(readFileSync(cachePath, "utf-8"));
-  assert.equal(rewritten.schemaVersion, 1);
-  assert.deepEqual(Object.keys(rewritten.files), [join(sessions, "a.jsonl")]);
-
-  writeFileSync(cachePath, JSON.stringify({ schemaVersion: 99, files: {} }), "utf-8");
-  const second = await scan({ roots: [sessions], cachePath });
-  assert.equal(second.byFamily.claude.todayTotalTokens, 12);
-  assert.equal(second.scan.scanned, 1, "a foreign schema version is rescanned");
-});
-
 test("the scan cache is written atomically with private permissions", async () => {
-  const { sessions, cachePath } = tempTree();
-  writeSession(sessions, "a.jsonl", [assistantLine()]);
-  await scan({ roots: [sessions], cachePath });
-  assert.equal(statSync(cachePath).mode & 0o777, 0o600);
-  const envelope = JSON.parse(readFileSync(cachePath, "utf-8"));
-  assert.equal(envelope.schemaVersion, 1);
+  const tree = tempTree();
+  writeSession(tree.sessions, "a.jsonl", [assistantLine()]);
+  await scan(tree);
+  assert.equal(statSync(tree.cachePath).mode & 0o777, 0o600);
+  const envelope = readJson(tree.cachePath);
+  assert.equal(envelope.schemaVersion, 2);
   const [entry] = Object.values(envelope.files);
   assert.equal(typeof entry.size, "number");
   assert.equal(typeof entry.mtimeMs, "number");
   assert.equal(typeof entry.offset, "number");
   assert.equal(entry.complete, true);
   assert.equal(entry.offset, entry.size, "a file ending in a newline is fully consumed");
+  assert.equal(statSync(tree.totalsPath).mode & 0o777, 0o600);
 });
 
 test("session roots honour PI_CODING_AGENT_DIR and only include existing directories", () => {
@@ -378,13 +664,32 @@ test("session roots honour PI_CODING_AGENT_DIR and only include existing directo
     join(home, ".omp", "agent", "sessions"),
   ]);
 
+  const aliasAgent = join(home, "agent-alias");
+  symlinkSync(join(home, ".pi", "agent"), aliasAgent);
+  assert.deepEqual(resolveSessionRoots({ env: { PI_CODING_AGENT_DIR: aliasAgent }, home }), [
+    join(aliasAgent, "sessions"),
+    join(home, ".omp", "agent", "sessions"),
+  ], "a symlinked agent dir does not add the same sessions twice");
+
   const bare = mkdtempSync(join(tmpdir(), "pi-quota-roots-empty-"));
   assert.deepEqual(resolveSessionRoots({ env: {}, home: bare }), []);
   assert.equal(
     resolveLocalStatsCachePath({ env: { XDG_CACHE_HOME: join(home, "cache") }, home }),
     join(home, "cache", "pi-quota", "local-sessions.json"),
   );
+  assert.equal(
+    resolveHistoryDir({ env: { PI_CODING_AGENT_DIR: agentDir }, home }),
+    join(agentDir, "pi-usage"),
+    "history lives with the agent directory",
+  );
+  assert.equal(resolveHistoryDir({ env: {}, home }), join(home, ".pi", "agent", "pi-usage"));
+  assert.equal(resolveTotalsPath(treePath(agentDir)), join(agentDir, "pi-usage", "totals.json"));
 });
+
+/** Build a history dir without touching the filesystem (path helpers only). */
+function treePath(agentDir) {
+  return join(agentDir, "pi-usage");
+}
 
 test("Omarchy records carry the local stats fields and keep their quota fields", () => {
   const report = { providers: [provider()], localStats: { claude: LOCAL } };
@@ -423,8 +728,8 @@ test("a family with local usage but no credential gets no record", () => {
 });
 
 test("collectQuota attaches localStats and its meta block next to the quota results", async () => {
-  const { sessions, cachePath } = tempTree();
-  writeSession(sessions, "a.jsonl", [
+  const tree = tempTree();
+  writeSession(tree.sessions, "a.jsonl", [
     assistantLine({ ts: new Date(NOW).toISOString(), usage: { input: 100, output: 0, cacheRead: 0, cacheWrite: 0 } }),
   ]);
   const { fetchFn } = routedFetch([["api.anthropic.com", () => jsonResponse(claudeUsageBody())]]);
@@ -440,7 +745,7 @@ test("collectQuota attaches localStats and its meta block next to the quota resu
     home,
     stores: [],
     allowBrowser: false,
-    localStats: { roots: [sessions], cachePath, budgetMs: 60_000 },
+    localStats: { roots: [tree.sessions], cachePath: tree.cachePath, historyDir: tree.historyDir, budgetMs: 60_000 },
   });
 
   assert.equal(report.providers[0].ok, true, "local stats never change a provider result");
@@ -449,13 +754,14 @@ test("collectQuota attaches localStats and its meta block next to the quota resu
   assert.equal(report.localStatsMeta.files, 1);
   assert.equal(report.localStatsMeta.scanned, 1);
   assert.equal(report.localStatsMeta.partial, false);
+  assert.equal(report.localStatsMeta.frozenDays, 0);
 });
 
 test("a local-stats cache failure is a warning, never a provider failure", async () => {
-  const { dir, sessions } = tempTree();
-  writeSession(sessions, "a.jsonl", [assistantLine({ usage: { input: 5, output: 0, cacheRead: 0, cacheWrite: 0 } })]);
+  const tree = tempTree();
+  writeSession(tree.sessions, "a.jsonl", [assistantLine({ usage: { input: 5, output: 0, cacheRead: 0, cacheWrite: 0 } })]);
   // A directory where the cache file should be makes the atomic rename fail.
-  const cachePath = join(dir, "blocked-cache");
+  const cachePath = join(tree.dir, "blocked-cache");
   mkdirSync(cachePath, { recursive: true });
   const { fetchFn } = routedFetch([["api.anthropic.com", () => jsonResponse(claudeUsageBody())]]);
   const home = mkdtempSync(join(tmpdir(), "pi-quota-local-engine-"));
@@ -470,7 +776,7 @@ test("a local-stats cache failure is a warning, never a provider failure", async
     home,
     stores: [],
     allowBrowser: false,
-    localStats: { roots: [sessions], cachePath, budgetMs: 60_000 },
+    localStats: { roots: [tree.sessions], cachePath, historyDir: tree.historyDir, budgetMs: 60_000 },
   });
 
   assert.equal(report.providers[0].ok, true);
@@ -520,7 +826,7 @@ test("a message with only totalTokens is counted instead of dropped", () => {
     NOW,
   );
   assert.deepEqual(usage, {
-    day: localDayKey(NOW),
+    day: TODAY,
     family: "claude",
     slot: "",
     model: "m",
@@ -529,19 +835,4 @@ test("a message with only totalTokens is counted instead of dropped", () => {
     cacheRead: 0,
     cacheWrite: 0,
   });
-});
-
-test("a removed session root removes its contribution on the next scan", async () => {
-  const { dir, sessions, cachePath } = tempTree();
-  const other = join(dir, "other-sessions");
-  mkdirSync(other, { recursive: true });
-  writeSession(sessions, "a.jsonl", [assistantLine({ usage: { input: 3, output: 0, cacheRead: 0, cacheWrite: 0 } })]);
-  writeSession(other, "b.jsonl", [assistantLine({ usage: { input: 8, output: 0, cacheRead: 0, cacheWrite: 0 } })]);
-  const first = await scan({ roots: [sessions, other], cachePath });
-  assert.equal(first.byFamily.claude.todayTotalTokens, 11);
-
-  rmSync(other, { recursive: true, force: true });
-  const second = await scan({ roots: [sessions, other], cachePath });
-  assert.equal(second.byFamily.claude.todayTotalTokens, 3);
-  assert.equal(second.scan.files, 1);
 });

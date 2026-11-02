@@ -52,14 +52,17 @@ shuvquota, and it never writes to a credential file.
   `ui.setStatus`, `ui.setWidget` and `ui.notify`.
 * Pi's session files (`~/.pi/agent/sessions/**/*.jsonl`) are opened read-only, to
   count tokens per day and per model. The scan cache keys each file by its path,
-  size and byte offset and stores only aggregate counts and model names; no
-  prompt text or tool output is read into a cache, a record or the report.
+  size and byte offset and stores open days; the durable history under
+  `~/.pi/agent/pi-usage/` stores frozen days. Both hold only aggregate counts and
+  model names — no prompt text or tool output reaches a cache, a record or the
+  report.
 * Nothing is written outside these paths:
 
   | Path | What |
   | --- | --- |
   | `~/.cache/pi-quota/usage.json` | the report cache |
-  | `~/.cache/pi-quota/local-sessions.json` | per-session-file token scan cache |
+  | `~/.cache/pi-quota/local-sessions.json` | per-session-file offsets and open token days |
+  | `${PI_CODING_AGENT_DIR:-~/.pi/agent}/pi-usage/totals.json`, `tokens-YYYY-MM.json` | frozen token history, plus `.corrupt-<ts>` siblings when one is unreadable |
   | `~/.cache/pi-quota/refresh-state.json` | each family's own refresh clock |
   | `~/.cache/pi-quota/last-published.json`, `last-good.json`, `backoff.json` | sticky snapshots and throttle state |
   | `~/.config/pi-quota/opencode-cookie` | only after `piquota auth opencode`, mode `600` |
@@ -218,6 +221,8 @@ piquota auth opencode --no-browser
 piquota auth opencode --wait 300
 
 piquota omarchy                 # write pi-*.json records for Omarchy's Agents panel
+piquota stats                   # durable token history: last frozen day, families, totals
+piquota stats --rebuild-totals  # recompute totals.json from the frozen month files
 ```
 
 Colours: green above 50% remaining, yellow 20–50%, red below 20%.
@@ -437,7 +442,7 @@ seven entries, oldest first, today last):
       "byAccount": { "#1": { "todayTokens": 14172, "weekTokens": 118422, "todayPrompts": 3, "totalPrompts": 1200, "totalTokens": 48812210 } }
     }
   },
-  "localStatsMeta": { "files": 604, "scanned": 1, "reused": 603, "bytesRead": 3042, "durationMs": 9, "partial": false, "budgetMs": 12000 }
+  "localStatsMeta": { "files": 604, "scanned": 1, "reused": 603, "bytesRead": 3042, "durationMs": 9, "partial": false, "budgetMs": 12000, "frozenDays": 0 }
 }
 ```
 
@@ -502,6 +507,7 @@ shows them next to the quota:
 | `piquota --json` | `localStats.<family>` — the Omarchy-shaped counters plus `byAccount` |
 | `/usage` panel | a `tokens` row per provider: today, 7 days, prompts, then the top 3 models of the week |
 | `piquota omarchy` | the optional fields Omarchy's Agents panel draws as "Tokens by day" and "Tokens by model" |
+| `piquota stats` | the durable history: last frozen day, families, prompts, session-days |
 
 What counts: one assistant message with a non-zero token count is one prompt,
 and its tokens are `input + output + cacheRead + cacheWrite` — the same sum the
@@ -512,16 +518,51 @@ siblings, so `opencode-go-7` is account `#7`. Providers it does not manage
 (`deepinfra`, `xai`, ...) are ignored, and so is the custom `claude-bridge`
 provider: its tokens are not a Pi subscription.
 
+**Two stores, two lifetimes.** Open days (normally just today) live in the
+disposable scan cache. Once a local day is over it is frozen into a durable
+history that no rescan, no cache wipe and no session deletion can rewrite. The
+history is Pi data, so it lives next to Pi's agent directory:
+
+| Path | What |
+| --- | --- |
+| `${PI_CODING_AGENT_DIR:-~/.pi/agent}/pi-usage/totals.json` | all-time rollup per family and account (models, prompts, session-days, active dates) plus `lastFrozenDay` |
+| `${PI_CODING_AGENT_DIR:-~/.pi/agent}/pi-usage/tokens-YYYY-MM.json` | the frozen days of one local month, keyed day → family → slot → model |
+| `~/.cache/pi-quota/local-sessions.json` | per-session-file size, mtime and byte offset, plus open days only |
+
+> `~/.pi` is often a git repository. Add `agent/pi-usage/` to that repo's
+> `.gitignore` if you do not want your token counts committed.
+
+Freezing: every run moves each day before today that is not frozen yet into its
+month file and into `totals.json`, then drops it from the per-file cache. The
+month file is written first and the totals second; the `lastFrozenDay` watermark
+makes a restart re-freeze a half-written day idempotently (the month write is a
+SET per day) instead of adding it twice. A late write to an already-frozen day —
+a session that appends just past midnight — increments both stores directly; a
+crash between those two writes can double that one small delta. A
+budget-truncated scan never freezes: history is only written from complete runs.
+
+Consequences, all covered by tests: history survives session deletion and cache
+loss; a lost or corrupt `totals.json` is moved aside as
+`totals.json.corrupt-<ts>` and rebuilt from the session files still on disk;
+frozen days are never recomputed, so a replaced session file cannot rewrite them
+either. A lost *month* file loses only that month's daily detail — the all-time
+totals stay — and `piquota stats --rebuild-totals` recomputes `totals.json` from
+every month file, recovering days whose session files are already gone. A normal
+run reads only `totals.json` plus the month files covering the last seven days
+(current month, and the previous one early in a month), so years of history
+never slow a run: on this machine the 41 frozen days use a ~1 KB
+`totals.json` and two month files of a few tens of KB.
+
 Cost: the first run streams each session file once (1.5 GB ≈ 3 s here); later
-runs read only the bytes appended since the previous scan (≈ 10 ms when nothing
-changed). The per-file cache is `~/.cache/pi-quota/local-sessions.json`
-(atomic, `0600`), keyed by each file's size, mtime and last-read byte offset, so
-an append is read incrementally, a rewritten or shrinking file is rescanned, a
-deleted file drops its contribution, and a corrupt cache is a cache miss. The
+runs read only the bytes appended since the previous scan (≈ 10–40 ms when
+nothing or little changed), and every byte is parsed once in normal operation.
+The cache is atomic and `0600`; a rewrite or shrink rescans that file, a
+corrupt cache is a cache miss, and frozen days are skipped in either case. The
 scan has a wall-clock budget (12 s, or `PI_QUOTA_LOCAL_STATS_BUDGET_MS`) so the
 first run cannot push `/usage` past its 30 s exec timeout; when it runs out the
-report carries `localStatsMeta.partial` and the panel marks the numbers
-`scan partial`. `PI_QUOTA_LOCAL_STATS=0` turns the scan off.
+report carries `localStatsMeta.partial`, the panel marks the numbers
+`scan partial`, and nothing is frozen that run. `PI_QUOTA_LOCAL_STATS=0` turns
+the scan off.
 
 Forked sessions are not de-duplicated: on a 1.5 GB store (603 files, 185,626
 assistant messages) only 11 message ids appeared in more than one file (0.006%),
@@ -543,7 +584,8 @@ src/providers/antigravity-oauth.js  in-memory refresh with Google's public clien
 src/providers/backoff.js       per-family throttle state
 src/sticky.js                  last published / last good snapshots and throttle recovery
 src/engine.js                  collectQuota() -> one normalized report
-src/local/pi-sessions.js       token counts from Pi's session files, incremental scan cache
+src/local/pi-sessions.js       token counts from Pi's session files, incremental scan
+src/local/history.js           frozen local-day history: month files + all-time rollup
 src/model.js                   window normalization, percent and reset parsing
 src/render/{theme,panel}.js    colors, thresholds, rings, bars, boxed panel
 src/cache.js                   report cache at ~/.cache/pi-quota/usage.json
@@ -551,6 +593,7 @@ src/omarchy/record.js          pure mapping from the report to Omarchy usage rec
 src/omarchy/publish.js         atomic writer for pi-*.json, and stale-record cleanup
 src/refresh.js                 per-family refresh clocks, and the merge back into one report
 src/cli/args.js                argument parsing, and the flag/positional split
+src/cli/commands/stats.js      `piquota stats` and `--rebuild-totals`
 src/exec.js                    the one place that spawns gh CLI binary
 src/http.js                    fetch wrapper: timeouts, JSON, redaction
 contrib/systemd/               user service and timer behind `install.sh --omarchy-timer`
@@ -577,7 +620,7 @@ extensions/quota-panel.ts      Pi TUI line and /usage
 ## Tests
 
 ```bash
-node --test tests/*.test.mjs     # 291 tests, fake tokens only, no network
+node --test tests/*.test.mjs     # 302 tests, fake tokens only, no network
 ```
 
 Modules covered: `auth.json` parsing and de-duplication, the Claude Code store
@@ -589,9 +632,11 @@ strategies, the Firefox cookie reader against a synthetic SQLite database, the
 Antigravity refresh (in-memory only), sticky and last-good snapshots resilience,
 the Omarchy record mapping and atomic writer, the local token scan (family and
 slot mapping, incremental append, shrink, deletion, local-day bucketing, cache
-corruption), the renderers, the Pi extension contract, the per-family refresh
-clocks, argument parsing, and the structure of these documents themselves
-(tables, fences, links, anchors).
+corruption), the durable history (month partitioning, freezing at midnight, late
+appends to frozen days, cache loss, a crash between the month and totals writes,
+corrupt-history quarantine, rebuild-totals), the renderers, the Pi extension
+contract, the per-family refresh clocks, argument parsing, and the structure of
+these documents themselves (tables, fences, links, anchors).
 
 ## Acknowledgments & Prior Art
 

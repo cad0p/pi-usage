@@ -19,6 +19,7 @@ import { parseArgs } from "../src/cli/args.js";
 import { runAuthCommand } from "../src/cli/commands/auth.js";
 import { runGentlePiCommand } from "../src/cli/commands/gentle-pi.js";
 import { runOmarchyCommand } from "../src/cli/commands/omarchy.js";
+import { runStatsCommand } from "../src/cli/commands/stats.js";
 import { explainLines, resolveFamilies } from "../src/cli/explain.js";
 import { err, out } from "../src/cli/output.js";
 import { collectQuota, enabledFamilies, normalizeClaudeSourceMode } from "../src/engine.js";
@@ -56,6 +57,7 @@ Usage:
   piquota auth <opencode|status> [flags]
   piquota gentle-pi <status|apply|revert>
   piquota omarchy
+  piquota stats [--rebuild-totals]
 
 Quota:
   --json             Emit the normalized report as JSON (for rp-host and automations)
@@ -70,6 +72,7 @@ Quota:
   --no-refresh       Never refresh Antigravity's token in memory
   --explain          Show which stores/fields are read (names only)
   --clear-cache      Delete the local cache and exit
+  --rebuild-totals   With \`stats\`: rebuild the token-history totals from its month files
   --version          Print the version and exit
 
 Auth (OpenCode Go session, the only credential Pi does not store):
@@ -79,6 +82,11 @@ Auth (OpenCode Go session, the only credential Pi does not store):
                                    print the URL without launching a browser
   piquota auth opencode --wait <s> how long to wait for the login (default 180)
   piquota auth status              report every credential source
+
+Stats:
+  piquota stats                    summarise the durable token history
+                                   (dir: \${PI_CODING_AGENT_DIR:-~/.pi/agent}/pi-usage)
+  piquota stats --rebuild-totals   recompute totals.json from the frozen month files
 
 Omarchy:
   piquota omarchy                  write pi-<family>.json records for Omarchy's Agents bar panel
@@ -142,6 +150,10 @@ async function main() {
   if (command === "gentle-pi") {
     const sub = bare[1] ?? "status";
     return runGentlePiCommand(sub);
+  }
+
+  if (command === "stats" || args.rebuildTotals) {
+    return runStatsCommand({ rebuild: command === "stats" ? args.rebuildTotals : true, env: process.env });
   }
 
   if (command === "omarchy") {

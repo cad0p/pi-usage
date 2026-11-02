@@ -8,21 +8,24 @@
  * and does it at a bounded cost: the first run streams every session file once,
  * later runs read only the bytes appended since the last scan.
  *
+ * Two stores, two lifetimes:
+ *   - the disposable per-file cache under `~/.cache/pi-quota/local-sessions.json`
+ *     holds the (size, mtimeMs, inode, offset) of every session file plus that
+ *     file's aggregates for OPEN days only (normally just today), so an append
+ *     is read once and nothing is ever parsed twice;
+ *   - the durable history under `${PI_CODING_AGENT_DIR:-~/.pi/agent}/pi-usage/`
+ *     (see history.js) holds every closed day. Freezing is one-way: a frozen
+ *     day is never recomputed from a rescan, never rewritten by a session
+ *     deletion and never lost with the cache.
+ *
  * Hard rules enforced here:
  *   - session files are opened strictly read-only and never modified;
  *   - nothing but aggregate counts (tokens, prompts, dates, model names) and
- *     the file keys needed to scan incrementally is kept, so no prompt text,
- *     tool output or credential can reach a cache or a record;
+ *     the file keys needed to scan incrementally reaches a cache, a record or
+ *     the report, so no prompt text, tool output or credential is ever stored;
  *   - the scan is best-effort: a missing root, an unreadable file or a corrupt
- *     cache degrades to fewer numbers and a warning, never to an exception.
- *
- * Cost model: the cache (`~/.cache/pi-quota/local-sessions.json`) holds, per
- * session file, the (size, mtimeMs, offset) it was read up to plus that file's
- * own aggregates keyed by (family, slot, local day, model). A file that grew is
- * read from `offset`; a file that shrank or was replaced is rescanned; a file
- * that disappeared takes its contribution with it. Today's numbers are always
- * recomputed from the per-day aggregates at report time, so a cache written
- * yesterday still answers "today" correctly.
+ *     cache/history degrades to fewer numbers and a warning, never to a
+ *     provider failure.
  *
  * Duplicates: a fork or rewind is a new session file, so in principle the same
  * assistant message could be counted twice. Measured on a real store (603 files,
@@ -34,29 +37,34 @@
  * usage (the conservative direction) instead of hiding it.
  */
 
-import {
-  createReadStream,
-  mkdirSync,
-  readdirSync,
-  readFileSync,
-  renameSync,
-  rmSync,
-  statSync,
-  writeFileSync,
-} from "node:fs";
+import { createReadStream, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { dirname, join } from "node:path";
 
 import { FAMILY_BY_PROVIDER, resolveProviderSlot } from "../auth/pi-auth.js";
 import { redact } from "../http.js";
+import {
+  addToModels,
+  applyDurable,
+  bucketMessages,
+  bucketTokens,
+  emptyBucket,
+  emptyTotals,
+  familyRowMessages,
+  familyRowTokens,
+  loadTotals,
+  loadWindowDays,
+  resolveHistoryDir,
+} from "./history.js";
 
-/** Version of the cache envelope; a foreign version is a cache miss. */
-export const LOCAL_STATS_SCHEMA_VERSION = 1;
+/** Version of the disposable per-file cache; a foreign version is a cache miss. */
+export const LOCAL_STATS_SCHEMA_VERSION = 2;
 
 /**
  * How long a scan may run before it returns what it has. The /usage extension
  * runs the CLI with a 30 s timeout and a first full scan of ~1.5 GB costs a few
- * seconds, so this leaves room for the quota calls that run beside it.
+ * seconds, so this leaves room for the quota calls that run beside it. A
+ * truncated scan never freezes a day: history is written only from complete runs.
  */
 export const DEFAULT_SCAN_BUDGET_MS = 12_000;
 
@@ -67,20 +75,8 @@ const SESSION_SUFFIX = ".jsonl";
 const RECENT_DAYS = 7;
 
 /**
- * @typedef {Object} LocalModelUsage
- * @property {number} inputTokens
- * @property {number} outputTokens
- * @property {number} cacheReadInputTokens
- * @property {number} cacheCreationInputTokens
- */
-
-/**
- * @typedef {Object} LocalAccountStats
- * @property {number} todayTokens   Tokens used by this account today.
- * @property {number} weekTokens    Tokens used by this account in the last 7 local days.
- * @property {number} todayPrompts  Assistant messages from this account today.
- * @property {number} totalPrompts  Assistant messages from this account, all time.
- * @property {number} totalTokens   Tokens used by this account, all time.
+ * @typedef {import("./history.js").Bucket} Bucket
+ * @typedef {import("./history.js").DayRows} DayRows
  */
 
 /**
@@ -97,11 +93,11 @@ const RECENT_DAYS = 7;
  * @property {Record<string, number>} weekTokensByModel  Same, over the last 7 local days.
  * @property {Array<{ date: string, messageCount: number }>} recentDays
  * @property {number} totalPrompts
- * @property {number} totalSessions
+ * @property {number} totalSessions   Session-days: a session spanning midnight counts once per day.
  * @property {number} activeDays
  * @property {string[]} activeDates
- * @property {Record<string, LocalModelUsage>} modelUsage
- * @property {Record<string, LocalAccountStats>} byAccount
+ * @property {Record<string, { inputTokens: number, outputTokens: number, cacheReadInputTokens: number, cacheCreationInputTokens: number }>} modelUsage
+ * @property {Record<string, { todayTokens: number, weekTokens: number, todayPrompts: number, totalPrompts: number, totalTokens: number }>} byAccount
  */
 
 /**
@@ -110,6 +106,7 @@ const RECENT_DAYS = 7;
  * @typedef {Object} LocalStatsOptions
  * @property {string[]} [roots]        Session roots to scan; overrides the Pi/omp defaults.
  * @property {string} [cachePath]      Scan cache location; overrides ~/.cache/pi-quota/local-sessions.json.
+ * @property {string} [historyDir]     Durable history directory; overrides ${PI_CODING_AGENT_DIR:-~/.pi/agent}/pi-usage.
  * @property {Record<string, string | undefined>} [env]
  * @property {string} [home]
  * @property {number} [now]            Report time; decides which local day is "today".
@@ -123,14 +120,14 @@ const RECENT_DAYS = 7;
  * `offset` is the byte offset of the first byte that is not part of a complete
  * line (end of file when the last line ended with a newline). `complete` is
  * false when the scan budget stopped the read mid-file; the next run continues
- * from `offset` instead of assuming the file is finished.
+ * from `offset` instead of assuming the file is finished. `days` holds open
+ * days only: a frozen day is removed from the entry once the durable write
+ * succeeded, so a rescan can never recompute it.
  *
  * @typedef {Object} SessionFileEntry
  * @property {number} size
  * @property {number} mtimeMs
- * @property {number} ino       Identity of the file, so a replacement that is
- *                              larger than the old one is rescanned instead of
- *                              read from a stale offset. 0 when unavailable.
+ * @property {number} ino
  * @property {number} offset
  * @property {boolean} complete
  * @property {Record<string, Array<[string, string, string, number, number, number, number, number]>>} days
@@ -146,8 +143,7 @@ function cacheHome(env, home) {
 }
 
 /**
- * Where the per-file scan cache lives. Same directory as the report cache, so
- * `--clear-cache` semantics and the documented filesystem boundary hold.
+ * Where the disposable per-file scan cache lives.
  *
  * @param {{ env?: Record<string, string | undefined>, home?: string }} [options]
  * @returns {string}
@@ -174,7 +170,7 @@ export function resolveSessionRoots(options = {}) {
   const home = options.home ?? homedir();
   /** @type {string[]} */
   const candidates = [];
-  if (env.PI_CODING_AGENT_DIR) candidates.push(join(resolve(env.PI_CODING_AGENT_DIR), "sessions"));
+  if (env.PI_CODING_AGENT_DIR) candidates.push(join(env.PI_CODING_AGENT_DIR, "sessions"));
   candidates.push(join(home, ".pi", "agent", "sessions"));
   candidates.push(join(home, ".omp", "agent", "sessions"));
 
@@ -182,13 +178,20 @@ export function resolveSessionRoots(options = {}) {
   const roots = [];
   const seen = new Set();
   for (const candidate of candidates) {
-    if (seen.has(candidate)) continue;
-    seen.add(candidate);
+    let key = candidate;
     try {
-      if (statSync(candidate).isDirectory()) roots.push(candidate);
+      // Two roots can name the same directory: `PI_CODING_AGENT_DIR` may point
+      // at a symlink of `~/.pi/agent`, and scanning that twice would count
+      // every message twice.
+      key = realpathSync(candidate);
+      if (seen.has(key)) continue;
+      if (!statSync(candidate).isDirectory()) continue;
     } catch {
       // Missing root: not an error, just nothing to scan there.
+      continue;
     }
+    seen.add(key);
+    roots.push(candidate);
   }
   return roots;
 }
@@ -206,6 +209,31 @@ export function localDayKey(ms) {
   const month = String(date.getMonth() + 1).padStart(2, "0");
   const day = String(date.getDate()).padStart(2, "0");
   return `${year}-${month}-${day}`;
+}
+
+/**
+ * Explicit roots bypass `resolveSessionRoots`, so de-duplicate them by real path
+ * here too: a caller that names the same store twice must not double count.
+ *
+ * @param {string[]} roots
+ * @returns {string[]}
+ */
+function dedupeRoots(roots) {
+  /** @type {string[]} */
+  const unique = [];
+  const seen = new Set();
+  for (const root of roots) {
+    let key = root;
+    try {
+      key = realpathSync(root);
+    } catch {
+      // Keep the unresolved path; listSessionFiles skips missing roots.
+    }
+    if (seen.has(key)) continue;
+    seen.add(key);
+    unique.push(root);
+  }
+  return unique;
 }
 
 /**
@@ -332,7 +360,7 @@ export function usageFromLine(line, now = Date.now()) {
   if (!resolved) return null;
 
   let input = count(usage.input);
-  let output = count(usage.output);
+  const output = count(usage.output);
   const cacheRead = count(usage.cacheRead);
   const cacheWrite = count(usage.cacheWrite);
   if (input + output + cacheRead + cacheWrite === 0) {
@@ -354,7 +382,7 @@ export function usageFromLine(line, now = Date.now()) {
 }
 
 /**
- * Per-file day aggregates while scanning: day -> key -> tuple.
+ * Per-file open-day aggregates while scanning: day -> key -> tuple.
  * The tuple is the serialized form `[family, slot, model, input, output,
  * cacheRead, cacheWrite, prompts]`, which keeps the cache compact.
  *
@@ -389,6 +417,25 @@ function addUsage(days, usage) {
     return;
   }
   bucket.set(key, [usage.family, usage.slot, usage.model, usage.input, usage.output, usage.cacheRead, usage.cacheWrite, 1]);
+}
+
+/**
+ * Add a late-written line to an already-frozen day. Session counts are omitted:
+ * `history.js` explains why re-counting them would be worse than leaving them.
+ *
+ * @param {Record<string, DayRows>} lateRows
+ * @param {NonNullable<ReturnType<typeof usageFromLine>>} usage
+ */
+function addLateUsage(lateRows, usage) {
+  const dayRows = lateRows[usage.day] ?? (lateRows[usage.day] = {});
+  const familyRow = dayRows[usage.family] ?? (dayRows[usage.family] = { sessions: 0, slots: {} });
+  const slotRow = familyRow.slots[usage.slot] ?? (familyRow.slots[usage.slot] = { sessions: 0, models: {} });
+  const bucket = slotRow.models[usage.model] ?? (slotRow.models[usage.model] = emptyBucket());
+  bucket.input += usage.input;
+  bucket.output += usage.output;
+  bucket.cacheRead += usage.cacheRead;
+  bucket.cacheWrite += usage.cacheWrite;
+  bucket.messages += 1;
 }
 
 /**
@@ -490,29 +537,29 @@ async function readLines(input) {
 }
 
 /**
- * Read one session file into day aggregates.
+ * Read one session file into open-day aggregates, routing each message.
  *
  * @param {{
  *   path: string,
  *   startOffset: number,
- *   existingDays: DaysMap,
+ *   days: DaysMap,
  *   now: number,
+ *   onUsage: (usage: NonNullable<ReturnType<typeof usageFromLine>>) => void,
  *   shouldStop: () => boolean,
  * }} input
- * @returns {Promise<{ days: DaysMap, offset: number, complete: boolean }>}
+ * @returns {Promise<{ offset: number, complete: boolean }>}
  */
 async function scanFile(input) {
-  const days = input.existingDays;
   const result = await readLines({
     path: input.path,
     startOffset: input.startOffset,
     shouldStop: input.shouldStop,
     onLine: (line) => {
       const usage = usageFromLine(line, input.now);
-      if (usage) addUsage(days, usage);
+      if (usage) input.onUsage(usage);
     },
   });
-  return { days, offset: result.offset, complete: !result.aborted };
+  return { offset: result.offset, complete: !result.aborted };
 }
 
 /**
@@ -522,6 +569,7 @@ async function scanFile(input) {
 function listSessionFiles(roots) {
   /** @type {string[]} */
   const files = [];
+  const seen = new Set();
   for (const root of roots) {
     /** @type {Array<[string, import("node:fs").Dirent[]]>} */
     const stack = [];
@@ -541,6 +589,16 @@ function listSessionFiles(roots) {
             // An unreadable directory only hides its own sessions.
           }
         } else if (entry.isFile() && entry.name.endsWith(SESSION_SUFFIX)) {
+          // Same file through two roots (symlinked session dirs, a shared
+          // store) must be read once per run.
+          let key = full;
+          try {
+            key = realpathSync(full);
+          } catch {
+            // A vanished file is caught by statSync below and skipped.
+          }
+          if (seen.has(key)) continue;
+          seen.add(key);
           files.push(full);
         }
       }
@@ -550,9 +608,8 @@ function listSessionFiles(roots) {
 }
 
 /**
- * Read the cache envelope. A missing, corrupt or foreign-shaped file is a cache
- * miss (a full rescan), never a crash: the cache is an optimization, not state
- * the numbers depend on.
+ * Read the disposable cache envelope. A missing, corrupt or foreign-shaped file
+ * is a cache miss (a full rescan), never a crash.
  *
  * @param {string} path
  * @returns {{ files: Record<string, SessionFileEntry>, hit: boolean }}
@@ -612,166 +669,266 @@ function writeCacheFile(path, files) {
 }
 
 /**
- * @param {string} slot
- * @returns {number}
- */
-function slotOrder(slot) {
-  if (slot === "") return -1;
-  const numeric = Number.parseInt(slot, 10);
-  return Number.isFinite(numeric) ? numeric : Number.MAX_SAFE_INTEGER;
-}
-
-/**
- * Fold every cached file's aggregates into the per-family statistics the
- * Omarchy panel and the /usage panel read. Today-dependent fields are derived
- * here, from the per-day aggregates, never stored as "today".
+ * Fold every session file's open-day tuples into one `DayRows` per day. Session
+ * counts are distinct files, which is what "today: N sessions" means.
  *
  * @param {Record<string, SessionFileEntry>} files
- * @param {{ now?: number }} [options]
- * @returns {Record<string, LocalFamilyStats>}
+ * @returns {Record<string, DayRows>}
  */
-export function buildLocalStats(files, options = {}) {
-  const now = options.now ?? Date.now();
-  const today = localDayKey(now);
-  const recentDates = recentLocalDates(now, RECENT_DAYS);
-
-  /** @type {Map<string, { prompts: number, sessions: Set<string>, activeDates: Set<string>, dayTokens: Map<string, number>, dayPrompts: Map<string, number>, daySessions: Map<string, Set<string>>, dayModels: Map<string, Map<string, number>>, models: Map<string, LocalModelUsage>, accounts: Map<string, { dayTokens: Map<string, number>, dayPrompts: Map<string, number>, prompts: number, tokens: number }> }>} */
-  const families = new Map();
-
+function buildOpenRows(files) {
+  /** @type {Map<string, Map<string, { files: Set<string>, slots: Map<string, { files: Set<string>, models: Map<string, Bucket> }> }>>} */
+  const days = new Map();
   for (const [file, entry] of Object.entries(files ?? {})) {
-    if (!entry || !entry.days) continue;
-    for (const [day, tuples] of Object.entries(entry.days)) {
+    for (const [day, tuples] of Object.entries(entry.days ?? {})) {
       if (!Array.isArray(tuples) || tuples.length === 0) continue;
       for (const tuple of tuples) {
         if (!Array.isArray(tuple) || tuple.length < 8) continue;
         const [family, slot, model] = tuple;
         if (typeof family !== "string" || typeof slot !== "string" || typeof model !== "string") continue;
-        const input = count(tuple[3]);
-        const output = count(tuple[4]);
-        const cacheRead = count(tuple[5]);
-        const cacheWrite = count(tuple[6]);
-        const prompts = count(tuple[7]);
-        const tokens = input + output + cacheRead + cacheWrite;
-        if (prompts === 0 && tokens === 0) continue;
+        const bucket = {
+          input: count(tuple[3]),
+          output: count(tuple[4]),
+          cacheRead: count(tuple[5]),
+          cacheWrite: count(tuple[6]),
+          messages: count(tuple[7]),
+        };
+        if (bucket.messages === 0 && bucketTokens(bucket) === 0) continue;
 
-        let acc = families.get(family);
-        if (!acc) {
-          acc = {
-            prompts: 0,
-            sessions: new Set(),
-            activeDates: new Set(),
-            dayTokens: new Map(),
-            dayPrompts: new Map(),
-            daySessions: new Map(),
-            dayModels: new Map(),
-            models: new Map(),
-            accounts: new Map(),
-          };
-          families.set(family, acc);
-        }
-
-        acc.prompts += prompts;
-        acc.activeDates.add(day);
-        acc.sessions.add(file);
-
-        acc.dayTokens.set(day, (acc.dayTokens.get(day) ?? 0) + tokens);
-        acc.dayPrompts.set(day, (acc.dayPrompts.get(day) ?? 0) + prompts);
-        const daySessions = acc.daySessions.get(day) ?? new Set();
-        daySessions.add(file);
-        acc.daySessions.set(day, daySessions);
-        const dayModels = acc.dayModels.get(day) ?? new Map();
-        dayModels.set(model, (dayModels.get(model) ?? 0) + tokens);
-        acc.dayModels.set(day, dayModels);
-
-        const known = acc.models.get(model);
+        const dayMap = days.get(day) ?? new Map();
+        days.set(day, dayMap);
+        const familyAgg = dayMap.get(family) ?? { files: new Set(), slots: new Map() };
+        dayMap.set(family, familyAgg);
+        familyAgg.files.add(file);
+        const slotAgg = familyAgg.slots.get(slot) ?? { files: new Set(), models: new Map() };
+        familyAgg.slots.set(slot, slotAgg);
+        slotAgg.files.add(file);
+        const known = slotAgg.models.get(model);
         if (known) {
-          known.inputTokens += input;
-          known.outputTokens += output;
-          known.cacheReadInputTokens += cacheRead;
-          known.cacheCreationInputTokens += cacheWrite;
+          known.input += bucket.input;
+          known.output += bucket.output;
+          known.cacheRead += bucket.cacheRead;
+          known.cacheWrite += bucket.cacheWrite;
+          known.messages += bucket.messages;
         } else {
-          acc.models.set(model, {
-            inputTokens: input,
-            outputTokens: output,
-            cacheReadInputTokens: cacheRead,
-            cacheCreationInputTokens: cacheWrite,
-          });
+          slotAgg.models.set(model, { ...bucket });
         }
-
-        const account = acc.accounts.get(slot) ?? { dayTokens: new Map(), dayPrompts: new Map(), prompts: 0, tokens: 0 };
-        account.dayTokens.set(day, (account.dayTokens.get(day) ?? 0) + tokens);
-        account.dayPrompts.set(day, (account.dayPrompts.get(day) ?? 0) + prompts);
-        account.prompts += prompts;
-        account.tokens += tokens;
-        acc.accounts.set(slot, account);
       }
     }
   }
 
+  /** @type {Record<string, DayRows>} */
+  const rows = {};
+  for (const [day, families] of days) {
+    /** @type {DayRows} */
+    const dayRows = {};
+    for (const [family, familyAgg] of families) {
+      /** @type {Record<string, { sessions: number, models: Record<string, Bucket> }>} */
+      const slots = {};
+      for (const [slot, slotAgg] of familyAgg.slots) {
+        /** @type {Record<string, Bucket>} */
+        const models = {};
+        for (const [model, bucket] of slotAgg.models) models[model] = { ...bucket };
+        slots[slot] = { sessions: slotAgg.files.size, models };
+      }
+      dayRows[family] = { sessions: familyAgg.files.size, slots };
+    }
+    rows[day] = dayRows;
+  }
+  return rows;
+}
+
+/**
+ * @param {Map<string, number>} models Token totals by model id.
+ * @returns {Record<string, number>}
+ */
+function tokensByModel(models) {
+  /** @type {Array<[string, number]>} */
+  const entries = [];
+  for (const [model, tokens] of models) {
+    if (tokens > 0) entries.push([model, tokens]);
+  }
+  entries.sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
+  return Object.fromEntries(entries);
+}
+
+/**
+ * @param {string} label
+ * @returns {number}
+ */
+function labelOrder(label) {
+  if (label === "#1") return -1;
+  const numeric = Number.parseInt(String(label).replace(/^#/, ""), 10);
+  return Number.isFinite(numeric) ? numeric : Number.MAX_SAFE_INTEGER;
+}
+
+/**
+ * Fold the durable rollup, the frozen days of the last seven days, and the open
+ * days into the shape the Omarchy panel and /usage read. Today is always taken
+ * from open days; the week prefers the open copy of a day and falls back to the
+ * frozen month file, so a crash between a month write and the totals write never
+ * double counts.
+ *
+ * @param {{
+ *   totals?: import("./history.js").Totals,
+ *   openRows?: Record<string, DayRows>,
+ *   windowDays?: Record<string, DayRows>,
+ *   now?: number,
+ * }} input
+ * @returns {Record<string, LocalFamilyStats>}
+ */
+export function buildLocalStats(input = {}) {
+  const now = input.now ?? Date.now();
+  const today = localDayKey(now);
+  const recentDates = recentLocalDates(now, RECENT_DAYS);
+  const openRows = input.openRows ?? {};
+  const windowDays = input.windowDays ?? {};
+  const totals = input.totals ?? emptyTotals();
+
+  const families = new Set(totals.families.keys());
+  for (const rows of Object.values(openRows)) for (const family of Object.keys(rows)) families.add(family);
+  for (const rows of Object.values(windowDays)) for (const family of Object.keys(rows)) families.add(family);
+
   /** @type {Record<string, LocalFamilyStats>} */
   const byFamily = {};
-  for (const [family, acc] of families) {
-    if (acc.prompts === 0) continue;
+  for (const family of families) {
+    const history = totals.families.get(family) ?? null;
 
-    /** @type {Record<string, LocalModelUsage>} */
-    const modelUsage = {};
-    const models = Array.from(acc.models.entries()).sort((a, b) => {
-      const totalOf = (bucket) => bucket.inputTokens + bucket.outputTokens + bucket.cacheReadInputTokens + bucket.cacheCreationInputTokens;
-      const byTotal = totalOf(b[1]) - totalOf(a[1]);
-      return byTotal !== 0 ? byTotal : a[0].localeCompare(b[0]);
-    });
-    for (const [model, usage] of models) modelUsage[model] = { ...usage };
-
-    const todayModels = acc.dayModels.get(today) ?? new Map();
-    /** @type {Record<string, number>} */
-    const todayTokensByModel = {};
-    for (const [model, tokens] of Array.from(todayModels.entries()).sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))) {
-      todayTokensByModel[model] = tokens;
-    }
-
-    // The panel ranks models by what was used this week, not by a model that
-    // dominated months ago.
-    const weekModels = new Map();
-    for (const date of recentDates) {
-      for (const [model, tokens] of acc.dayModels.get(date) ?? []) {
-        weekModels.set(model, (weekModels.get(model) ?? 0) + tokens);
+    // Open days (normally just today, plus anything a truncated run left open).
+    let openPrompts = 0;
+    let openSessions = 0;
+    const openModels = new Map();
+    const openAccounts = new Map();
+    const openDates = new Set();
+    for (const [day, rows] of Object.entries(openRows)) {
+      const familyRow = rows?.[family];
+      if (!familyRow) continue;
+      openDates.add(day);
+      openSessions += count(familyRow.sessions);
+      for (const [slot, slotRow] of Object.entries(familyRow.slots ?? {})) {
+        const label = slot === "" ? "#1" : `#${slot}`;
+        const account = openAccounts.get(label) ?? { prompts: 0, sessions: 0, models: new Map() };
+        account.sessions += count(slotRow.sessions);
+        for (const [model, bucket] of Object.entries(slotRow.models ?? {})) {
+          addToModels(openModels, model, bucket);
+          addToModels(account.models, model, bucket);
+          openPrompts += bucketMessages(bucket);
+          account.prompts += bucketMessages(bucket);
+        }
+        openAccounts.set(label, account);
       }
     }
-    /** @type {Record<string, number>} */
-    const weekTokensByModel = {};
-    for (const [model, tokens] of Array.from(weekModels.entries()).sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))) {
-      weekTokensByModel[model] = tokens;
+
+    // The seven-day window: open days override frozen ones.
+    const dayTokens = new Map();
+    const dayModels = new Map();
+    const daySlots = new Map();
+    for (const date of recentDates) {
+      const rows = openRows[date] ?? windowDays[date];
+      const familyRow = rows?.[family];
+      if (!familyRow) {
+        dayTokens.set(date, 0);
+        continue;
+      }
+      dayTokens.set(date, familyRowTokens(familyRow));
+      /** @type {Map<string, number>} */
+      const models = new Map();
+      /** @type {Map<string, { tokens: number, prompts: number }>} */
+      const slots = new Map();
+      for (const [slot, slotRow] of Object.entries(familyRow.slots ?? {})) {
+        const label = slot === "" ? "#1" : `#${slot}`;
+        let tokens = 0;
+        let prompts = 0;
+        for (const [model, bucket] of Object.entries(slotRow.models ?? {})) {
+          const modelTokens = bucketTokens(bucket);
+          tokens += modelTokens;
+          prompts += bucketMessages(bucket);
+          models.set(model, (models.get(model) ?? 0) + modelTokens);
+        }
+        const known = slots.get(label) ?? { tokens: 0, prompts: 0 };
+        known.tokens += tokens;
+        known.prompts += prompts;
+        slots.set(label, known);
+      }
+      dayModels.set(date, models);
+      daySlots.set(date, slots);
     }
 
-    /** @type {Record<string, LocalAccountStats>} */
+    const todayRows = openRows[today]?.[family] ?? null;
+    const todayPrompts = todayRows ? familyRowMessages(todayRows) : 0;
+    const todayTotalTokens = todayRows ? familyRowTokens(todayRows) : 0;
+    /** @type {Map<string, number>} */
+    const todayModels = new Map();
+    for (const slotRow of Object.values(todayRows?.slots ?? {})) {
+      for (const [model, bucket] of Object.entries(slotRow.models ?? {})) {
+        todayModels.set(model, (todayModels.get(model) ?? 0) + bucketTokens(bucket));
+      }
+    }
+
+    /** @type {Map<string, number>} */
+    const weekModels = new Map();
+    for (const models of dayModels.values()) {
+      for (const [model, tokens] of models) weekModels.set(model, (weekModels.get(model) ?? 0) + tokens);
+    }
+
+    /** @type {Map<string, Bucket>} */
+    const allModels = new Map();
+    for (const [model, bucket] of history?.models ?? []) allModels.set(model, { ...bucket });
+    for (const [model, bucket] of openModels) addToModels(allModels, model, bucket);
+
+    const activeDates = new Set(history?.activeDates ?? []);
+    for (const date of openDates) activeDates.add(date);
+
+    /** @type {Record<string, { todayTokens: number, weekTokens: number, todayPrompts: number, totalPrompts: number, totalTokens: number }>} */
     const byAccount = {};
-    const slots = Array.from(acc.accounts.keys()).sort((a, b) => slotOrder(a) - slotOrder(b) || a.localeCompare(b));
-    for (const slot of slots) {
-      const account = acc.accounts.get(slot);
-      if (!account) continue;
-      const weekTokens = recentDates.reduce((sum, date) => sum + (account.dayTokens.get(date) ?? 0), 0);
-      byAccount[slot === "" ? "#1" : `#${slot}`] = {
-        todayTokens: account.dayTokens.get(today) ?? 0,
+    const labels = new Set([...(history?.accounts.keys() ?? []), ...openAccounts.keys()]);
+    for (const label of Array.from(labels).sort((a, b) => labelOrder(a) - labelOrder(b))) {
+      const historyAccount = history?.accounts.get(label);
+      const openAccount = openAccounts.get(label);
+      /** @type {Map<string, Bucket>} */
+      const accountModels = new Map();
+      for (const [model, bucket] of historyAccount?.models ?? []) accountModels.set(model, { ...bucket });
+      for (const [model, bucket] of openAccount?.models ?? []) addToModels(accountModels, model, bucket);
+      let totalTokens = 0;
+      for (const bucket of accountModels.values()) totalTokens += bucketTokens(bucket);
+      let weekTokens = 0;
+      for (const date of recentDates) weekTokens += daySlots.get(date)?.get(label)?.tokens ?? 0;
+      byAccount[label] = {
+        todayTokens: daySlots.get(today)?.get(label)?.tokens ?? 0,
         weekTokens,
-        todayPrompts: account.dayPrompts.get(today) ?? 0,
-        totalPrompts: account.prompts,
-        totalTokens: account.tokens,
+        todayPrompts: daySlots.get(today)?.get(label)?.prompts ?? 0,
+        totalPrompts: (historyAccount?.totalPrompts ?? 0) + (openAccount?.prompts ?? 0),
+        totalTokens,
+      };
+    }
+
+    const totalPrompts = (history?.totalPrompts ?? 0) + openPrompts;
+    if (totalPrompts === 0 && allModels.size === 0) continue;
+
+    /** @type {Record<string, { inputTokens: number, outputTokens: number, cacheReadInputTokens: number, cacheCreationInputTokens: number }>} */
+    const modelUsage = {};
+    const sortedModels = Array.from(allModels.entries()).sort((a, b) => bucketTokens(b[1]) - bucketTokens(a[1]) || a[0].localeCompare(b[0]));
+    for (const [model, bucket] of sortedModels) {
+      modelUsage[model] = {
+        inputTokens: bucket.input,
+        outputTokens: bucket.output,
+        cacheReadInputTokens: bucket.cacheRead,
+        cacheCreationInputTokens: bucket.cacheWrite,
       };
     }
 
     byFamily[family] = {
       hasLocalStats: true,
       hasPromptStats: true,
-      todayPrompts: acc.dayPrompts.get(today) ?? 0,
-      todaySessions: acc.daySessions.get(today)?.size ?? 0,
-      todayTotalTokens: acc.dayTokens.get(today) ?? 0,
-      todayTokensByModel,
-      weekTokensByModel,
-      recentDays: recentDates.map((date) => ({ date, messageCount: acc.dayTokens.get(date) ?? 0 })),
-      totalPrompts: acc.prompts,
-      totalSessions: acc.sessions.size,
-      activeDays: acc.activeDates.size,
-      activeDates: Array.from(acc.activeDates).sort(),
+      todayPrompts,
+      todaySessions: todayRows ? count(todayRows.sessions) : 0,
+      todayTotalTokens,
+      todayTokensByModel: tokensByModel(todayModels),
+      weekTokensByModel: tokensByModel(weekModels),
+      recentDays: recentDates.map((date) => ({ date, messageCount: dayTokens.get(date) ?? 0 })),
+      totalPrompts,
+      totalSessions: (history?.totalSessions ?? 0) + openSessions,
+      activeDays: activeDates.size,
+      activeDates: Array.from(activeDates).sort(),
       modelUsage,
       byAccount,
     };
@@ -780,14 +937,16 @@ export function buildLocalStats(files, options = {}) {
 }
 
 /**
- * Scan Pi's session files and fold them into local statistics.
+ * Scan Pi's session files, freeze closed days into the durable history, and fold
+ * everything into local statistics.
  *
- * Never throws. Everything unexpected (unreadable file, unwritable cache)
- * becomes a warning; the numbers simply cover fewer sessions.
+ * Never throws. Everything unexpected (unreadable file, unwritable cache or
+ * history) becomes a warning; the numbers simply cover fewer sessions.
  *
  * @param {{
  *   roots?: string[],
  *   cachePath?: string,
+ *   historyDir?: string,
  *   env?: Record<string, string | undefined>,
  *   home?: string,
  *   now?: number,
@@ -797,26 +956,37 @@ export function buildLocalStats(files, options = {}) {
  * @returns {Promise<{
  *   byFamily: Record<string, LocalFamilyStats>,
  *   warnings: string[],
- *   scan: { files: number, scanned: number, reused: number, bytesRead: number, durationMs: number, partial: boolean, budgetMs: number },
+ *   scan: { files: number, scanned: number, reused: number, bytesRead: number, durationMs: number, partial: boolean, budgetMs: number, frozenDays: number },
  * }>}
  */
 export async function collectLocalStats(options = {}) {
   const clock = options.clock ?? Date.now;
   const startedAt = clock();
   const now = options.now ?? Date.now();
+  const today = localDayKey(now);
   const budgetMs = Number.isFinite(options.budgetMs) ? /** @type {number} */ (options.budgetMs) : DEFAULT_SCAN_BUDGET_MS;
-  const roots = options.roots ?? resolveSessionRoots(options);
+  const roots = dedupeRoots(options.roots ?? resolveSessionRoots(options));
   const cachePath = options.cachePath ?? resolveLocalStatsCachePath(options);
+  const historyDir = options.historyDir ?? resolveHistoryDir(options);
   /** @type {string[]} */
   const warnings = [];
 
-  const overBudget = () => clock() - startedAt > budgetMs;
+  // A missing history or a missing cache every day still on disk has to be
+  // rebuildable, so both force a rescan. Frozen days are skipped in that case:
+  // they were already counted and a rescan must never add them again.
+  const history = loadTotals({ historyDir, warnings });
   const cached = readCacheFile(cachePath);
+  const rescanAll = !cached.hit || history.rescanAll;
+  const lastFrozenDay = history.totals.lastFrozenDay;
+
+  const overBudget = () => clock() - startedAt > budgetMs;
   const listen = listSessionFiles(roots);
   const listedSet = new Set(listen);
 
   /** @type {Record<string, SessionFileEntry>} */
   const next = {};
+  /** @type {Record<string, DayRows>} */
+  const lateRows = {};
   let changed = !cached.hit;
   let scanned = 0;
   let reused = 0;
@@ -843,6 +1013,7 @@ export async function collectLocalStats(options = {}) {
     const previous = cached.files[path];
     if (
       previous &&
+      !rescanAll &&
       previous.size === stats.size &&
       previous.mtimeMs === stats.mtimeMs &&
       previous.ino === (stats.ino ?? 0) &&
@@ -854,20 +1025,31 @@ export async function collectLocalStats(options = {}) {
       continue;
     }
 
-    let days;
+    const replaced = previous ? previous.ino !== (stats.ino ?? 0) || stats.size < previous.offset : false;
+    const rescan = rescanAll || replaced;
+    const reset = !previous || rescan;
+    const days = reset ? emptyDays() : decodeDays(previous.days);
+    const startOffset = reset ? 0 : previous.offset;
     let offset;
     let complete;
     try {
-      const reset = !previous || previous.ino !== (stats.ino ?? 0) || stats.size < previous.offset;
-      const startOffset = reset ? 0 : previous.offset;
       const result = await scanFile({
         path,
         startOffset,
-        existingDays: reset ? emptyDays() : decodeDays(previous.days),
+        days,
         now,
         shouldStop: overBudget,
+        onUsage: (usage) => {
+          if (lastFrozenDay && usage.day <= lastFrozenDay) {
+            // Frozen days are never recomputed. A first-time read (append) of
+            // bytes belonging to one is a late write and goes to history.
+            if (rescan) return;
+            addLateUsage(lateRows, usage);
+            return;
+          }
+          addUsage(days, usage);
+        },
       });
-      days = result.days;
       offset = result.offset;
       complete = result.complete;
       bytesRead += offset - startOffset;
@@ -904,12 +1086,37 @@ export async function collectLocalStats(options = {}) {
   }
 
   // Files the budget skipped keep their previous entry; files that are gone
-  // lose theirs (and their contribution) on this run.
+  // lose theirs on this run.
   for (const path of listen) {
     if (!next[path] && cached.files[path]) next[path] = cached.files[path];
   }
   for (const path of Object.keys(cached.files)) {
     if (!listedSet.has(path)) changed = true;
+  }
+
+  const openRows = buildOpenRows(next);
+  const applied = applyDurable({
+    historyDir,
+    totals: history.totals,
+    openRows,
+    lateRows,
+    today,
+    partial,
+    writable: history.writable,
+    ensure: !history.exists,
+    warnings,
+  });
+
+  // A day that is in the rollup (frozen now, or already frozen before a crash)
+  // must leave the disposable cache; otherwise a rescan would see it twice.
+  if (applied.droppedDays.size > 0) {
+    for (const entry of Object.values(next)) {
+      for (const day of applied.droppedDays) {
+        if (entry.days && day in entry.days) delete entry.days[day];
+      }
+    }
+    for (const day of applied.droppedDays) delete openRows[day];
+    changed = true;
   }
 
   if (changed) {
@@ -919,8 +1126,11 @@ export async function collectLocalStats(options = {}) {
     }
   }
 
+  const recentDates = recentLocalDates(now, RECENT_DAYS);
+  const windowDays = loadWindowDays({ historyDir, dates: recentDates, warnings });
+
   return {
-    byFamily: buildLocalStats(next, { now }),
+    byFamily: buildLocalStats({ totals: history.totals, openRows, windowDays, now }),
     warnings,
     scan: {
       files: listen.length,
@@ -930,6 +1140,7 @@ export async function collectLocalStats(options = {}) {
       durationMs: clock() - startedAt,
       partial,
       budgetMs,
+      frozenDays: applied.frozenDays.length,
     },
   };
 }

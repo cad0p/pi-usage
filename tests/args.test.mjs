@@ -43,6 +43,14 @@ test("a non-numeric value for an own flag is reported, never silently dropped", 
   assert.equal(parsed.ttlMs, 60_000, "the default is kept when the value is unusable");
 });
 
+test("--rebuild-totals is an owned boolean flag, not a typo", () => {
+  const parsed = parseArgs(["stats", "--rebuild-totals"]);
+  assert.deepEqual(parsed.positionals, ["stats"]);
+  assert.deepEqual(parsed.unknown, []);
+  assert.equal(parsed.rebuildTotals, true);
+  assert.equal(parseArgs(["stats"]).rebuildTotals, false);
+});
+
 test("subcommand value flags stay out of both positionals and unknown", () => {
   const auth = parseArgs(["auth", "opencode", "--wait", "180"]);
   assert.deepEqual(auth.positionals, ["auth", "opencode"]);
