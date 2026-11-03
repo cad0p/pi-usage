@@ -300,13 +300,20 @@ dependencies to wrap the body in a `ScrollView`.
 
 `tab` (or `2`) opens **History**, the second page: the durable token history for
 one month, with the same foldable sections. A provider section lists the month's
-days, the token split by model, and — for a multi-account provider — one row per
-account with its month and all-time totals (every account the family has in the
-month *or* all-time, so one busy key does not hide the others). `←`/`→` (or
+days, the prompt count for that month and for all time, the token split by
+model, and — for a multi-account provider — one row per account with its month
+and all-time totals (every account the family has in the month *or* all-time, so
+one busy key does not hide the others). `←`/`→` (or
 `[`/`]`) walk the browsable months — those with a file, plus the live month,
 which is where History opens even before its first freeze — and `tab` (or `1`)
 comes back to Now. The all-time
-figure is `totals.json` (frozen through its watermark). A family's open day
+figure is `totals.json` (frozen through its watermark) plus, when it is merged,
+the same open day the month counts, so today is never missing from it. A rollup
+that cannot cover the month on screen — a freeze whose totals write failed, a
+month file restored behind `totals.json` — is still printed, dimmed, with
+`~ all-time lags this month; run piquota stats --rebuild-totals` above the rows:
+the figure is the only answer to "how much has this burned ever", so it is
+explained rather than dropped. A family's open day
 (today) is merged from the live report only when the report was *generated* today
 and the frozen month has no row for that family's day — per family, so one family
 frozen early never hides another's live row — and a day is counted exactly once.
@@ -321,7 +328,11 @@ the last keypress asked for.
 History reads `piquota stats --json [--month YYYY-MM]`: the month list, one
 month's days per family/slot/model, the all-time rollup and notes. That command
 never takes the writer lock and never writes, so it is safe to run while a scan
-is freezing a day.
+is freezing a day. Everything it reports is frozen: `lastFrozenDay` is its
+watermark, and neither `piquota stats` nor its JSON moves an open day into a
+total. The History page merges the live day itself, for the month and for the
+all-time figures alike, and prints the same "comes from the live report" note
+under both.
 
 A provider with several accounts is shown as one header (`OP-Go · 7 of 14 accounts
 ok`) plus one line per account with every window and its reset, e.g.
@@ -826,7 +837,7 @@ extensions/quota-panel.ts      Pi TUI line and /usage
 ## Tests
 
 ```bash
-node --test tests/*.test.mjs     # 401 tests, fake tokens only, no network
+node --test tests/*.test.mjs     # 404 tests, fake tokens only, no network
 ```
 
 Modules covered: `auth.json` parsing and de-duplication, the Claude Code store
