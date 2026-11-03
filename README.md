@@ -546,7 +546,15 @@ loss. A lost or corrupt `totals.json` is moved aside as
 `totals.json.corrupt-<ts>` and **rebuilt from the month files**, which are the
 authoritative record of frozen days — not from the session files, because a
 session deleted since then would otherwise shrink history. Frozen days are never
-recomputed, so a replaced session file cannot rewrite them either. A lost *month* file loses only that month's daily detail — the all-time
+recomputed, so a replaced session file cannot rewrite them either.
+
+Two repair rules keep a damaged month from quietly costing days. A month file
+that cannot be *read* (permissions, I/O) is left alone: the rollup is written
+with an `incompleteMonths` marker and rebuilt on the next run, so restoring the
+permission heals the history by itself. A month file that is *corrupt* is moved
+aside by the lock owner (never by a read-only run) with a warning naming the file
+and its `.corrupt-<ts>` copy, and the days it held are rebuilt from the session
+files that still exist so "tokens by day" and the rollup stay consistent. A lost *month* file loses only that month's daily detail — the all-time
 totals stay — and `piquota stats --rebuild-totals` recomputes `totals.json` from
 every month file, recovering days whose session files are already gone — and it
 refuses to run when there is no month file at all while `totals.json` still has
@@ -658,7 +666,7 @@ extensions/quota-panel.ts      Pi TUI line and /usage
 ## Tests
 
 ```bash
-node --test tests/*.test.mjs     # 320 tests, fake tokens only, no network
+node --test tests/*.test.mjs     # 325 tests, fake tokens only, no network
 ```
 
 Modules covered: `auth.json` parsing and de-duplication, the Claude Code store

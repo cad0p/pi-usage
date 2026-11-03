@@ -1142,6 +1142,8 @@ export function buildLocalStats(input = {}) {
     // anything the run that does hold the lock is writing right now.
     const history = loadTotals({ historyDir, warnings, canWrite: false });
     const cached = readCacheFile(cachePath);
+    // Nothing here may write: not the history, not the cache, and not a repair
+    // of a corrupt month file (review findings N8, N10).
     warnings.push(
       lock.reason
         ? `local token stats: could not take the history lock (${lock.reason}); showing the numbers already on disk and writing nothing`
@@ -1151,7 +1153,12 @@ export function buildLocalStats(input = {}) {
       byFamily: buildLocalStats({
         totals: history.totals,
         openRows: buildOpenRows(cached.files),
-        windowDays: loadWindowDays({ historyDir, dates: recentLocalDates(now, RECENT_DAYS), warnings }),
+        windowDays: loadWindowDays({
+          historyDir,
+          dates: recentLocalDates(now, RECENT_DAYS),
+          warnings,
+          canWrite: false,
+        }),
         now,
       }),
       warnings,
@@ -1173,7 +1180,21 @@ export function buildLocalStats(input = {}) {
       history.totals.lastFrozenDay === "" &&
       typeof cached.historyWatermark === "string" &&
       cached.historyWatermark !== "";
-    const rescanAll = !cached.hit || history.rescanAll || lostHistory;
+    // Months inside the reporting window whose file is gone or was just
+    // quarantined: their days are still in the rollup, so they are rebuilt from
+    // the sessions and written back as daily detail (review finding N12).
+    const windowDates = recentLocalDates(now, RECENT_DAYS);
+    const window = /** @type {any} */ (loadWindowDays({ historyDir, dates: windowDates, warnings, canWrite: true, returnDamaged: true }));
+    /** @type {Set<string>} */
+    const repairDays = new Set();
+    if (window.damaged.length > 0) {
+      const damagedMonths = new Set(window.damaged);
+      for (const date of windowDates) {
+        if (!damagedMonths.has(date.slice(0, 7))) continue;
+        if (history.totals.lastFrozenDay && date <= history.totals.lastFrozenDay) repairDays.add(date);
+      }
+    }
+    const rescanAll = !cached.hit || history.rescanAll || lostHistory || repairDays.size > 0;
     const lastFrozenDay = history.totals.lastFrozenDay;
 
     const overBudget = () => clock() - startedAt > budgetMs;
@@ -1190,10 +1211,36 @@ export function buildLocalStats(input = {}) {
       if (entry?.fingerprint) counted.set(entry.fingerprint, path);
     }
 
+    /**
+     * The surviving file a copy chain bottoms out in.
+     *
+     * A copy can itself be copied (A -> B -> C), and an older cache may hold a
+     * chain. Following `dedupedBy` to its root means deleting a middle copy
+     * cannot make the tail look orphaned while the root is still counted
+     * (review finding N11).
+     *
+     * @param {string} path
+     * @returns {string | null} A path outside the chain that still exists.
+     */
+    const rootOriginal = (path) => {
+      const seen = new Set([path]);
+      let current = cached.files[path]?.dedupedBy;
+      while (current) {
+        if (seen.has(current)) return null;
+        seen.add(current);
+        const next = cached.files[current]?.dedupedBy;
+        if (!next) return current;
+        current = next;
+      }
+      return null;
+    };
+
     /** @type {Record<string, SessionFileEntry>} */
     const next = {};
     /** @type {Record<string, DayRows>} */
     const lateRows = {};
+    /** @type {Record<string, DayRows>} */
+    const repairRows = {};
     let changed = !cached.hit;
     let scanned = 0;
     let reused = 0;
@@ -1237,7 +1284,7 @@ export function buildLocalStats(input = {}) {
       // own: if the original is gone, this file is now the only holder of those
       // open days and must be read again (review finding N4).
       const cachedEntry = cached.files[path];
-      const orphanedCopy = cachedEntry?.dedupedBy !== undefined && !listedSet.has(cachedEntry.dedupedBy);
+      const orphanedCopy = cachedEntry?.dedupedBy !== undefined && !listedSet.has(rootOriginal(path) ?? cachedEntry.dedupedBy);
       const previous = orphanedCopy ? undefined : cachedEntry;
       if (
         previous &&
@@ -1284,6 +1331,9 @@ export function buildLocalStats(input = {}) {
       const duplicateOf = candidate !== undefined && sameContent(candidate, path, stats.size) ? candidate : undefined;
       if (rescan && fingerprint && candidate === undefined) counted.set(fingerprint, path);
       if (duplicateOf !== undefined) {
+        // Point at the root of the chain, not at whatever file happened to
+        // match: a copy of a copy must survive the middle link being deleted.
+        const root = rootOriginal(duplicateOf) ?? duplicateOf;
         next[path] = {
           size: stats.size,
           mtimeMs: stats.mtimeMs,
@@ -1291,7 +1341,7 @@ export function buildLocalStats(input = {}) {
           offset: stats.size,
           complete: true,
           fingerprint,
-          dedupedBy: duplicateOf,
+          dedupedBy: root,
           days: {},
         };
         changed = true;
@@ -1311,6 +1361,12 @@ export function buildLocalStats(input = {}) {
           now,
           shouldStop: overBudget,
           onUsage: (usage) => {
+            if (repairDays.has(usage.day)) {
+              // The row is rebuilt for a day whose month file was lost; the
+              // rollup keeps its totals, so this never adds to them.
+              addLateUsage(repairRows, usage);
+              return;
+            }
             if (lastFrozenDay && usage.day <= lastFrozenDay) {
               // Frozen days are never recomputed. A first-time read (append) of
               // bytes belonging to one is a late write and goes to history.
@@ -1366,6 +1422,11 @@ export function buildLocalStats(input = {}) {
       if (!listedSet.has(path)) changed = true;
     }
 
+    // Ownership is re-checked here, not only every eight files: a scan of a
+    // handful of small files reaches this point without a refresh point, and a
+    // run that lost the lock must not write (review finding N8).
+    if (!lostLock && !refreshHistoryLock(lock)) lostLock = true;
+
     // A run that lost the lock must not write anything: another run now owns
     // the history, and a second write is exactly the double count the lock
     // exists to prevent.
@@ -1373,7 +1434,12 @@ export function buildLocalStats(input = {}) {
       warnings.push(
         "local token stats: another piquota run took the history lock over during this scan; the numbers below are read-only",
       );
-      const windowDays = loadWindowDays({ historyDir, dates: recentLocalDates(now, RECENT_DAYS), warnings });
+      const windowDays = loadWindowDays({
+        historyDir,
+        dates: recentLocalDates(now, RECENT_DAYS),
+        warnings,
+        canWrite: false,
+      });
       return {
         byFamily: buildLocalStats({ totals: history.totals, openRows: buildOpenRows(next), windowDays, now }),
         warnings,
@@ -1397,6 +1463,7 @@ export function buildLocalStats(input = {}) {
       totals: history.totals,
       openRows,
       lateRows,
+      repairRows,
       today,
       partial,
       writable: history.writable,
@@ -1417,7 +1484,9 @@ export function buildLocalStats(input = {}) {
     }
 
     if (changed) {
-      const written = writeCacheFile(cachePath, next, history.totals.lastFrozenDay);
+      const written = refreshHistoryLock(lock)
+        ? writeCacheFile(cachePath, next, history.totals.lastFrozenDay)
+        : { ok: true };
       if (!written.ok) {
         warnings.push(`local token stats: could not write the scan cache at ${cachePath}: ${written.error}`);
       }

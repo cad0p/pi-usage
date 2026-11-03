@@ -8,6 +8,7 @@
 
 import assert from "node:assert/strict";
 import {
+  chmodSync,
   copyFileSync,
   existsSync,
   mkdirSync,
@@ -621,6 +622,158 @@ test("a lock taken over from a slow run is not deleted by that run on its way ou
   assert.equal(refreshHistoryLock(second), true);
   assert.equal(releaseHistoryLock(second), true);
   assert.equal(acquireHistoryLock({ lockPath, now }).acquired, true, "once released, the next run takes it");
+});
+
+test("a run that loses the lock mid-scan writes no history and no cache, even with few files", async () => {
+  const tree = tempTree();
+  for (let index = 0; index < 3; index += 1) {
+    writeSession(tree.sessions, `f${index}.jsonl`, [
+      assistantLine({ ts: tsForDay(-1), usage: { input: 10, output: 0, cacheRead: 0, cacheWrite: 0 } }),
+      assistantLine({ ts: tsForDay(0), usage: { input: 10, output: 0, cacheRead: 0, cacheWrite: 0 } }),
+    ]);
+  }
+  // Three files never reach the every-eight-files refresh, so only the check
+  // right before the writes can notice a takeover (review finding N8). The
+  // clock stands in for the other run: it swaps the owner token while we scan.
+  let calls = 0;
+  const clock = () => {
+    calls += 1;
+    if (calls === 6) writeFileSync(`${tree.cachePath}.lock`, "someone-else\n", "utf-8");
+    return NOW;
+  };
+  const result = await collectLocalStats({
+    roots: [tree.sessions],
+    cachePath: tree.cachePath,
+    historyDir: tree.historyDir,
+    now: NOW,
+    budgetMs: 60_000,
+    clock,
+  });
+
+  assert.equal(result.scan.locked, true);
+  assert.equal(result.scan.frozenDays, 0);
+  assert.ok(result.warnings.some((warning) => warning.includes("took the history lock over")), result.warnings.join(" | "));
+  assert.equal(existsSync(tree.totalsPath), false, "no rollup is written by a run that lost the lock");
+  assert.equal(existsSync(resolveMonthPath(tree.historyDir, MONTH)), false, "no month file either");
+  assert.equal(existsSync(tree.cachePath), false, "and no cache");
+  assert.equal(readFileSync(`${tree.cachePath}.lock`, "utf-8").trim(), "someone-else", "the successor's lock is left alone");
+});
+
+test("a copy chain resolves to its root, so deleting a middle copy changes nothing", async () => {
+  const tree = tempTree();
+  const a = writeSession(tree.sessions, "A.jsonl", [
+    assistantLine({ usage: { input: 10, output: 0, cacheRead: 0, cacheWrite: 0 } }),
+    assistantLine({ usage: { input: 10, output: 0, cacheRead: 0, cacheWrite: 0 } }),
+  ]);
+  await scan(tree);
+  copyFileSync(a, join(tree.sessions, "B.jsonl"));
+  await scan(tree);
+  copyFileSync(join(tree.sessions, "B.jsonl"), join(tree.sessions, "C.jsonl"));
+  const all = await scan(tree);
+  assert.equal(all.byFamily.claude.todayPrompts, 2, "three identical files, one session");
+
+  // C must point at A, not at B: deleting the middle link used to orphan C and
+  // count its lines a second time (review finding N11).
+  const files = readJson(tree.cachePath).files;
+  assert.equal(files[join(tree.sessions, "C.jsonl")].dedupedBy, join(tree.sessions, "A.jsonl"));
+
+  unlinkSync(join(tree.sessions, "B.jsonl"));
+  const middle = await scan(tree);
+  assert.equal(middle.byFamily.claude.todayPrompts, 2, "the chain still bottoms out in a live original");
+
+  unlinkSync(a);
+  const root = await scan(tree);
+  assert.equal(root.byFamily.claude.todayPrompts, 2, "with the root gone the copy is adopted, once");
+});
+
+test("an unreadable month file never shrinks the rollup permanently", async (t) => {
+  if (process.getuid?.() === 0) {
+    t.skip("permissions are not enforced for root");
+    return;
+  }
+  const tree = tempTree();
+  writeSession(tree.sessions, "a.jsonl", [
+    assistantLine({ ts: new Date(noonOf("2026-09-05")).toISOString(), usage: { input: 100, output: 0, cacheRead: 0, cacheWrite: 0 } }),
+    assistantLine({ ts: tsForDay(-1), usage: { input: 1_000, output: 0, cacheRead: 0, cacheWrite: 0 } }),
+  ]);
+  await scan(tree);
+  const complete = totalsOf(tree);
+  const september = resolveMonthPath(tree.historyDir, "2026-09");
+  assert.equal(complete.families.claude.totalPrompts, 2);
+
+  // A permission error is temporary: the days it holds must not be dropped from
+  // the rollup just because the file could not be read once (finding N9).
+  chmodSync(september, 0o000);
+  rmSync(tree.totalsPath, { force: true });
+  try {
+    const blocked = await scan(tree);
+    assert.ok(blocked.warnings.some((warning) => warning.includes("could not be read")), blocked.warnings.join(" | "));
+    const partial = totalsOf(tree);
+    assert.deepEqual(partial.incompleteMonths, ["2026-09"], "the rollup says which month it is missing");
+    assert.equal(partial.families.claude.totalPrompts, 1, "only the readable day is in it");
+    assert.equal(blocked.scan.frozenDays, 0, "nothing is frozen while the history is incomplete");
+  } finally {
+    chmodSync(september, 0o600);
+  }
+
+  const healed = await scan(tree);
+  assert.equal(totalsOf(tree).incompleteMonths, undefined, "a readable month heals the rollup by itself");
+  assert.equal(totalsOf(tree).families.claude.totalPrompts, 2);
+  assert.equal(totalsOf(tree).lastFrozenDay, complete.lastFrozenDay);
+  assert.equal(healed.byFamily.claude.totalPrompts, 2);
+});
+
+test("a read-only reader never repairs a corrupt month file", async () => {
+  const tree = tempTree();
+  writeSession(tree.sessions, "a.jsonl", [
+    assistantLine({ ts: tsForDay(-1), usage: { input: 10, output: 0, cacheRead: 0, cacheWrite: 0 } }),
+    assistantLine({ ts: tsForDay(0), usage: { input: 10, output: 0, cacheRead: 0, cacheWrite: 0 } }),
+  ]);
+  await scan(tree);
+  const month = resolveMonthPath(tree.historyDir, MONTH);
+  writeFileSync(month, "{bad", "utf-8");
+  mkdirSync(dirname(tree.cachePath), { recursive: true });
+  writeFileSync(`${tree.cachePath}.lock`, "other-run\n", "utf-8");
+
+  const blocked = await scan(tree);
+  assert.equal(blocked.scan.locked, true);
+  assert.ok(
+    readdirSync(tree.historyDir).every((name) => !name.includes(".corrupt-")),
+    "renaming a file aside is a repair, and this run does not own the lock (finding N10)",
+  );
+  assert.ok(
+    blocked.warnings.some((warning) => warning.includes("does not hold the history lock")),
+    blocked.warnings.join(" | "),
+  );
+  assert.equal(readFileSync(month, "utf-8"), "{bad", "the corrupt file is left exactly as it was");
+});
+
+test("a quarantined month says what was lost and where the copy is", async () => {
+  const tree = tempTree();
+  writeSession(tree.sessions, "a.jsonl", [
+    assistantLine({ ts: tsForDay(-1), usage: { input: 400, output: 0, cacheRead: 0, cacheWrite: 0 } }),
+    assistantLine({ ts: tsForDay(0), usage: { input: 10, output: 0, cacheRead: 0, cacheWrite: 0 } }),
+  ]);
+  await scan(tree);
+  const month = resolveMonthPath(tree.historyDir, MONTH);
+  writeFileSync(month, "{truncated", "utf-8");
+
+  const result = await scan(tree);
+  const warning = result.warnings.find((entry) => entry.includes("corrupt or from another version"));
+  assert.ok(warning, result.warnings.join(" | "));
+  assert.match(warning, new RegExp(resolveMonthPath(tree.historyDir, MONTH).replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+  assert.match(warning, /\.corrupt-<timestamp>/, "the copy is named so it can be restored");
+  assert.ok(readdirSync(tree.historyDir).some((name) => name.includes(".corrupt-")));
+  // The day whose session file still exists is re-frozen from disk, so the
+  // window and the rollup agree instead of drifting apart.
+  assert.equal(result.byFamily.claude.recentDays.at(-2).messageCount, 400);
+  assert.equal(result.byFamily.claude.totalPrompts, 2, "the rollup still counts the rebuilt day, plus today");
+  assert.equal(totalsOf(tree).families.claude.totalPrompts, 1, "the rollup holds the frozen day only, never today");
+  // The day's daily detail is back in a month file, so the next run's window
+  // does not need the repair pass again.
+  assert.equal(result.scan.frozenDays, 0);
+  assert.ok(existsSync(resolveMonthPath(tree.historyDir, MONTH)));
+  assert.equal(monthOf(tree).days[localDayKey(Date.parse(tsForDay(-1)))].claude.slots[""].models["claude-opus-5-5"].input, 400);
 });
 
 test("a lost rollup is rebuilt from the month files, not from the surviving sessions", async () => {

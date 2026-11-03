@@ -266,7 +266,7 @@ export function cloneDayRows(rows) {
  * @returns {Totals}
  */
 export function emptyTotals() {
-  return { lastFrozenDay: "", families: new Map() };
+  return { lastFrozenDay: "", families: new Map(), incompleteMonths: [] };
 }
 
 /**
@@ -399,7 +399,15 @@ export function totalsToJson(totals) {
       accounts,
     };
   }
-  return { schemaVersion: HISTORY_SCHEMA_VERSION, lastFrozenDay: totals.lastFrozenDay, families };
+  return {
+    schemaVersion: HISTORY_SCHEMA_VERSION,
+    lastFrozenDay: totals.lastFrozenDay,
+    // Months this rollup had to skip because they could not be read. A rollup
+    // that carries one is known to be incomplete and is rebuilt on the next run
+    // instead of being trusted (review finding N9).
+    ...(totals.incompleteMonths && totals.incompleteMonths.length > 0 ? { incompleteMonths: [...totals.incompleteMonths] } : {}),
+    families,
+  };
 }
 
 /**
@@ -455,6 +463,9 @@ export function parseTotals(raw) {
 
   const totals = emptyTotals();
   totals.lastFrozenDay = object.lastFrozenDay;
+  if (Array.isArray(object.incompleteMonths)) {
+    totals.incompleteMonths = object.incompleteMonths.filter((month) => typeof month === "string");
+  }
   for (const [family, value] of Object.entries(object.families)) {
     if (!value || typeof value !== "object") continue;
     const entry = /** @type {Record<string, unknown>} */ (value);
@@ -667,7 +678,7 @@ export function totalsFromMonths(input) {
   try {
     names = readdirSync(input.historyDir);
   } catch {
-    return { totals: emptyTotals(), months: 0, days: 0 };
+    return { totals: emptyTotals(), months: 0, days: 0, unreadable: [] };
   }
   const months = names
     .map((name) => MONTH_FILE.exec(name))
@@ -676,9 +687,12 @@ export function totalsFromMonths(input) {
     .sort();
 
   const totals = emptyTotals();
+  /** @type {string[]} */
+  const unreadable = [];
   let days = 0;
   for (const month of months) {
-    const entry = readMonthFile(input.historyDir, month, input.warnings);
+    const entry = readMonthFile(input.historyDir, month, input.warnings, { canWrite: input.canWrite });
+    if (entry.unreadable) unreadable.push(month);
     if (!entry.writable) continue;
     for (const day of Object.keys(entry.days).sort()) {
       const rows = entry.days[day];
@@ -688,7 +702,7 @@ export function totalsFromMonths(input) {
       days += 1;
     }
   }
-  return { totals, months: months.length, days };
+  return { totals, months: months.length, days, unreadable };
 }
 
 /**
@@ -716,9 +730,27 @@ export function loadTotals(input) {
    * @param {boolean} writableRollup Whether the rollup may be written now.
    */
   const fromMonths = (writableRollup) => {
-    const rebuilt = totalsFromMonths({ historyDir: input.historyDir, warnings: input.warnings });
+    const rebuilt = totalsFromMonths({
+      historyDir: input.historyDir,
+      warnings: input.warnings,
+      canWrite: writableRollup && input.canWrite !== false,
+    });
     if (rebuilt.months === 0) {
       return { totals: emptyTotals(), rescanAll: true, writable: writableRollup, path, exists: false, rebuiltFromMonths: false };
+    }
+    if (rebuilt.unreadable.length > 0) {
+      // Some month could not be read (permission, I/O). Writing a rollup built
+      // without it would drop those days for good, so the rollup is written but
+      // marked incomplete — and an incomplete rollup is never trusted: the next
+      // run rebuilds it from the months, which is how a restored month
+      // permission heals the history by itself (review finding N9).
+      rebuilt.totals.incompleteMonths = rebuilt.unreadable;
+      input.warnings.push(
+        `local token stats: ${rebuilt.unreadable.length} month file(s) could not be read (${rebuilt.unreadable.join(", ")}); ` +
+          "the token history stays partial and nothing is frozen until they can be read again",
+      );
+      if (writableRollup && input.canWrite !== false) writeJsonAtomic(path, totalsToJson(rebuilt.totals));
+      return { totals: rebuilt.totals, rescanAll: true, writable: false, path, exists: true, rebuiltFromMonths: false };
     }
     input.warnings.push(
       `local token stats: the history rollup was rebuilt from ${rebuilt.months} month file(s) (${rebuilt.days} frozen day(s))`,
@@ -761,6 +793,11 @@ export function loadTotals(input) {
   if (totals.families.size === 0 && totals.lastFrozenDay === "" && hasMonthFiles(input.historyDir)) {
     return fromMonths(true);
   }
+  // A rollup that skipped an unreadable month is repaired as soon as that month
+  // can be read again.
+  if ((totals.incompleteMonths ?? []).length > 0 && hasMonthFiles(input.historyDir)) {
+    return fromMonths(true);
+  }
   return { totals, rescanAll: false, writable: true, path, exists: true, rebuiltFromMonths: false };
 }
 
@@ -773,17 +810,24 @@ export function loadTotals(input) {
  * @param {string[]} warnings
  * @returns {{ days: Record<string, DayRows>, writable: boolean, exists: boolean, path: string }}
  */
-export function readMonthFile(historyDir, month, warnings) {
+export function readMonthFile(historyDir, month, warnings, options = {}) {
+  const canWrite = options.canWrite !== false;
   const path = resolveMonthPath(historyDir, month);
   let raw;
   try {
     raw = readFileSync(path, "utf-8");
   } catch (error) {
     if (/** @type {{ code?: string }} */ (error)?.code === "ENOENT") {
-      return { days: {}, writable: true, exists: false, path };
+      return { days: {}, writable: true, exists: false, unreadable: false, quarantined: false, path };
     }
-    warnings.push(`local token stats: could not read the ${month} history at ${path}: ${redact(/** @type {{ message?: string }} */ (error)?.message)}`);
-    return { days: {}, writable: false, exists: true, path };
+    // A permission or I/O error is temporary: the file is still there and may be
+    // readable in a moment. It must NOT be quarantined, and the days it holds
+    // must not be silently dropped from the rollup (review finding N9).
+    warnings.push(
+      `local token stats: could not read ${path} (${redact(/** @type {{ message?: string }} */ (error)?.message)}); ` +
+        "leaving the token history untouched this run, because rebuilding without it would permanently drop those days",
+    );
+    return { days: {}, writable: false, exists: true, unreadable: true, quarantined: false, path };
   }
 
   let parsed;
@@ -792,12 +836,36 @@ export function readMonthFile(historyDir, month, warnings) {
   } catch {
     parsed = null;
   }
-  if (!parsed || typeof parsed !== "object" || parsed.schemaVersion !== HISTORY_SCHEMA_VERSION || parsed.month !== month
-    || !parsed.days || typeof parsed.days !== "object" || Array.isArray(parsed.days)) {
-    const writable = quarantine(path, warnings, `local token history month ${month}`);
-    return { days: {}, writable, exists: true, path };
+  const shapeOk = parsed && typeof parsed === "object" && parsed.schemaVersion === HISTORY_SCHEMA_VERSION && parsed.month === month
+    && parsed.days && typeof parsed.days === "object" && !Array.isArray(parsed.days);
+  if (!shapeOk) {
+    // Corrupt or written by another version. Renaming it aside is a repair, so
+    // only the lock owner may do it; a read-only reader just says what it sees
+    // (review finding N10).
+    if (!canWrite) {
+      warnings.push(
+        `local token stats: ${path} is unreadable or from another version; leaving it in place because this run does not hold the history lock. ` +
+          "Its days are missing from the numbers below until a run with the lock can repair it",
+      );
+      return { days: {}, writable: false, exists: true, unreadable: true, quarantined: false, path };
+    }
+    const label = `local token history month ${month}`;
+    const writable = quarantine(path, warnings, label);
+    if (writable) {
+      // Loud and specific (review finding N12): name the file, what is missing,
+      // and how to get it back. A quarantined month is *repairable*, so it does
+      // not block the rebuild the way an unreadable one does.
+      warnings.push(
+        `local token stats: ${path} was corrupt or from another version; the frozen days it held are missing from the totals ` +
+          `until you restore it from its .corrupt-<timestamp> sibling. Days whose session files still exist are re-frozen from them`,
+      );
+    }
+    // A month that was moved aside no longer blocks a rebuild: its days are
+    // gone from disk, and refusing to write a rollup would leave the totals
+    // stale forever. One that could not be repaired still blocks it (N9).
+    return { days: {}, writable, exists: true, unreadable: !writable, quarantined: writable, path };
   }
-  return { days: parsed.days, writable: true, exists: true, path };
+  return { days: parsed.days, writable: true, exists: true, unreadable: false, quarantined: false, path };
 }
 
 /**
@@ -845,9 +913,10 @@ function incrementDayRows(days, day, deltaRows) {
  *   partial: boolean,
  *   writable: boolean,
  *   ensure?: boolean,
+ *   repairRows?: Record<string, DayRows>,
  *   warnings: string[],
  * }} input
- * @returns {{ droppedDays: Set<string>, frozenDays: string[], wroteTotals: boolean }}
+ * @returns {{ droppedDays: Set<string>, frozenDays: string[], repairedDays: string[], wroteTotals: boolean }}
  */
 export function applyDurable(input) {
   /** @type {Set<string>} */
@@ -865,7 +934,11 @@ export function applyDurable(input) {
   // deltas from bytes that were read once, so they still apply.
   const freezeDays = input.partial ? [] : candidates;
   const lateDays = Object.keys(input.lateRows).sort();
-  if (freezeDays.length === 0 && lateDays.length === 0) {
+  // Days whose month file was lost but whose rollup totals are intact: the rows
+  // are rebuilt from the sessions and written as a SET, so the day's detail
+  // returns without the all-time totals counting it twice.
+  const repairDays = Object.keys(input.repairRows ?? {}).sort();
+  if (freezeDays.length === 0 && lateDays.length === 0 && repairDays.length === 0) {
     // A first run with nothing closed yet still writes an (empty) totals file:
     // its presence is what tells the next run the history is intact, instead of
     // rescanning every session again because "history is missing".
@@ -873,15 +946,15 @@ export function applyDurable(input) {
       const written = writeJsonAtomic(resolveTotalsPath(input.historyDir), totalsToJson(input.totals));
       if (!written.ok) {
         input.warnings.push(`local token stats: could not write the history totals: ${written.error}`);
-        return { droppedDays: dropped, frozenDays: [], wroteTotals: false };
+        return { droppedDays: dropped, frozenDays: [], repairedDays: [], wroteTotals: false };
       }
-      return { droppedDays: dropped, frozenDays: [], wroteTotals: true };
+      return { droppedDays: dropped, frozenDays: [], repairedDays: [], wroteTotals: true };
     }
-    return { droppedDays: dropped, frozenDays: [], wroteTotals: false };
+    return { droppedDays: dropped, frozenDays: [], repairedDays: [], wroteTotals: false };
   }
   if (!input.writable) {
     input.warnings.push("local token stats: the durable history is unreadable and could not be moved aside; this run leaves it untouched");
-    return { droppedDays: dropped, frozenDays: [], wroteTotals: false };
+    return { droppedDays: dropped, frozenDays: [], repairedDays: [], wroteTotals: false };
   }
 
   /** @type {Map<string, { days: Record<string, DayRows>, writable: boolean }>} */
@@ -890,7 +963,7 @@ export function applyDurable(input) {
     const month = day.slice(0, 7);
     let entry = months.get(month);
     if (!entry) {
-      entry = readMonthFile(input.historyDir, month, input.warnings);
+      entry = readMonthFile(input.historyDir, month, input.warnings, { canWrite: true });
       months.set(month, entry);
     }
     return entry;
@@ -898,13 +971,18 @@ export function applyDurable(input) {
 
   for (const day of lateDays) {
     const month = monthFor(day);
-    if (!month.writable) return { droppedDays: dropped, frozenDays: [], wroteTotals: false };
+    if (!month.writable) return { droppedDays: dropped, frozenDays: [], repairedDays: [], wroteTotals: false };
     incrementDayRows(month.days, day, input.lateRows[day]);
   }
   for (const day of freezeDays) {
     const month = monthFor(day);
-    if (!month.writable) return { droppedDays: dropped, frozenDays: [], wroteTotals: false };
+    if (!month.writable) return { droppedDays: dropped, frozenDays: [], repairedDays: [], wroteTotals: false };
     month.days[day] = cloneDayRows(input.openRows[day]);
+  }
+  for (const day of repairDays) {
+    const month = monthFor(day);
+    if (!month.writable) return { droppedDays: dropped, frozenDays: [], repairedDays: [], wroteTotals: false };
+    month.days[day] = cloneDayRows(input.repairRows[day]);
   }
 
   // Month files first: a frozen day must be on disk before the watermark that
@@ -917,24 +995,26 @@ export function applyDurable(input) {
     });
     if (!written.ok) {
       input.warnings.push(`local token stats: could not write the ${month} history: ${written.error}`);
-      return { droppedDays: dropped, frozenDays: [], wroteTotals: false };
+      return { droppedDays: dropped, frozenDays: [], repairedDays: [], wroteTotals: false };
     }
   }
 
   for (const day of lateDays) applyLateToTotals(input.totals, day, input.lateRows[day]);
   for (const day of freezeDays) applyDayToTotals(input.totals, day, input.openRows[day]);
   if (freezeDays.length > 0) input.totals.lastFrozenDay = maxDay(input.totals.lastFrozenDay, freezeDays[freezeDays.length - 1]);
+  // `repairDays` are deliberately not folded in: the rollup already counts them,
+  // and the month write above only restores their daily detail.
 
   const written = writeJsonAtomic(resolveTotalsPath(input.historyDir), totalsToJson(input.totals));
   if (!written.ok) {
     input.warnings.push(
       `local token stats: could not write the history totals: ${written.error}; the month files are ahead, so \`piquota stats --rebuild-totals\` can recover them`,
     );
-    return { droppedDays: dropped, frozenDays: [], wroteTotals: false };
+    return { droppedDays: dropped, frozenDays: [], repairedDays: [], wroteTotals: false };
   }
 
   for (const day of freezeDays) dropped.add(day);
-  return { droppedDays: dropped, frozenDays: freezeDays, wroteTotals: true };
+  return { droppedDays: dropped, frozenDays: freezeDays, repairedDays: repairDays, wroteTotals: true };
 }
 
 /**
@@ -949,12 +1029,19 @@ export function loadWindowDays(input) {
   const months = new Set(input.dates.map((date) => date.slice(0, 7)));
   /** @type {Record<string, DayRows>} */
   const days = {};
+  /** @type {string[]} */
+  const damaged = [];
   for (const month of months) {
-    const entry = readMonthFile(input.historyDir, month, input.warnings);
+    const entry = readMonthFile(input.historyDir, month, input.warnings, { canWrite: input.canWrite });
+    if (entry.quarantined || entry.unreadable) damaged.push(month);
     for (const [day, rows] of Object.entries(entry.days)) {
       if (wanted.has(day)) days[day] = rows;
     }
   }
+  // Months whose days are not on disk any more, so the caller can rebuild those
+  // days from the session files instead of reporting zeros next to a rollup
+  // that still counts them.
+  if (input.returnDamaged) return { days, damaged };
   return days;
 }
 
@@ -1006,7 +1093,18 @@ export function rebuildTotalsFromMonths(input) {
   const totals = emptyTotals();
   let days = 0;
   for (const month of months) {
-    const entry = readMonthFile(input.historyDir, month, input.warnings);
+    const entry = readMonthFile(input.historyDir, month, input.warnings, { canWrite: true });
+    if (entry.unreadable) {
+      return {
+        ok: false,
+        error: `${resolveMonthPath(input.historyDir, month)} could not be read; refusing to rebuild the rollup without it`,
+        months: months.length,
+        days,
+        families: totals.families.size,
+        lastFrozenDay: totals.lastFrozenDay,
+        path: resolveTotalsPath(input.historyDir),
+      };
+    }
     if (!entry.writable) continue;
     for (const day of Object.keys(entry.days).sort()) {
       const rows = entry.days[day];
