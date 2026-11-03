@@ -5,7 +5,13 @@ All notable changes to this project will be documented in this file.
 ## [calver-released]
 
 <!-- USER-EDITABLE SECTION START -->
-<!-- Add your curated release notes here. -->
+A fullscreen `/usage` with browsable history, and a refresh about three times faster.
+
+- **Fullscreen `/usage`:** bare `/usage` opens a view like `/context`. It paints at once from the last report (`refreshing …` until the new one lands, then `updated HH:MM`), keeps an always-visible key legend, folds provider sections, and scrolls with the arrows, `j`/`k`, PgUp/PgDn, `g`/`G` and the mouse wheel. Rows wrap instead of being clipped, so resets stay visible at 64 columns. Folds, page and month persist for the pi session; `esc`/`q` leaves a clean editor.
+- **History:** `tab` (or `1`/`2`) switches to month history: days, models and per-account tokens, `←`/`→` and `[`/`]` walk the months, and today merges from the live report exactly once. Backed by the new read-only `piquota stats --json [--month YYYY-MM]`.
+- **No invented `#1`:** the unnumbered base account carries no suffix on any surface.
+- **Faster refresh:** a provider's accounts are queried in parallel (default 8, `PI_QUOTA_ACCOUNT_CONCURRENCY` 1–32): a forced refresh went from ~2.9 s to ~1.0 s, OpenCode Go's 14 keys from ~3.8 s to ~0.9 s.
+- **User-Agent:** every request sends `pi-usage/<version> (+https://github.com/cad0p/pi-usage)` instead of Node's generic `node` (Antigravity keeps its CLI agent).
 <!-- USER-EDITABLE SECTION END -->
 
 ### 🚀 Features
