@@ -18,6 +18,7 @@
  * @property {boolean} version
  * @property {boolean} status
  * @property {boolean} clearCache
+ * @property {boolean} rebuildTotals
  * @property {number} ttlMs
  * @property {number} timeoutMs
  * @property {string[]} unknown          Flags this parser does not own.
@@ -70,6 +71,7 @@ export function parseArgs(argv, defaults = {}) {
     status: false,
     box: false,
     clearCache: false,
+    rebuildTotals: false,
     ttlMs: defaults.defaultTtlMs ?? 60_000,
     timeoutMs: defaults.defaultTimeoutMs ?? 15_000,
     unknown: [],
@@ -141,6 +143,9 @@ export function parseArgs(argv, defaults = {}) {
         break;
       case "--clear-cache":
         parsed.clearCache = true;
+        break;
+      case "--rebuild-totals":
+        parsed.rebuildTotals = true;
         break;
       default:
         // Owned by a subcommand, which reads it from `raw` itself.

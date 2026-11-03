@@ -265,6 +265,142 @@ test("the full panel lists every account while the box and the line keep one per
   assert.equal((harness.notifications.at(-1).match(/OP-Go/g) ?? []).length, 1, "the summary names each family once");
 });
 
+test("the panel adds a compact token section per provider and per account", async () => {
+  const module = await import(EXTENSION);
+  const account = (slot, used) => ({
+    family: "opencode-go",
+    label: "OpenCode Go (Pi)",
+    primaryWindowId: "5h",
+    account: `#${slot}`,
+    slot: slot === 1 ? null : String(slot),
+    plan: "Go plan",
+    windows: [
+      { id: "5h", label: "5h window", usedPercent: used, remainingPercent: 100 - used, resetsAt: null, resetsInSec: 600, note: null },
+    ],
+    error: null,
+    ok: true,
+    updatedAt: "2030-01-01T00:00:00.000Z",
+    expiresInMin: null,
+  });
+  const week = [
+    { date: "2026-10-27", messageCount: 0 },
+    { date: "2026-10-28", messageCount: 10_000 },
+    { date: "2026-10-29", messageCount: 0 },
+    { date: "2026-10-30", messageCount: 20_000 },
+    { date: "2026-10-31", messageCount: 0 },
+    { date: "2026-11-01", messageCount: 30_000 },
+    { date: "2026-11-02", messageCount: 40_000 },
+  ];
+  const report = {
+    generatedAt: "2030-01-01T00:00:00.000Z",
+    sources: [],
+    warnings: [],
+    providers: [
+      {
+        family: "claude",
+        label: "Claude (Pi)",
+        primaryWindowId: "5h",
+        account: "fixture@example.com",
+        plan: null,
+        windows: [
+          { id: "5h", label: "5h window", usedPercent: 4, remainingPercent: 96, resetsAt: null, resetsInSec: 3600, note: null },
+        ],
+        error: null,
+        ok: true,
+        updatedAt: "2030-01-01T00:00:00.000Z",
+        expiresInMin: null,
+      },
+      account(1, 10),
+      account(2, 50),
+    ],
+    localStats: {
+      claude: {
+        hasLocalStats: true,
+        todayPrompts: 12,
+        todaySessions: 2,
+        todayTotalTokens: 34_567,
+        todayTokensByModel: { "claude-opus-5-5": 34_567 },
+        weekTokensByModel: {
+          "claude-opus-5-5": 60_000,
+          "claude-sonnet-5": 30_000,
+          "claude-haiku-4": 8_000,
+          "claude-exp-1": 2_000,
+        },
+        recentDays: week,
+        totalPrompts: 99,
+        totalSessions: 7,
+        activeDays: 4,
+        modelUsage: {
+          "claude-opus-5-5": { inputTokens: 1_000, outputTokens: 2_000, cacheReadInputTokens: 30_000, cacheCreationInputTokens: 5_000 },
+          "claude-sonnet-5": { inputTokens: 100, outputTokens: 200, cacheReadInputTokens: 500, cacheCreationInputTokens: 0 },
+          "claude-haiku-4": { inputTokens: 10, outputTokens: 20, cacheReadInputTokens: 30, cacheCreationInputTokens: 0 },
+          "claude-exp-1": { inputTokens: 5, outputTokens: 0, cacheReadInputTokens: 0, cacheCreationInputTokens: 0 },
+        },
+      },
+      "opencode-go": {
+        hasLocalStats: true,
+        todayPrompts: 5,
+        todaySessions: 1,
+        todayTotalTokens: 1_250_000,
+        weekTokensByModel: { "deepseek-v4.1-flash": 2_000_000 },
+        recentDays: week,
+        totalPrompts: 50,
+        totalSessions: 3,
+        activeDays: 4,
+        modelUsage: { "deepseek-v4.1-flash": { inputTokens: 1_000_000, outputTokens: 250_000, cacheReadInputTokens: 0, cacheCreationInputTokens: 0 } },
+        byAccount: {
+          "#1": { todayTokens: 0, weekTokens: 100 },
+          "#2": { todayTokens: 1_250_000, weekTokens: 2_000_000 },
+        },
+      },
+    },
+    localStatsMeta: { partial: false },
+  };
+  const harness = makeHarness({ report });
+  module.default(harness.pi);
+  await startSession(harness);
+
+  const usage = harness.commands.find((command) => command.name === "usage");
+  await usage.definition.handler("", harness.ctx);
+  const panel = plain(renderWidget(harness.widgets.at(-1)).join("\n"));
+
+  assert.match(panel, /tokens\s+today 34\.6k · 7d 100k · 12 prompts/);
+  assert.match(panel, /claude-opus-5-5 60\.0k · claude-sonnet-5 30\.0k · claude-haiku-4 8\.0k · \+1 more/);
+  assert.match(panel, /tokens\s+today 1\.3M · 7d 100k · 5 prompts/);
+  assert.match(panel, /deepseek-v4\.1-flash 2\.0M/, "the multi-account family also gets its token section");
+
+  // panelComponent prefixes every line with one space.
+  const accountLines = panel.split("\n").filter((line) => /^ +#\d/.test(line));
+  assert.equal(accountLines.length, 2);
+  assert.doesNotMatch(accountLines[0], /today/, "an account with no usage today gets no suffix");
+  assert.match(accountLines[1], /1\.3M today/, "the account line carries its own tokens");
+});
+
+test("a partial scan is stated on the panel instead of being passed off as complete", async () => {
+  const module = await import(EXTENSION);
+  const report = {
+    ...REPORT,
+    localStats: {
+      claude: {
+        hasLocalStats: true,
+        todayTotalTokens: 500,
+        todayPrompts: 1,
+        recentDays: [{ date: "2026-11-02", messageCount: 500 }],
+        modelUsage: { "claude-opus-5-5": { inputTokens: 500 } },
+      },
+    },
+    localStatsMeta: { partial: true },
+  };
+  const harness = makeHarness({ report });
+  module.default(harness.pi);
+  await startSession(harness);
+
+  const usage = harness.commands.find((command) => command.name === "usage");
+  await usage.definition.handler("", harness.ctx);
+  const panel = plain(renderWidget(harness.widgets.at(-1)).join("\n"));
+  assert.match(panel, /today 500 · 7d 500 · 1 prompt · scan partial/);
+});
+
 test("a fourteen-account panel is a component, so Pi's ten-line cap never truncates it", async () => {
   const module = await import(EXTENSION);
   /** @param {number} slot */

@@ -70,12 +70,49 @@ type QuotaProvider = {
   expiresInMin: number | null;
 };
 
+type LocalModelUsage = {
+  inputTokens?: number;
+  outputTokens?: number;
+  cacheReadInputTokens?: number;
+  cacheCreationInputTokens?: number;
+};
+
+type LocalAccountStats = {
+  todayTokens?: number;
+  weekTokens?: number;
+  todayPrompts?: number;
+  totalPrompts?: number;
+  totalTokens?: number;
+};
+
+/**
+ * Pi's own token counts for one family, computed by the CLI from the session
+ * files. It only ever holds aggregate counts: no prompt text, no identities.
+ */
+type LocalFamilyStats = {
+  hasLocalStats?: boolean;
+  todayPrompts?: number;
+  todaySessions?: number;
+  todayTotalTokens?: number;
+  todayTokensByModel?: Record<string, number>;
+  weekTokensByModel?: Record<string, number>;
+  recentDays?: Array<{ date: string; messageCount: number }>;
+  totalPrompts?: number;
+  totalSessions?: number;
+  activeDays?: number;
+  activeDates?: string[];
+  modelUsage?: Record<string, LocalModelUsage>;
+  byAccount?: Record<string, LocalAccountStats>;
+};
+
 type QuotaReport = {
   providers: QuotaProvider[];
   generatedAt: string;
   sources: string[];
   warnings: string[];
   byFamily: Record<string, QuotaProvider[]>;
+  localStats?: Record<string, LocalFamilyStats>;
+  localStatsMeta?: { partial?: boolean } | null;
 };
 
 type Theme = {
@@ -563,6 +600,77 @@ function shortDuration(seconds: number | null): string {
   return `${Math.max(1, Math.floor(seconds / 60))}m`;
 }
 
+/** Token counts stay readable in a widget: 812, 4.1k, 1.2M. */
+function formatTokens(value: number): string {
+  const tokens = Math.max(0, Math.round(Number(value) || 0));
+  if (tokens < 1_000) return String(tokens);
+  if (tokens < 100_000) return `${(tokens / 1_000).toFixed(1)}k`;
+  if (tokens < 1_000_000) return `${Math.round(tokens / 1_000)}k`;
+  if (tokens < 1_000_000_000) return `${(tokens / 1_000_000).toFixed(1)}M`;
+  return `${(tokens / 1_000_000_000).toFixed(1)}B`;
+}
+
+/** Model ids are long and provider-prefixed; the panel only needs the tail. */
+function shortModelName(name: string): string {
+  const text = String(name ?? "");
+  const tail = text.split("/").pop() || text;
+  return tail.length <= 22 ? tail : `${tail.slice(0, 21)}…`;
+}
+
+/**
+ * The heaviest models of the last seven days, plus how many were left out.
+ * The all-time buckets are the fallback for a report from a CLI that predates
+ * the weekly breakdown, and for a week with no usage at all.
+ */
+function topModels(usage: Record<string, LocalModelUsage> | undefined, weekUsage: Record<string, number> | undefined, limit: number) {
+  const byName = (a: { name: string; total: number }, b: { name: string; total: number }) =>
+    b.total - a.total || a.name.localeCompare(b.name);
+  const weekRows = Object.entries(weekUsage ?? {})
+    .map(([name, total]) => ({ name, total: Number(total) || 0 }))
+    .filter((row) => row.total > 0)
+    .sort(byName);
+  const rows = weekRows.length > 0
+    ? weekRows
+    : Object.entries(usage ?? {})
+        .map(([name, bucket]) => ({
+          name,
+          total:
+            (Number(bucket?.inputTokens) || 0) +
+            (Number(bucket?.outputTokens) || 0) +
+            (Number(bucket?.cacheReadInputTokens) || 0) +
+            (Number(bucket?.cacheCreationInputTokens) || 0),
+        }))
+        .sort(byName);
+  return { rows: rows.slice(0, limit), more: Math.max(0, rows.length - limit) };
+}
+
+/**
+ * The token section of one provider: today and the last seven days, then the
+ * models that account for that usage. Two lines at most, aligned with the
+ * window rows above it.
+ */
+function renderTokenRows(stats: LocalFamilyStats | undefined, labelWidth: number, theme: Theme, partial = false): string[] {
+  if (!stats || stats.hasLocalStats === false) return [];
+  const week = (stats.recentDays ?? []).reduce((sum, day) => sum + (Number(day?.messageCount) || 0), 0);
+  const today = Number(stats.todayTotalTokens) || 0;
+  const prompts = Number(stats.todayPrompts) || 0;
+  const parts = [
+    `${theme.fg("dim", "today")} ${formatTokens(today)}`,
+    `${theme.fg("dim", "7d")} ${formatTokens(week)}`,
+  ];
+  if (prompts > 0) parts.push(theme.fg("dim", `${prompts} prompt${prompts === 1 ? "" : "s"}`));
+  if (partial) parts.push(theme.fg("warning", "scan partial"));
+  const lines = [`  ${theme.fg("dim", "tokens".padEnd(labelWidth))}  ${parts.join(theme.fg("dim", " · "))}`];
+
+  const { rows, more } = topModels(stats.modelUsage, stats.weekTokensByModel, 3);
+  if (rows.length > 0) {
+    const cells = rows.map((row) => `${shortModelName(row.name)} ${formatTokens(row.total)}`);
+    if (more > 0) cells.push(theme.fg("dim", `+${more} more`));
+    lines.push(`  ${" ".repeat(labelWidth)}  ${cells.join(theme.fg("dim", " · "))}`);
+  }
+  return lines;
+}
+
 /** The account's fullest window: the one that stops its next prompt. */
 function bindingWindow(provider: QuotaProvider): QuotaWindow | null {
   let best: QuotaWindow | null = null;
@@ -592,8 +700,10 @@ function isMultiAccount(providers: QuotaProvider[], provider: QuotaProvider): bo
 /**
  * One family, many accounts: a header plus one line per account with only its
  * binding window, so fourteen keys stay fourteen lines instead of fifty-six.
+ * Each line carries the account's own tokens for today, because on a
+ * fourteen-key provider "which key burned today's quota" is the question.
  */
-function renderAccountRows(accounts: QuotaProvider[], theme: Theme): string[] {
+function renderAccountRows(accounts: QuotaProvider[], theme: Theme, stats?: LocalFamilyStats): string[] {
   const family = accounts[0].family;
   const healthy = accounts.filter((account) => account.ok).length;
   const header = `${paint(BRAND[family] ?? "#8B949E", SHORT_NAME[family] ?? accounts[0].label)} ${theme.fg("dim", `· ${healthy} of ${accounts.length} accounts ok`)}`;
@@ -623,7 +733,9 @@ function renderAccountRows(accounts: QuotaProvider[], theme: Theme): string[] {
         const reset = each.resetsInSec === null ? "" : ` ${theme.fg("dim", `(${shortDuration(each.resetsInSec)})`.padEnd(5))}`;
         return `${theme.fg("dim", WINDOW_TAG[each.id] ?? each.id)} ${paint(bandFor(pct).color, `${Math.round(pct)}%`.padStart(4))}${reset}`;
       });
-    lines.push(`  ${label}  ${paint(band.color, band.glyph)} ${cells.join(theme.fg("dim", " · "))}`);
+    const today = Number(stats?.byAccount?.[account.account]?.todayTokens) || 0;
+    const tokens = today > 0 ? ` · ${formatTokens(today)} today` : "";
+    lines.push(`  ${label}  ${paint(band.color, band.glyph)} ${cells.join(theme.fg("dim", " · "))}${theme.fg("dim", tokens)}`);
   }
   return lines;
 }
@@ -634,11 +746,15 @@ function renderPanel(report: QuotaReport, theme: Theme): string[] {
   const unconfigured = report.providers.filter((provider) => provider.notConfigured === true);
   const renderedFamilies = new Set<string>();
 
+  const partialScan = report.localStatsMeta?.partial === true;
   for (const provider of active) {
+    const localStats = report.localStats?.[provider.family];
+    const labelWidth = Math.max(6, ...provider.windows.map((window) => String(window.label ?? "").length));
     if (isMultiAccount(active, provider)) {
       if (renderedFamilies.has(provider.family)) continue;
       renderedFamilies.add(provider.family);
-      lines.push(...renderAccountRows(active.filter((other) => other.family === provider.family), theme));
+      lines.push(...renderAccountRows(active.filter((other) => other.family === provider.family), theme, localStats));
+      lines.push(...renderTokenRows(localStats, labelWidth, theme, partialScan));
       continue;
     }
     const name = paint(BRAND[provider.family] ?? "#8B949E", provider.label);
@@ -661,30 +777,31 @@ function renderPanel(report: QuotaReport, theme: Theme): string[] {
       const color = kind === "transient" || kind === "throttle" ? "warning" : kind === "expired" || kind === "auth" ? "error" : "dim";
       lines.push(`  ${theme.fg(color, glyph)} ${theme.fg("warning", provider.note ?? errorCaption(provider.error))}`);
       if (isRecoverableError(provider.error) && provider.note) lines.push(`  ${theme.fg("warning", provider.note)}`);
-      continue;
-    }
-    if (provider.note) lines.push(`  ${theme.fg("warning", `~ ${provider.note}`)}`);
-    if (provider.windows.length === 0) {
+    } else if (provider.windows.length === 0) {
+      if (provider.note) lines.push(`  ${theme.fg("warning", `~ ${provider.note}`)}`);
       lines.push(`  ${theme.fg("dim", "no rate-limit windows reported")}`);
-      continue;
+    } else {
+      if (provider.note) lines.push(`  ${theme.fg("warning", `~ ${provider.note}`)}`);
+      for (const window of provider.windows) {
+        const used = usedOf(window);
+        const label = theme.fg("dim", window.label.padEnd(labelWidth));
+        if (used === null) {
+          lines.push(`  ${label}  ${theme.fg("dim", window.note ?? "no percentage reported")}`);
+          continue;
+        }
+        const band = bandFor(used);
+        const reset = window.resetsInSec === null ? "" : theme.fg("dim", ` · reset in ${humanDuration(window.resetsInSec)}`);
+        lines.push(
+          `  ${label}  ${paint(band.color, band.glyph)} ${paint(band.color, bar(used))} ` +
+            `${paint(band.color, `${used.toFixed(used < 10 ? 1 : 0)}%`.padStart(5))} ` +
+            `${theme.fg("dim", "used")}${reset}`,
+        );
+      }
     }
 
-    const width = Math.max(...provider.windows.map((window) => window.label.length));
-    for (const window of provider.windows) {
-      const used = usedOf(window);
-      const label = theme.fg("dim", window.label.padEnd(width));
-      if (used === null) {
-        lines.push(`  ${label}  ${theme.fg("dim", window.note ?? "no percentage reported")}`);
-        continue;
-      }
-      const band = bandFor(used);
-      const reset = window.resetsInSec === null ? "" : theme.fg("dim", ` · reset in ${humanDuration(window.resetsInSec)}`);
-      lines.push(
-        `  ${label}  ${paint(band.color, band.glyph)} ${paint(band.color, bar(used))} ` +
-          `${paint(band.color, `${used.toFixed(used < 10 ? 1 : 0)}%`.padStart(5))} ` +
-          `${theme.fg("dim", "used")}${reset}`,
-      );
-    }
+    // Local token stats survive a failed quota probe: the credential may be
+    // rejected while the tokens already burned are still a fact on disk.
+    lines.push(...renderTokenRows(localStats, labelWidth, theme, partialScan));
   }
   lines.push(theme.fg("dim", `used % · read-only · ${report.generatedAt}`));
   if (unconfigured.length > 0) {
