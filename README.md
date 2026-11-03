@@ -32,17 +32,22 @@ shuvquota, and it never writes to a credential file.
 
 ## Hard guarantees
 
-* `~/.pi/agent/auth.json` is opened with `flag: "r"`. Never written, synced or
-  refreshed. Verified with a checksum before and after every run.
+* pi-usage opens `~/.pi/agent/auth.json` with `flag: "r"` and never writes it.
+  CLI and systemd-timer runs are strictly read-only. In the Pi extension only,
+  `getProviderAuth` may ask Pi to renew Anthropic/Codex OAuth under Pi's own
+  cross-process auth lock; pi-usage never writes auth storage itself. Check the
+  auth.json checksum around live runs.
 * No token, refresh token, API key, session cookie or `sessionKey` is printed,
-  logged, cached, or sent anywhere. E-mail identities are redacted in every
-  artifact.
-* Antigravity's access token **may** be refreshed, but only in memory. Google
-  does not rotate that refresh token, so Pi's stored copy stays valid. Claude and
-  Codex are never refreshed, because they **do** rotate and persisting a rotated
-  token would break Pi. Every surface reports the token the run *used*: a renewal
-  that succeeded clears the stored "token expired" claim, and only a failed one
-  leaves the expiry (and the warning) on screen.
+  logged, or serialized to a file. Tokens are sent only to their provider; the
+  extension holds resolved access tokens in memory for the request. Antigravity's
+  renewed access token stays in a process-local cache until shortly before expiry.
+  E-mail identities are redacted in every artifact.
+* Antigravity may be renewed in memory because Google does not rotate its refresh
+  token. The CLI and timer never refresh Claude/Codex; inside Pi, the extension
+  calls Pi's `getProviderAuth`, which returns fresh OAuth directly or lets Pi
+  renew and persist it under Pi's auth-store lock. pi-usage itself never writes
+  auth.json. Every surface reports the token the run *used*: an Antigravity
+  renewal clears the stale stored-expiry claim; only a failed renewal leaves it.
 * The Claude Code store (`~/.claude/.credentials.json`) is opened read-only too, and
   its refresh token is never even read into memory, so nothing here can rotate a
   token the installed `claude` owns. `~/.claude.json` is read only for the account
@@ -109,14 +114,17 @@ There are two ways to be signed in to Claude, and a user may have either or both
 | Claude Code CLI | `~/.claude/.credentials.json` (honours `CLAUDE_CONFIG_DIR`); on macOS, when that file is absent, the `Claude Code-credentials` login Keychain item (read-only, via `security find-generic-password`; macOS may ask once to allow access) | What `npm:pi-claude-code-provider` drives. A subscription with usage credits disabled answers `400` on Pi's own entry for every request, and this is the source that still works. |
 | Pi's own entry | `~/.pi/agent/auth.json` → `anthropic` | `/login anthropic` in Pi, without the plugin installed. |
 
-**The Claude Code CLI wins when both are present and its token is still valid.** The
-choice is a *preference, not a fallback*: only the selected source is tried, so a
-broken preferred source is reported rather than silently masked by the other one.
-The one exception is an expired Claude Code token next to a fresh Pi login: a store
-left behind by an uninstalled CLI never refreshes again, so `auto` reads Pi's login
-instead and adds a warning naming the switch. Override it with
-`PI_QUOTA_CLAUDE_SOURCE=pi` or `=claude-code`; `--explain` prints which one was used
-and why.
+For `piquota` CLI and timer runs, the Claude Code CLI wins when both are
+present and its token is still valid. The choice is a *preference, not a fallback*:
+only the selected source is tried, so a broken preferred source is reported rather
+than silently masked by the other one. An expired Claude Code token next to a fresh
+Pi login is passed over in `auto` mode with a warning. Override CLI selection with
+`PI_QUOTA_CLAUDE_SOURCE=pi` or `=claude-code`; `--explain` prints what was used.
+
+Inside Pi, the extension asks Pi's `getProviderAuth("anthropic")` for OAuth first.
+A fresh token is returned as-is; when it is near expiry, Pi renews and persists it
+under its auth-store lock, then the extension uses that returned token in memory.
+If Pi has no OAuth login, the configured source preference applies.
 
 The Claude Code store is opened read-only, and its refresh token is deliberately
 **never carried into memory**: Anthropic rotates refresh tokens, and a rotation
@@ -176,10 +184,10 @@ When you also run `install.sh` for the terminal CLI, pass
 | `piquota` on your `PATH` for terminal use | no | yes, symlinked |
 | Omarchy sync while Pi is closed | no | yes, with `--omarchy-timer` |
 
-If you live inside Pi and use Omarchy, the npm route covers it: the extension
-runs `piquota omarchy` on every quota refresh, so the bar fills without any
-setup. Choose `install.sh` when you want the CLI in a terminal, or background
-sync while Pi is not running.
+If you live inside Pi and use Omarchy, the extension publishes each
+provider's record in-process as soon as that family finishes, then prunes stale
+records once the complete refresh settles. Choose `install.sh` when you want the
+CLI in a terminal, or background sync while Pi is not running.
 
 ### Manual Install / Development
 
@@ -268,11 +276,13 @@ refresh (and a gentle refresh after each agent turn). `/usage hide` gives the ro
 back. `/usage panel` still pins the same panel flat above the editor.
 
 The overlay paints on the same keystroke: it renders the report the extension
-already holds, or the CLI's on-disk report cache (`~/.cache/pi-quota/usage.json`,
-read-only) when memory is empty, and never waits for the CLI before the first
-frame. The same forced refresh bare `/usage` always ran then runs behind it: the
-header says `refreshing …` while it does, and the update time when it lands. A
-failed refresh is a line in the view, never a thrown error. Every provider is a section:
+already holds, or the on-disk report cache (`~/.cache/pi-quota/usage.json`) when
+memory is empty. It never waits for network work before the first frame. Opening
+`/usage` refreshes only families older than their own clock (60 seconds by
+default; Claude's 300-second throttle-safe interval is preserved); `r` forces
+all enabled families. Families run independently and repaint as they finish. A
+failed refresh is a line in the view, never a thrown error. The local session
+scan runs in a Node worker thread, not on the TUI event loop. Every provider is a section:
 the header is the brand-coloured name line, the body lists every window with its
 used-fraction bar, reset countdown and the token rows for today, the last seven
 days, the prompts and the heaviest models. All sections start expanded; the fold
@@ -323,14 +333,13 @@ A report generated before midnight, or the older report cache painted on the fir
 frame, is skipped: its `todayTotalTokens` belong to another day, and merging them
 under today would count a frozen yesterday twice. The tail then names the report's
 day and says today is not merged. A missing or quarantined month is a note instead
-of rows, a failed `stats` run shows the CLI's own stderr line (redacted) or its
-exit status with a retry hint, and a slow fetch never moves the page off the month
-the last keypress asked for.
+of rows, a failed history read is redacted and shown with a retry hint, and a slow
+read never moves the page off the month the last keypress asked for.
 
-History reads `piquota stats --json [--month YYYY-MM]`: the month list, one
-month's days per family/slot/model, the all-time rollup and notes. That command
-never takes the writer lock and never writes, so it is safe to run while a scan
-is freezing a day. Everything it reports is frozen: `lastFrozenDay` is its
+The extension reads the same `historyJson` payload in-process; the CLI exposes
+it as `piquota stats --json [--month YYYY-MM]`: the month list, one month's days
+per family/slot/model, the all-time rollup and notes. The read path never takes
+the writer lock and never writes, so it is safe while a scan is freezing a day. Everything it reports is frozen: `lastFrozenDay` is its
 watermark, and neither `piquota stats` nor its JSON moves an open day into a
 total. The History page merges the live day itself, for the month and for the
 all-time figures alike, and prints the same "comes from the live report" note
