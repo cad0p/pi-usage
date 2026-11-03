@@ -41,14 +41,15 @@ function record(value) {
 }
 
 /**
- * The account label shown by every surface: #1 for the base entry, #<slot> for a
- * numbered sibling. The key itself never appears.
+ * The account label shown by every surface: the base auth.json entry has no
+ * numeric suffix, so it gets no number; only a real sibling slot is `#<slot>`.
+ * The key itself never appears.
  *
  * @param {{ slot?: string | null }} credential
  * @returns {string}
  */
 function accountLabel(credential) {
-  return credential.slot ? `#${credential.slot}` : "#1";
+  return credential.slot ? `#${credential.slot}` : "";
 }
 
 /**

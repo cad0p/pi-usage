@@ -284,7 +284,7 @@ function overlayReport() {
     family: "opencode-go",
     label: "OpenCode Go (Pi)",
     primaryWindowId: "5h",
-    account: `#${slot}`,
+    account: slot === 1 ? "" : `#${slot}`,
     plan: "Go plan",
     windows: [
       { id: "5h", label: "5h window", usedPercent: used, remainingPercent: 100 - used, resetsAt: null, resetsInSec: 600, note: null },
@@ -330,7 +330,7 @@ test("the full panel lists every account while the box and the line keep one per
     family: "opencode-go",
     label: "OpenCode Go (Pi)",
     primaryWindowId: "5h",
-    account: `#${slot}`,
+    account: slot === 1 ? "" : `#${slot}`,
     slot: slot === 1 ? null : String(slot),
     plan: "Go plan",
     windows: [
@@ -361,7 +361,8 @@ test("the full panel lists every account while the box and the line keep one per
   const panelWidget = harness.widgets.at(-1);
   const panel = plain(renderWidget(panelWidget).join("\n"));
   assert.match(panel, /OP-Go · 2 of 2 accounts ok/);
-  assert.match(panel, /#1 +● session +10% \(10m\) +· month 100% \(10d\)/, "every window of an account shares its one line");
+  assert.match(panel, /^ +● session +10% \(10m\) +· month 100% \(10d\)/m, "the base entry has no number and still lists every window");
+  assert.equal(/#1\b/.test(panel), false, "no surface invents a number for the base entry");
   assert.match(panel, /#2 +● session +50% \(10m\) +· month 100% \(10d\)/);
   assert.equal(/5h window/.test(panel), false, "per-account windows are not listed one per line");
 });
@@ -372,7 +373,7 @@ test("the panel adds a compact token section per provider and per account", asyn
     family: "opencode-go",
     label: "OpenCode Go (Pi)",
     primaryWindowId: "5h",
-    account: `#${slot}`,
+    account: slot === 1 ? "" : `#${slot}`,
     slot: slot === 1 ? null : String(slot),
     plan: "Go plan",
     windows: [
@@ -471,10 +472,49 @@ test("the panel adds a compact token section per provider and per account", asyn
   assert.match(panel, /deepseek-v4\.1-flash 2\.0M/, "the multi-account family also gets its token section");
 
   // panelComponent prefixes every line with one space.
-  const accountLines = panel.split("\n").filter((line) => /^ +#\d/.test(line));
+  const accountLines = panel.split("\n").filter((line) => /^ +(?:#\d+ +)?[○◔◕●]/.test(line));
   assert.equal(accountLines.length, 2);
   assert.doesNotMatch(accountLines[0], /today/, "an account with no usage today gets no suffix");
   assert.match(accountLines[1], /1\.3M today/, "the account line carries its own tokens");
+});
+
+test("a report cached before the label fix still renders the base account without a number", async () => {
+  const module = await import(EXTENSION);
+  const legacy = (account, slot, today) => ({
+    family: "opencode-go",
+    label: "OpenCode Go (Pi)",
+    account,
+    slot,
+    plan: "Go plan",
+    windows: [{ id: "5h", label: "5h window", usedPercent: 10, remainingPercent: 90, resetsAt: null, resetsInSec: 600, note: null }],
+    error: null,
+    ok: true,
+    updatedAt: "2030-01-01T00:00:00.000Z",
+    expiresInMin: null,
+  });
+  const harness = makeHarness({
+    report: {
+      generatedAt: "2030-01-01T00:00:00.000Z",
+      sources: [],
+      warnings: [],
+      providers: [legacy("#1", null), legacy("#2", "2")],
+      localStats: {
+        "opencode-go": {
+          hasLocalStats: true,
+          todayTotalTokens: 500,
+          byAccount: { "#1": { todayTokens: 500 }, "#2": { todayTokens: 0 } },
+        },
+      },
+    },
+  });
+  module.default(harness.pi);
+  const usage = harness.commands.find((command) => command.name === "usage");
+  await usage.definition.handler("panel", harness.ctx);
+  const panel = plain(renderWidget(harness.widgets.at(-1)).join("\n"));
+
+  assert.equal(/#1\b/.test(panel), false, "the legacy label is not printed");
+  assert.match(panel, /#2/, "a real slot keeps its number");
+  assert.match(panel, /500 today/, "the base row still finds its tokens under the old key");
 });
 
 test("a partial scan is stated on the panel instead of being passed off as complete", async () => {
@@ -571,7 +611,8 @@ test("bare /usage opens a fullscreen overlay, refreshes behind it and leaves the
   assert.match(frame, /5h window/);
   assert.match(frame, /Weekly window/);
   assert.match(frame, /▾ OP-Go · 2 of 2 accounts ok/);
-  assert.match(frame, /#1\s+●\s+session/, "a multi-account provider keeps one line per account");
+  assert.match(frame, /\s+●\s+session/, "the base account row carries no invented number");
+  assert.equal(/#1\b/.test(frame), false, "the base entry has no number in any surface");
   assert.match(frame, /#2\s+●\s+session/);
   assert.match(frame, /used % · read-only/, "the panel footer is part of the view");
   assert.equal(frame.split("\n").filter((line) => /2030-01-01T00:00:00\.000Z/.test(line)).length, 0, "the footer does not repeat the timestamp the header already prints");

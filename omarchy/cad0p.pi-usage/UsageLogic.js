@@ -141,15 +141,19 @@ function compactDuration(ms) {
 
 // ----------------------------------------------------------------- accounts
 
-// One row per account of a multi-account record, every window kept.
+// One row per account of a multi-account record, every window kept. The base
+// auth.json entry has no number, so its id stays empty (a blank, aligned column)
+// instead of an invented "#1"; a record cached before the fix is normalized.
 function accountRows(p) {
   var list = p && isList(p.accounts) ? p.accounts : []
   var rows = []
   for (var i = 0; i < list.length; i++) {
     var entry = list[i] || {}
     var windows = limitWindows(entry.limits)
+    var id = entry.id == null ? "" : String(entry.id)
+    if (id === "#1") id = ""
     rows.push({
-      id: String(entry.id || ("#" + (i + 1))),
+      id: id,
       ok: entry.ok === true,
       status: String(entry.status || ""),
       windows: windows,
@@ -187,7 +191,7 @@ function headline(p) {
         best = row
     }
     if (best) return {
-      title: best.id + " · " + best.binding.title,
+      title: (best.id === "" ? "" : best.id + " · ") + best.binding.title,
       percent: best.binding.percent,
       resetAt: best.binding.resetAt,
       accountId: best.id

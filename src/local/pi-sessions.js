@@ -58,6 +58,7 @@ import { dirname, join } from "node:path";
 import { FAMILY_BY_PROVIDER, resolveProviderSlot } from "../auth/pi-auth.js";
 import { redact } from "../http.js";
 import {
+  accountLabel,
   acquireHistoryLock,
   addToModels,
   applyDurable,
@@ -910,7 +911,9 @@ function tokensByModel(models) {
  * @returns {number}
  */
 function labelOrder(label) {
-  if (label === "#1") return -1;
+  // "" is the base entry; "#1" is the old invented label for it, kept so a
+  // totals.json written before the fix still sorts first.
+  if (label === "" || label === "#1") return -1;
   const numeric = Number.parseInt(String(label).replace(/^#/, ""), 10);
   return Number.isFinite(numeric) ? numeric : Number.MAX_SAFE_INTEGER;
 }
@@ -959,7 +962,7 @@ export function buildLocalStats(input = {}) {
       openDates.add(day);
       openSessions += count(familyRow.sessions);
       for (const [slot, slotRow] of Object.entries(familyRow.slots ?? {})) {
-        const label = slot === "" ? "#1" : `#${slot}`;
+        const label = accountLabel(slot);
         const account = openAccounts.get(label) ?? { prompts: 0, sessions: 0, models: new Map() };
         account.sessions += count(slotRow.sessions);
         for (const [model, bucket] of Object.entries(slotRow.models ?? {})) {
@@ -994,7 +997,7 @@ export function buildLocalStats(input = {}) {
       /** @type {Map<string, { tokens: number, prompts: number }>} */
       const slots = new Map();
       for (const [slot, slotRow] of Object.entries(familyRow.slots ?? {})) {
-        const label = slot === "" ? "#1" : `#${slot}`;
+        const label = accountLabel(slot);
         let tokens = 0;
         let prompts = 0;
         for (const [model, bucket] of Object.entries(slotRow.models ?? {})) {

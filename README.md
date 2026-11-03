@@ -297,7 +297,9 @@ dependencies to wrap the body in a `ScrollView`.
 A provider with several accounts is shown as one header (`OP-Go · 7 of 14 accounts
 ok`) plus one line per account with every window and its reset, e.g.
 `#2 ● session 2% (10m) · week 10% (6d) · month 90% (19d)`, or the reason it failed
-(`key rejected`, `no Go plan`). The leading glyph is the fullest window's band. The
+(`key rejected`, `no Go plan`). The base entry in `auth.json` (`opencode-go`) has
+no number, so its label column is blank; only real sibling slots (`opencode-go-2`
+…) are numbered `#2` … `#14`. The leading glyph is the fullest window's band. The
 overlay and the pinned panel are rendered as components, so Pi's ten-line cap on
 plain widgets never truncates them.
 
@@ -475,7 +477,7 @@ seven entries, oldest first, today last):
       "activeDays": 11,
       "activeDates": ["2026-10-27"],
       "modelUsage": { "gpt-5.1-codex": { "inputTokens": 4, "outputTokens": 425, "cacheReadInputTokens": 6838, "cacheCreationInputTokens": 6905 } },
-      "byAccount": { "#1": { "todayTokens": 14172, "weekTokens": 118422, "todayPrompts": 3, "totalPrompts": 1200, "totalTokens": 48812210 } }
+      "byAccount": { "": { "todayTokens": 14172, "weekTokens": 118422, "todayPrompts": 3, "totalPrompts": 1200, "totalTokens": 48812210 } }
     }
   },
   "localStatsMeta": { "files": 604, "scanned": 1, "reused": 603, "bytesRead": 3042, "durationMs": 9, "partial": false, "budgetMs": 12000, "frozenDays": 0, "locked": false }
@@ -523,7 +525,9 @@ piquota omarchy                  # write pi-claude.json, pi-codex.json, ... once
   `auth.json`) still gets **one** record: every healthy account contributes only
   the window that constrains it, titled `#<slot> · Session|Weekly|Monthly`, and
   failed accounts add no rows but are summarised by reason, e.g.
-  `#8–#10 key rejected · #11–#14 no Go plan`. The same record also carries
+  `#8–#10 key rejected · #11–#14 no Go plan`. The unnumbered base entry keeps a
+  blank `id` and its limits are untitled; only real sibling slots carry
+  `#<slot>`. The same record also carries
   `accounts[{id, ok, status, limits}]` with every window of every account
   (`status` is a short reason such as `Key rejected` for a failed one), which
   Omarchy's built-in panel ignores and this package's own plugin draws.
@@ -791,7 +795,7 @@ extensions/quota-panel.ts      Pi TUI line and /usage
 ## Tests
 
 ```bash
-node --test tests/*.test.mjs     # 371 tests, fake tokens only, no network
+node --test tests/*.test.mjs     # 376 tests, fake tokens only, no network
 ```
 
 Modules covered: `auth.json` parsing and de-duplication, the Claude Code store

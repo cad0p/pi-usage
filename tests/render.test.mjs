@@ -137,7 +137,7 @@ function accountFixture(slot, usedPercent) {
   return providerFixture({
     family: "opencode-go",
     label: "OpenCode Go (Pi)",
-    account: `#${slot}`,
+    account: slot === 1 ? "" : `#${slot}`,
     slot: slot === 1 ? null : String(slot),
     windows: [windowFixture({ usedPercent, remainingPercent: 100 - usedPercent })],
   });
@@ -148,9 +148,19 @@ test("the panel titles one row per account of a multi-account family", () => {
     generatedAt: "2030-01-01T00:00:00.000Z",
   });
   const text = lines.join("\n");
-  assert.match(text, /OpenCode Go \(Pi\) #1/);
+  assert.match(text, /OpenCode Go \(Pi\) \u00b7 plan plus/);
+  assert.equal(/#1/.test(text), false, "the base entry has no number");
   assert.match(text, /OpenCode Go \(Pi\) #2/);
   assert.equal((text.match(/#2/g) ?? []).length, 1, "the account is not repeated on its own row");
+});
+
+test("a report that still says #1 never prints an invented number", () => {
+  const lines = renderPanel([providerFixture({ family: "opencode-go", label: "OpenCode Go (Pi)", account: "#1" })], plainPalette(), {
+    generatedAt: "2030-01-01T00:00:00.000Z",
+  });
+  const text = lines.join("\n");
+  assert.equal(/#1/.test(text), false);
+  assert.match(text, /OpenCode Go \(Pi\)/);
 });
 
 test("compact and status keep only the first account of a multi-account family", () => {

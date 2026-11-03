@@ -753,11 +753,29 @@ function accountReason(error: string | null | undefined): string {
   return errorCaption(error);
 }
 
-/** `#N` accounts of one family, i.e. a family Pi holds several credentials for. */
+/**
+ * The slot label of an account: "" for the base auth.json entry (it has no
+ * number, so no surface may invent one) and "#<slot>" for a real sibling. A
+ * report cached before the fix still says "#1" for the base entry.
+ */
+function accountLabel(account: string | null | undefined): string {
+  const text = String(account ?? "");
+  if (text === "#1") return "";
+  return /^#\d+$/.test(text) ? text : text;
+}
+
+/** The per-account token row, tolerating the old "#1" key in a cached scan. */
+function accountStats(stats: LocalFamilyStats | undefined, label: string): LocalAccountStats | undefined {
+  if (!stats?.byAccount) return undefined;
+  return stats.byAccount[label] ?? (label === "" ? stats.byAccount["#1"] : undefined);
+}
+
+/**
+ * A family Pi holds several credentials for: one section and one line per
+ * account, whatever the account labels look like.
+ */
 function isMultiAccount(providers: QuotaProvider[], provider: QuotaProvider): boolean {
-  return typeof provider.account === "string"
-    && provider.account.startsWith("#")
-    && providers.filter((other) => other.family === provider.family).length > 1;
+  return providers.filter((other) => other.family === provider.family).length > 1;
 }
 
 /**
@@ -771,20 +789,23 @@ function renderAccountRows(accounts: QuotaProvider[], theme: Theme, stats?: Loca
   const healthy = accounts.filter((account) => account.ok).length;
   const header = `${paint(BRAND[family] ?? "#8B949E", SHORT_NAME[family] ?? accounts[0].label)} ${theme.fg("dim", `· ${healthy} of ${accounts.length} accounts ok`)}`;
   const lines = [header];
-  const width = Math.max(...accounts.map((account) => account.account.length));
-  for (const account of accounts) {
-    const label = theme.fg("dim", account.account.padEnd(width));
+  // The base entry has no number: its label column is blank but padded to the
+  // widest sibling, so the percentage columns still line up.
+  const labels = accounts.map((account) => accountLabel(account.account));
+  const width = Math.max(...labels.map((label) => label.length));
+  accounts.forEach((account, index) => {
+    const label = theme.fg("dim", labels[index].padEnd(width));
     if (!account.ok) {
       const kind = errorKind(account.error);
       const color = kind === "transient" || kind === "throttle" ? "warning" : kind === "expired" || kind === "auth" ? "error" : "dim";
       lines.push(`  ${label}  ${theme.fg(color, errorGlyph(account.error))} ${theme.fg("warning", accountReason(account.error))}`);
-      continue;
+      return;
     }
     const window = bindingWindow(account);
     const used = usedOf(window);
     if (window === null || used === null) {
       lines.push(`  ${label}  ${theme.fg("dim", "no rate-limit windows reported")}`);
-      continue;
+      return;
     }
     // Every window on one line, each in its own band colour; the leading glyph
     // is the fullest window's, so the column still sorts the accounts by eye.
@@ -796,10 +817,10 @@ function renderAccountRows(accounts: QuotaProvider[], theme: Theme, stats?: Loca
         const reset = each.resetsInSec === null ? "" : ` ${theme.fg("dim", `(${shortDuration(each.resetsInSec)})`.padEnd(5))}`;
         return `${theme.fg("dim", WINDOW_TAG[each.id] ?? each.id)} ${paint(bandFor(pct).color, `${Math.round(pct)}%`.padStart(4))}${reset}`;
       });
-    const today = Number(stats?.byAccount?.[account.account]?.todayTokens) || 0;
+    const today = Number(accountStats(stats, labels[index])?.todayTokens) || 0;
     const tokens = today > 0 ? ` · ${formatTokens(today)} today` : "";
     lines.push(`  ${label}  ${paint(band.color, band.glyph)} ${cells.join(theme.fg("dim", " · "))}${theme.fg("dim", tokens)}`);
-  }
+  });
   return lines;
 }
 
@@ -815,7 +836,8 @@ function renderProviderLines(provider: QuotaProvider, theme: Theme, localStats: 
   const lines: string[] = [];
   const labelWidth = Math.max(6, ...provider.windows.map((window) => String(window.label ?? "").length));
   const name = paint(BRAND[provider.family] ?? "#8B949E", provider.label);
-  const meta: string[] = [provider.account];
+  const account = accountLabel(provider.account);
+  const meta: string[] = account === "" ? [] : [account];
   if (provider.plan) meta.push(`plan ${provider.plan}`);
   // Two stores can back Claude, and this is the one place that says which.
   if (provider.sourceKind === "claude-code") meta.push("Claude Code CLI");

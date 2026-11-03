@@ -184,17 +184,20 @@ function recordTierLabel(provider) {
 }
 
 /**
- * Slot label of one account: "#1" for the base entry (or the first result when
- * the provider does not carry slots at all), "#<slot>" for a sibling.
+ * Slot label of one account: "" for the base entry (auth.json gives it no
+ * number, so no surface may invent one), "#<slot>" for a real sibling, and a
+ * named account as-is. A report cached before the fix still says "#1": that is
+ * the same base entry and normalizes to "".
  *
  * @param {import("../model.js").QuotaResult} provider
- * @param {number} index
  * @returns {string}
  */
-function accountLabel(provider, index) {
-  if (typeof provider.slot === "string" && provider.slot !== "") return `#${provider.slot}`;
-  if (typeof provider.account === "string" && /^#\d/.test(provider.account)) return provider.account;
-  return `#${index + 1}`;
+function accountLabel(provider) {
+  if (typeof provider.slot === "string") return provider.slot === "" ? "" : `#${provider.slot}`;
+  const account = typeof provider.account === "string" ? provider.account : "";
+  if (account === "" || account === "#1") return "";
+  if (/^#\d+$/.test(account)) return account;
+  return account;
 }
 
 /**
@@ -333,7 +336,11 @@ function compactFailureList(failures) {
       labels.push(failures[index].label);
       index += 1;
     }
-    groups.push(`${compactLabels(labels)} ${reason}`);
+    // The unnumbered base entry has no slot label: in prose it is "base", and
+    // when it is the only failure the reason alone says everything.
+    const named = labels.map((label) => (label === "" ? "base" : label));
+    const names = compactLabels(named);
+    groups.push(named.length === 1 && named[0] === "base" ? reason : `${names} ${reason}`);
   }
   const text = redact(groups.join(" · "));
   return text.length <= HELP_MAX ? text : `${text.slice(0, HELP_MAX - 1).trimEnd()}…`;
@@ -370,12 +377,12 @@ function buildFamilyRecord(family, providers, options = {}) {
   const accounts = [];
   let okCount = 0;
 
-  providers.forEach((provider, index) => {
-    const label = accountLabel(provider, index);
+  providers.forEach((provider) => {
+    const label = accountLabel(provider);
     if (provider.ok) {
       okCount += 1;
       const window = bindingWindow(provider.windows);
-      const mapped = window ? mapLimits([window], provider, `${label} · `)[0] : null;
+      const mapped = window ? mapLimits([window], provider, label === "" ? "" : `${label} · `)[0] : null;
       if (mapped) limits.push(mapped);
       accounts.push({ id: redact(label), ok: true, status: "", limits: mapLimits(provider.windows, provider) });
       return;
