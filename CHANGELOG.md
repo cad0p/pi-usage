@@ -5,7 +5,13 @@ All notable changes to this project will be documented in this file.
 ## [calver-released]
 
 <!-- USER-EDITABLE SECTION START -->
-<!-- Add your curated release notes here. -->
+`/usage` refreshes inside pi with no CLI child, each provider on its own, and every key works under the kitty keyboard protocol.
+
+- **In-process refresh:** `/usage` runs the engine inside pi instead of spawning `piquota`, so it paints in about 0.35 s and `r` finishes in under a second. Each provider updates on its own, so a slow one never holds the others back. The token-stats scan runs in a worker thread and never blocks the TUI. The systemd timer still uses the read-only CLI.
+- **Logins stay valid:** inside pi, Claude and Codex tokens come from pi's own `getProviderAuth`, which renews them under pi's lock exactly as when you use the model. Antigravity, which pi 1.5 no longer resolves, keeps its renewed token in memory for its lifetime; nothing is written back.
+- **Kitty keyboard protocol (Ghostty, kitty, foot):** arrows, Esc, Enter, Tab, Space and every legend key work in their CSI-u form on both tabs. Key releases never act, repeats do. A drift test compares the decoder with the installed pi-tui matcher.
+- **History all-time counts today once**, and an all-time figure that lags behind the month files is shown dimmed with a note instead of disappearing.
+- **Antigravity header:** no repeated project, and no false "token expired" while the account works.
 <!-- USER-EDITABLE SECTION END -->
 
 ### 🚀 Features
