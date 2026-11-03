@@ -539,7 +539,9 @@ makes a restart re-freeze a half-written day idempotently (the month write is a
 SET per day) instead of adding it twice. A late write to an already-frozen day —
 a session that appends just past midnight — increments both stores directly; if
 its month is temporarily unreadable, the delta stays in the cache until a later
-run can write it. A crash between the month and totals writes can double that
+run can write it. Such a held delta lives only in the disposable cache: if the
+cache is lost before the month becomes writable, that delta is dropped, because
+the bytes of a frozen day are never read again. A crash between the month and totals writes can double that
 one small delta. A budget-truncated scan never freezes: history is only written
 from complete runs.
 
@@ -558,7 +560,11 @@ rescan. A rollup rebuild never writes `totals.json` from an incomplete month set
 
 A *corrupt* or foreign-version month is moved aside by the lock owner (never by a
 read-only run) to `.corrupt-<ts>`. Its warning names the file and directs you to copy the
-`.corrupt-<ts>` backup back to the original month path if recoverable. Frozen days are never rebuilt from sessions: their
+`.corrupt-<ts>` backup back to the original month path if recoverable, or to delete
+the backup to abandon those counts. Until one of the two happens, freezing stops at
+that month for *every* later day too (the frozen watermark only moves forward), so
+later days stay open in the cache and each run repeats the warning; once the backup
+is restored or deleted, the held days freeze on the next run. Frozen days are never rebuilt from sessions: their
 daily rows are missing (shown as 0) in `recentDays`, while `totals.json` retains
 the all-time counts, so the two views may disagree. `piquota stats --rebuild-totals`
 refuses while a quarantined month has not been restored. A lost *month* file

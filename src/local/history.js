@@ -822,7 +822,7 @@ export function readMonthFile(historyDir, month, warnings, options = {}) {
       if (backup) {
         warnings.push(
           `local token stats: ${path} was quarantined as ${backup}; its frozen days are missing from recentDays (shown as 0), ` +
-            `while totals.json keeps the all-time counts. Copy ${backup} back to ${path} if recoverable`,
+            `while totals.json keeps the all-time counts. Copy ${backup} back to ${path} if recoverable, or delete that backup to abandon those counts; days after it stay open until then`,
         );
       }
       return { days: {}, writable: true, exists: false, unreadable: false, quarantined: backup !== null, path };
@@ -859,7 +859,7 @@ export function readMonthFile(historyDir, month, warnings, options = {}) {
       const backup = quarantinedMonthPath(historyDir, month);
       warnings.push(
         `local token stats: ${path} is corrupt or from another version; its frozen days are missing from recentDays (shown as 0), ` +
-          `while totals.json keeps the all-time counts. Copy ${backup ?? `${path}.corrupt-<timestamp>`} back to ${path} if recoverable`,
+          `while totals.json keeps the all-time counts. Copy ${backup ?? `${path}.corrupt-<timestamp>`} back to ${path} if recoverable, or delete that backup to abandon those counts; days after it stay open until then`,
       );
     }
     return { days: {}, writable, exists: true, unreadable: !writable, quarantined: writable, path };
@@ -1133,7 +1133,7 @@ export function rebuildTotalsFromMonths(input) {
         ok: false,
         error: entry.unreadable
           ? `${resolveMonthPath(input.historyDir, month)} could not be read; refusing to rebuild the rollup without it`
-          : `${resolveMonthPath(input.historyDir, month)} was quarantined; restore its .corrupt-<timestamp> copy before rebuilding totals`,
+          : `${resolveMonthPath(input.historyDir, month)} was quarantined; restore its .corrupt-<timestamp> copy, or delete it to abandon those counts, before rebuilding totals`,
         months: months.length,
         days,
         families: totals.families.size,
