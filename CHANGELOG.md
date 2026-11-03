@@ -8,6 +8,10 @@ All notable changes to this project will be documented in this file.
 <!-- Add your curated release notes here. -->
 <!-- USER-EDITABLE SECTION END -->
 
+### 🚀 Features
+
+- In-process /usage refresh, each provider on its own (closes #26)
+
 ### 🐛 Bug Fixes
 
 - History all-time counts today once; Antigravity header without the false expiry (closes #29)
