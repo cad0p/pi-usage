@@ -162,6 +162,20 @@ function wrapPlain(text, width) {
 }
 
 /**
+ * The slot label of an account: "" for the base auth.json entry (it has no
+ * number, so no surface may invent one), "#<slot>" for a real sibling. A report
+ * cached before the fix still says "#1" for the base entry.
+ *
+ * @param {string | null | undefined} account
+ * @returns {string}
+ */
+function slotLabel(account) {
+  if (typeof account !== "string") return "";
+  if (account === "#1") return "";
+  return /^#\d+$/.test(account) ? account : "";
+}
+
+/**
  * Per-provider detail lines, without box decoration.
  *
  * @param {import("../model.js").QuotaResult} provider
@@ -176,8 +190,10 @@ export function renderProviderLines(provider, paint, contentWidth = MAX_WIDTH, o
   const lines = [];
 
   // A multi-account family puts "#<slot>" in the title, so repeating it in the
-  // meta line would print the same label twice on one row.
-  const meta = options.accountInTitle ? [] : [provider.account];
+  // meta line would print the same label twice on one row. The unnumbered base
+  // entry contributes nothing, so the meta line does not start with a separator.
+  const accountText = provider.account === "#1" ? "" : slotLabel(provider.account) || provider.account || "";
+  const meta = options.accountInTitle || accountText === "" ? [] : [accountText];
   if (provider.plan) meta.push(`plan ${provider.plan}`);
   // Claude has two stores, and a broken one is the first thing to rule out when
   // the percentage looks wrong, so the panel names the store it actually read.
@@ -185,7 +201,11 @@ export function renderProviderLines(provider, paint, contentWidth = MAX_WIDTH, o
   if (provider.expiresInMin !== null && provider.expiresInMin <= 120) {
     meta.push(provider.expiresInMin < 0 ? "token EXPIRED" : `token ${provider.expiresInMin}m`);
   }
-  lines.push(clip(`${paint("bold", title)} ${paint("dim", `· ${meta.join(" · ")}`)}`, contentWidth));
+  lines.push(
+    meta.length === 0
+      ? clip(paint("bold", title), contentWidth)
+      : clip(`${paint("bold", title)} ${paint("dim", `· ${meta.join(" · ")}`)}`, contentWidth),
+  );
 
   if (!provider.ok) {
     const wrapped = wrapPlain(provider.error ?? "unavailable", contentWidth - 6);
@@ -318,10 +338,11 @@ export function renderPanel(providers, paint, meta = {}) {
     familyCounts.set(provider.family, (familyCounts.get(provider.family) ?? 0) + 1);
   }
   /** @param {import("../model.js").QuotaResult} provider */
-  const accountTitle = (provider) =>
-    (familyCounts.get(provider.family) ?? 0) > 1 && typeof provider.account === "string" && provider.account.startsWith("#")
-      ? `${FAMILY_TITLE[provider.family] ?? provider.label} ${provider.account}`
-      : null;
+  const accountTitle = (provider) => {
+    if ((familyCounts.get(provider.family) ?? 0) <= 1) return null;
+    const slot = slotLabel(provider.account);
+    return slot === "" ? null : `${FAMILY_TITLE[provider.family] ?? provider.label} ${slot}`;
+  };
 
   // Render once at the hard maximum, then settle on the natural width of the
   // content so long degradation messages cannot stretch every other row.

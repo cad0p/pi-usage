@@ -62,12 +62,12 @@ function goRecord() {
     usageStatusText: "1 of 3 accounts unavailable",
     authHelpText: "#3 key rejected",
     limits: [
-      { label: "#1 · Monthly window", title: "#1 · Monthly", percent: 1, resetsAt: at(18 * DAY) },
+      { label: "Monthly window", title: "Monthly", percent: 1, resetsAt: at(18 * DAY) },
       { label: "#2 · Monthly window", title: "#2 · Monthly", percent: 0.9, resetsAt: at(19 * DAY) },
     ],
     accounts: [
       {
-        id: "#1",
+        id: "",
         ok: true,
         status: "",
         limits: [
@@ -278,9 +278,21 @@ test("a multi-account headline is the healthy account with the most room left", 
   assert.equal(Logic.headerMeta(p), "2 of 3 accounts");
 });
 
+test("a record written before the label fix does not print an invented #1", () => {
+  const record = goRecord();
+  record.accounts = [
+    { id: "#1", ok: true, status: "", limits: [{ label: "5h window", title: "Session", percent: 0.1, resetsAt: at(HOUR) }] },
+    ...record.accounts.slice(1),
+  ];
+  record.limits = record.limits.slice(1);
+  const rows = plain(Logic.accountRows(Logic.displayProvider(record)));
+  assert.equal(rows[0].id, "", "the base row is blank, not #1");
+  assert.equal(plain(Logic.headline(Logic.displayProvider(record))).title, "Session", "an unnumbered base headline has no prefix");
+});
+
 test("every account keeps every window, and a failed account keeps its status", () => {
   const rows = plain(Logic.accountRows(Logic.displayProvider(goRecord())));
-  assert.deepEqual(rows.map((/** @type {any} */ row) => row.id), ["#1", "#2", "#3"]);
+  assert.deepEqual(rows.map((/** @type {any} */ row) => row.id), ["", "#2", "#3"], "the base entry has no number");
   assert.deepEqual(rows[1].windows.map((/** @type {any} */ w) => Logic.windowTag(w.title)), ["session", "week", "month"]);
   assert.equal(rows[1].binding.title, "Monthly");
   assert.equal(rows[2].ok, false);

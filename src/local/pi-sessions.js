@@ -58,6 +58,7 @@ import { dirname, join } from "node:path";
 import { FAMILY_BY_PROVIDER, resolveProviderSlot } from "../auth/pi-auth.js";
 import { redact } from "../http.js";
 import {
+  accountLabel,
   acquireHistoryLock,
   addToModels,
   applyDurable,
@@ -114,7 +115,7 @@ const RECENT_DAYS = 7;
  * @property {number} activeDays
  * @property {string[]} activeDates
  * @property {Record<string, { inputTokens: number, outputTokens: number, cacheReadInputTokens: number, cacheCreationInputTokens: number }>} modelUsage
- * @property {Record<string, { todayTokens: number, weekTokens: number, todayPrompts: number, totalPrompts: number, totalTokens: number }>} byAccount
+ * @property {Record<string, { todayTokens: number, weekTokens: number, todayPrompts: number, totalPrompts: number, totalTokens: number, todayTokensByModel: Record<string, number> }>} byAccount
  */
 
 /**
@@ -910,7 +911,9 @@ function tokensByModel(models) {
  * @returns {number}
  */
 function labelOrder(label) {
-  if (label === "#1") return -1;
+  // "" is the base entry; "#1" is the old invented label for it, kept so a
+  // totals.json written before the fix still sorts first.
+  if (label === "" || label === "#1") return -1;
   const numeric = Number.parseInt(String(label).replace(/^#/, ""), 10);
   return Number.isFinite(numeric) ? numeric : Number.MAX_SAFE_INTEGER;
 }
@@ -959,7 +962,7 @@ export function buildLocalStats(input = {}) {
       openDates.add(day);
       openSessions += count(familyRow.sessions);
       for (const [slot, slotRow] of Object.entries(familyRow.slots ?? {})) {
-        const label = slot === "" ? "#1" : `#${slot}`;
+        const label = accountLabel(slot);
         const account = openAccounts.get(label) ?? { prompts: 0, sessions: 0, models: new Map() };
         account.sessions += count(slotRow.sessions);
         for (const [model, bucket] of Object.entries(slotRow.models ?? {})) {
@@ -994,7 +997,7 @@ export function buildLocalStats(input = {}) {
       /** @type {Map<string, { tokens: number, prompts: number }>} */
       const slots = new Map();
       for (const [slot, slotRow] of Object.entries(familyRow.slots ?? {})) {
-        const label = slot === "" ? "#1" : `#${slot}`;
+        const label = accountLabel(slot);
         let tokens = 0;
         let prompts = 0;
         for (const [model, bucket] of Object.entries(slotRow.models ?? {})) {
@@ -1021,6 +1024,18 @@ export function buildLocalStats(input = {}) {
       for (const [model, bucket] of Object.entries(slotRow.models ?? {})) {
         todayModels.set(model, (todayModels.get(model) ?? 0) + bucketTokens(bucket));
       }
+    }
+    // The same split per account, so the History page can name the model behind
+    // an account's live (unfrozen) today row instead of leaving it blank.
+    /** @type {Map<string, Map<string, number>>} */
+    const todayAccountModels = new Map();
+    for (const [slot, slotRow] of Object.entries(todayRows?.slots ?? {})) {
+      const label = accountLabel(slot);
+      const models = todayAccountModels.get(label) ?? new Map();
+      for (const [model, bucket] of Object.entries(slotRow.models ?? {})) {
+        models.set(model, (models.get(model) ?? 0) + bucketTokens(bucket));
+      }
+      todayAccountModels.set(label, models);
     }
 
     /** @type {Map<string, number>} */
@@ -1057,6 +1072,7 @@ export function buildLocalStats(input = {}) {
         todayPrompts: daySlots.get(today)?.get(label)?.prompts ?? 0,
         totalPrompts: (historyAccount?.totalPrompts ?? 0) + (openAccount?.prompts ?? 0),
         totalTokens,
+        todayTokensByModel: Object.fromEntries(todayAccountModels.get(label) ?? []),
       };
     }
 

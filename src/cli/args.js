@@ -19,6 +19,7 @@
  * @property {boolean} status
  * @property {boolean} clearCache
  * @property {boolean} rebuildTotals
+ * @property {string | null} month      `stats --month YYYY-MM`, validated.
  * @property {number} ttlMs
  * @property {number} timeoutMs
  * @property {string[]} unknown          Flags this parser does not own.
@@ -72,6 +73,7 @@ export function parseArgs(argv, defaults = {}) {
     box: false,
     clearCache: false,
     rebuildTotals: false,
+    month: null,
     ttlMs: defaults.defaultTtlMs ?? 60_000,
     timeoutMs: defaults.defaultTimeoutMs ?? 15_000,
     unknown: [],
@@ -91,6 +93,17 @@ export function parseArgs(argv, defaults = {}) {
       }
       if (arg === "--ttl") parsed.ttlMs = number * 1000;
       if (arg === "--timeout") parsed.timeoutMs = number;
+      continue;
+    }
+
+    if (arg === "--month") {
+      const value = argv[index + 1];
+      if (!/^\d{4}-(0[1-9]|1[0-2])$/.test(value ?? "")) {
+        parsed.unknown.push(...flagWithValue(arg, value));
+        continue;
+      }
+      parsed.month = value;
+      index += 1;
       continue;
     }
 

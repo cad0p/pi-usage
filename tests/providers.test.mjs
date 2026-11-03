@@ -172,7 +172,7 @@ test("opencode-go: the API key reads its own 5h/weekly/monthly windows", async (
 
   const first = await fetchOpenCodeGo(base, { now: NOW, fetchFn, env: {}, stores: [], allowBrowser: false });
   assert.equal(first.ok, true);
-  assert.equal(first.account, "#1");
+  assert.equal(first.account, "", "the base entry has no number in auth.json");
   assert.equal(first.plan, "Go plan");
   assert.deepEqual(first.windows.map((window) => window.id), ["5h", "weekly", "monthly"]);
   assert.deepEqual(first.windows.map((window) => window.usedPercent), [0, 9, 100]);

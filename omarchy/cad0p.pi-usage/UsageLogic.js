@@ -141,15 +141,19 @@ function compactDuration(ms) {
 
 // ----------------------------------------------------------------- accounts
 
-// One row per account of a multi-account record, every window kept.
+// One row per account of a multi-account record, every window kept. The base
+// auth.json entry has no number, so its id stays empty (a blank, aligned column)
+// instead of an invented "#1"; a record cached before the fix is normalized.
 function accountRows(p) {
   var list = p && isList(p.accounts) ? p.accounts : []
   var rows = []
   for (var i = 0; i < list.length; i++) {
     var entry = list[i] || {}
     var windows = limitWindows(entry.limits)
+    var id = entry.id == null ? "" : String(entry.id)
+    if (id === "#1") id = ""
     rows.push({
-      id: String(entry.id || ("#" + (i + 1))),
+      id: id,
       ok: entry.ok === true,
       status: String(entry.status || ""),
       windows: windows,
@@ -172,7 +176,8 @@ function failedAccountCount(p) {
 // family are used one after another (pi rotates to the next slot when one is
 // exhausted), so what stops the next prompt is the account with the most
 // room left: the healthy account whose own fullest window is the emptiest.
-// That is the "lowest" figure /usage prints for the family.
+// /usage's panel lists every account instead of collapsing the family, so
+// this headline is the bar's own summary of those rows.
 function headline(p) {
   if (!p) return null
   var rows = accountRows(p)
@@ -186,7 +191,7 @@ function headline(p) {
         best = row
     }
     if (best) return {
-      title: best.id + " · " + best.binding.title,
+      title: (best.id === "" ? "" : best.id + " · ") + best.binding.title,
       percent: best.binding.percent,
       resetAt: best.binding.resetAt,
       accountId: best.id

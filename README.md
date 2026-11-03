@@ -223,6 +223,9 @@ piquota auth opencode --wait 300
 
 piquota omarchy                 # write pi-*.json records for Omarchy's Agents panel
 piquota stats                   # durable token history: last frozen day, families, totals
+piquota stats --json --month 2026-11
+                                # read-only history feed: months, one month's days
+                                # per family/slot/model, all-time totals, notes
 piquota stats --rebuild-totals  # recompute totals.json from the frozen month files
 ```
 
@@ -242,7 +245,7 @@ Inside Pi:
 
 | Command | Effect |
 | --- | --- |
-| `/usage` | one on-demand refresh, show the full panel until the next prompt (or a second `/usage`), notify a one-line summary |
+| `/usage` | open the fullscreen quota overlay: every provider, window, account and token row, folded by section, refreshed in the background; `tab` opens the month history; `esc` closes it |
 | `/usage box` | pin the five-row box above the editor |
 | `/usage line` | pin the compact line above the editor, in its own row |
 | `/usage panel` | full panel above the editor, pinned across prompts |
@@ -253,18 +256,81 @@ Inside Pi:
 
 ### The Pi surface
 
-Nothing is pinned by default: `/usage` is a one-shot command, so it claims no row
-above the editor and leaves the footer alone. Turn a surface on with `/usage box`,
-`/usage line`, `/usage panel` or `/usage status`; only then does the extension keep
-it fresh with a background refresh (and a gentle refresh after each agent turn).
-`/usage hide` gives the row back.
+Nothing is pinned by default: `/usage` opens a **fullscreen overlay** that takes
+the keyboard, so it claims no row above the editor and leaves the footer alone.
+It is the same `ctx.ui.custom` overlay pattern pi's `/context` uses: it fills the
+terminal, scrolls, folds and closes on Esc (or `q`), leaving nothing behind.
+Turn a persistent surface on with `/usage box`, `/usage line`, `/usage panel` or
+`/usage status`; only then does the extension keep it fresh with a background
+refresh (and a gentle refresh after each agent turn). `/usage hide` gives the row
+back. `/usage panel` still pins the same panel flat above the editor.
+
+The overlay paints on the same keystroke: it renders the report the extension
+already holds, or the CLI's on-disk report cache (`~/.cache/pi-quota/usage.json`,
+read-only) when memory is empty, and never waits for the CLI before the first
+frame. The same forced refresh bare `/usage` always ran then runs behind it: the
+header says `refreshing …` while it does, and the update time when it lands. A
+failed refresh is a line in the view, never a thrown error. Every provider is a section:
+the header is the brand-coloured name line, the body lists every window with its
+used-fraction bar, reset countdown and the token rows for today, the last seven
+days, the prompts and the heaviest models. All sections start expanded; the fold
+state and the page you left live for the pi session, so reopening `/usage`
+resumes them, and no file is written.
+
+| Key | Action |
+| --- | --- |
+| `↑`/`↓`, `j`/`k` | move the header cursor; a section taller than the viewport scrolls line by line first |
+| `enter` / `space` | fold or unfold the section under the cursor |
+| `→`/`l`, `←`/`h` | expand, collapse |
+| `PgUp`/`PgDn`, `g`/`Home`, `G`/`End` | page, first section, last section |
+| mouse wheel | scroll |
+| `r` | refresh in place (on History: the month and the live report) |
+| `tab`, `1` / `2` | switch between Now and History |
+| `esc` / `q` | close |
+
+The legend at the bottom lists every key the current view answers, and wraps
+into a second or third row on a narrow pane instead of dropping pairs — as few
+rows as fit, with the pairs balanced across them. The frame
+fits from about 60 columns up: a line wider than the terminal wraps at its
+` · ` separators with a hanging indent instead of being cut, so a row never
+loses the datum it ends with, and a resize rebuilds it. The wheel is handled by the component itself, like
+pi-context-view: pi routes fullscreen wheel events to the focused component but
+has no scrolling API for a custom screen, and this extension has no runtime
+dependencies to wrap the body in a `ScrollView`.
+
+`tab` (or `2`) opens **History**, the second page: the durable token history for
+one month, with the same foldable sections. A provider section lists the month's
+days, the token split by model, and — for a multi-account provider — one row per
+account with its month and all-time totals (every account the family has in the
+month *or* all-time, so one busy key does not hide the others). `←`/`→` (or
+`[`/`]`) walk the browsable months — those with a file, plus the live month,
+which is where History opens even before its first freeze — and `tab` (or `1`)
+comes back to Now. The all-time
+figure is `totals.json` (frozen through its watermark). A family's open day
+(today) is merged from the live report only when the report was *generated* today
+and the frozen month has no row for that family's day — per family, so one family
+frozen early never hides another's live row — and a day is counted exactly once.
+A report generated before midnight, or the older report cache painted on the first
+frame, is skipped: its `todayTotalTokens` belong to another day, and merging them
+under today would count a frozen yesterday twice. The tail then names the report's
+day and says today is not merged. A missing or quarantined month is a note instead
+of rows, a failed `stats` run shows the CLI's own stderr line (redacted) or its
+exit status with a retry hint, and a slow fetch never moves the page off the month
+the last keypress asked for.
+
+History reads `piquota stats --json [--month YYYY-MM]`: the month list, one
+month's days per family/slot/model, the all-time rollup and notes. That command
+never takes the writer lock and never writes, so it is safe to run while a scan
+is freezing a day.
 
 A provider with several accounts is shown as one header (`OP-Go · 7 of 14 accounts
 ok`) plus one line per account with every window and its reset, e.g.
 `#2 ● session 2% (10m) · week 10% (6d) · month 90% (19d)`, or the reason it failed
-(`key rejected`, `no Go plan`). The leading glyph is the fullest window's band. The panel is rendered as a component, so Pi's ten-line
-cap on plain widgets never truncates it, and the summary names the account with the
-most room: `OP-Go: 7/14 ok · lowest 24% (#7)`.
+(`key rejected`, `no Go plan`). The base entry in `auth.json` (`opencode-go`) has
+no number, so its label column is blank; only real sibling slots (`opencode-go-2`
+…) are numbered `#2` … `#14`. The leading glyph is the fullest window's band. The
+overlay and the pinned panel are rendered as components, so Pi's ten-line cap on
+plain widgets never truncates them.
 
 `/usage box` pins the **five-row box above the editor**:
 
@@ -440,7 +506,7 @@ seven entries, oldest first, today last):
       "activeDays": 11,
       "activeDates": ["2026-10-27"],
       "modelUsage": { "gpt-5.1-codex": { "inputTokens": 4, "outputTokens": 425, "cacheReadInputTokens": 6838, "cacheCreationInputTokens": 6905 } },
-      "byAccount": { "#1": { "todayTokens": 14172, "weekTokens": 118422, "todayPrompts": 3, "totalPrompts": 1200, "totalTokens": 48812210 } }
+      "byAccount": { "": { "todayTokens": 14172, "weekTokens": 118422, "todayPrompts": 3, "totalPrompts": 1200, "totalTokens": 48812210 } }
     }
   },
   "localStatsMeta": { "files": 604, "scanned": 1, "reused": 603, "bytesRead": 3042, "durationMs": 9, "partial": false, "budgetMs": 12000, "frozenDays": 0, "locked": false }
@@ -488,7 +554,9 @@ piquota omarchy                  # write pi-claude.json, pi-codex.json, ... once
   `auth.json`) still gets **one** record: every healthy account contributes only
   the window that constrains it, titled `#<slot> · Session|Weekly|Monthly`, and
   failed accounts add no rows but are summarised by reason, e.g.
-  `#8–#10 key rejected · #11–#14 no Go plan`. The same record also carries
+  `#8–#10 key rejected · #11–#14 no Go plan`. The unnumbered base entry keeps a
+  blank `id` and its limits are untitled; only real sibling slots carry
+  `#<slot>`. The same record also carries
   `accounts[{id, ok, status, limits}]` with every window of every account
   (`status` is a short reason such as `Key rejected` for a failed one), which
   Omarchy's built-in panel ignores and this package's own plugin draws.
@@ -510,7 +578,8 @@ is a collapsible section of one scrolling panel.
   with its window and reset (`Weekly · 1d`), a chip when something is wrong
   (`Unavailable`, `7 down`), and the headline meter while folded. The headline is
   the fullest window; for a multi-account provider it is the healthy account
-  with the most room left, the `lowest` figure `/usage` prints.
+  with the most room left. `/usage` does not collapse a family like that: its
+  panel lists one line per account, so this headline is the bar's own summary.
 - **Expanded**: the status card, LIMITS with the built-in meters and countdowns,
   then for a multi-account record one row per account with every window
   (`#2  session 2% 10m · week 10% 6d · month 90% 19d`, failed accounts dimmed
@@ -582,6 +651,8 @@ shows them next to the quota:
 | `/usage` panel | a `tokens` row per provider: today, 7 days, prompts, then the top 3 models of the week |
 | `piquota omarchy` | the optional fields Omarchy's Agents panel draws as "Tokens by day" and "Tokens by model" |
 | `piquota stats` | the durable history: last frozen day, families, prompts, session-days |
+| `/usage` → `tab` | History: per provider, the month's days and models, account totals for a multi-account family, and the all-time rollup |
+| `piquota stats --json` | the same history as a read-only JSON feed (`--month YYYY-MM` selects a month) |
 
 What counts: one assistant message with a non-zero token count is one prompt,
 and its tokens are `input + output + cacheRead + cacheWrite` — the same sum the
@@ -755,7 +826,7 @@ extensions/quota-panel.ts      Pi TUI line and /usage
 ## Tests
 
 ```bash
-node --test tests/*.test.mjs     # 359 tests, fake tokens only, no network
+node --test tests/*.test.mjs     # 401 tests, fake tokens only, no network
 ```
 
 Modules covered: `auth.json` parsing and de-duplication, the Claude Code store

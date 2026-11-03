@@ -61,6 +61,33 @@ test("--rebuild-totals is refused outside \`piquota stats\`", () => {
   }
 });
 
+test("--month is an owned stats value flag with a real YYYY-MM", () => {
+  const parsed = parseArgs(["stats", "--month", "2026-11"]);
+  assert.equal(parsed.month, "2026-11");
+  assert.deepEqual(parsed.positionals, ["stats"], "the value is not a family name");
+  assert.deepEqual(parsed.unknown, []);
+  assert.equal(parseArgs(["stats"]).month, null);
+
+  for (const value of ["2026-13", "2026-1", "not-a-month"]) {
+    const invalid = parseArgs(["stats", "--month", value]);
+    assert.equal(invalid.month, null);
+    assert.deepEqual(invalid.unknown, ["--month", value]);
+  }
+  assert.deepEqual(parseArgs(["stats", "--month"]).unknown, ["--month"]);
+});
+
+test("--month is refused outside `piquota stats`", () => {
+  for (const argv of [["--month", "2026-11"], ["claude", "--month", "2026-11"], ["omarchy", "--month", "2026-11"]]) {
+    const run = spawnSync(process.execPath, [CLI, ...argv], {
+      encoding: "utf-8",
+      timeout: 30_000,
+      env: { ...process.env, PI_CODING_AGENT_DIR: "/tmp/nonexistent-agent" },
+    });
+    assert.equal(run.status, 2, `argv ${argv.join(" ")}: ${run.stderr}`);
+    assert.match(run.stderr, /--month only works with .piquota stats./);
+  }
+});
+
 test("subcommand value flags stay out of both positionals and unknown", () => {
   const auth = parseArgs(["auth", "opencode", "--wait", "180"]);
   assert.deepEqual(auth.positionals, ["auth", "opencode"]);

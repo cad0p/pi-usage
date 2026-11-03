@@ -152,6 +152,39 @@ function quarantinedMonthPath(historyDir, month) {
 }
 
 /**
+ * The months with a month file on disk, plus any quarantined copies, read-only:
+ * `stats --json` and the overlay use this to know what can be browsed without
+ * taking the history lock or touching a file.
+ *
+ * @param {string} historyDir
+ * @returns {{ months: string[], quarantined: Array<{ month: string, path: string }> }}
+ */
+export function listHistoryMonths(historyDir) {
+  /** @type {string[]} */
+  let names;
+  try {
+    names = readdirSync(historyDir);
+  } catch {
+    return { months: [], quarantined: [] };
+  }
+  const months = new Set();
+  const quarantined = new Map();
+  for (const name of names) {
+    const month = MONTH_FILE.exec(name)?.[1];
+    if (month) {
+      months.add(month);
+      continue;
+    }
+    const backup = /^tokens-(\d{4}-\d{2})\.json\.corrupt-/.exec(name);
+    if (backup && !quarantined.has(backup[1])) quarantined.set(backup[1], join(historyDir, name));
+  }
+  return {
+    months: Array.from(months).sort(),
+    quarantined: Array.from(quarantined, ([month, path]) => ({ month, path })).sort((a, b) => a.month.localeCompare(b.month)),
+  };
+}
+
+/**
  * Whether the history directory holds any frozen month file at all.
  *
  * @param {string} historyDir
@@ -167,10 +200,11 @@ export function hasMonthFiles(historyDir) {
 
 /**
  * @param {string} slot
- * @returns {string} "#1" for the base entry, "#<slot>" for a numbered sibling.
+ * @returns {string} "" for the base entry (it has no number), "#<slot>" for a
+ * real sibling slot.
  */
 export function accountLabel(slot) {
-  return slot === "" ? "#1" : `#${slot}`;
+  return slot === "" || slot === null || slot === undefined ? "" : `#${slot}`;
 }
 
 /**
@@ -485,8 +519,11 @@ export function parseTotals(raw) {
       for (const day of entry.activeDates) if (typeof day === "string" && day !== "") familyTotals.activeDates.add(day);
     }
     if (entry.accounts && typeof entry.accounts === "object" && !Array.isArray(entry.accounts)) {
-      for (const [label, accountValue] of Object.entries(entry.accounts)) {
+      for (const [rawLabel, accountValue] of Object.entries(entry.accounts)) {
         if (!accountValue || typeof accountValue !== "object") continue;
+        // Files written before the base entry lost its invented "#1" carry that
+        // key; normalize on read so one account never shows up twice.
+        const label = rawLabel === "#1" ? "" : rawLabel;
         const account = /** @type {Record<string, unknown>} */ (accountValue);
         familyTotals.accounts.set(label, {
           totalPrompts: count(account.totalPrompts),
@@ -805,13 +842,18 @@ export function loadTotals(input) {
  * daily detail stays missing until the quarantined copy is restored. The
  * all-time totals it already fed are untouched.
  *
+ * `concise` is for a read-only reader (`stats --json`): it gets one short note
+ * per damaged month, not the writer's recovery instructions.
+ *
  * @param {string} historyDir
  * @param {string} month
  * @param {string[]} warnings
+ * @param {{ canWrite?: boolean, concise?: boolean }} [options]
  * @returns {{ days: Record<string, DayRows>, writable: boolean, exists: boolean, path: string }}
  */
 export function readMonthFile(historyDir, month, warnings, options = {}) {
   const canWrite = options.canWrite !== false;
+  const concise = options.concise === true;
   const path = resolveMonthPath(historyDir, month);
   let raw;
   try {
@@ -821,8 +863,10 @@ export function readMonthFile(historyDir, month, warnings, options = {}) {
       const backup = quarantinedMonthPath(historyDir, month);
       if (backup) {
         warnings.push(
-          `local token stats: ${path} was quarantined as ${backup}; its frozen days are missing from recentDays (shown as 0), ` +
-            `while totals.json keeps the all-time counts. Copy ${backup} back to ${path} if recoverable, or delete that backup to abandon those counts; days after it stay open until then`,
+          concise
+            ? `local token stats: ${path} is quarantined as ${backup}; its frozen days are unavailable while totals.json keeps the all-time counts`
+            : `local token stats: ${path} was quarantined as ${backup}; its frozen days are missing from recentDays (shown as 0), ` +
+                `while totals.json keeps the all-time counts. Copy ${backup} back to ${path} if recoverable, or delete that backup to abandon those counts; days after it stay open until then`,
         );
       }
       return { days: {}, writable: true, exists: false, unreadable: false, quarantined: backup !== null, path };
@@ -848,8 +892,10 @@ export function readMonthFile(historyDir, month, warnings, options = {}) {
   if (!shapeOk) {
     if (!canWrite) {
       warnings.push(
-        `local token stats: ${path} is corrupt or from another version; leaving it in place because this run does not hold the history lock. ` +
-          "Its days are missing from recentDays (shown as 0), while totals.json keeps the all-time counts; a lock owner can quarantine it for restoration",
+        concise
+          ? `local token stats: ${path} is corrupt or from another version; it is left untouched and its frozen days are unavailable`
+          : `local token stats: ${path} is corrupt or from another version; leaving it in place because this run does not hold the history lock. ` +
+              "Its days are missing from recentDays (shown as 0), while totals.json keeps the all-time counts; a lock owner can quarantine it for restoration",
       );
       return { days: {}, writable: false, exists: true, unreadable: true, quarantined: false, path };
     }

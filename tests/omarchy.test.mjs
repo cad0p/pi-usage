@@ -156,7 +156,7 @@ test("a multi-account family becomes one record with one binding window per acco
       provider({
         family: "opencode-go",
         label: "OpenCode Go (Pi)",
-        account: "#1",
+        account: "",
         slot: null,
         plan: "Go plan",
         windows: [
@@ -189,9 +189,32 @@ test("a multi-account family becomes one record with one binding window per acco
   assert.equal(record.tierLabel, "2 of 2 accounts");
   assert.equal(record.usageStatusText, "");
   assert.deepEqual(record.limits, [
-    { label: "#1 · Monthly window", title: "#1 · Monthly", percent: 0.9, resetsAt: "2026-10-20T00:00:00.000Z" },
+    { label: "Monthly window", title: "Monthly", percent: 0.9, resetsAt: "2026-10-20T00:00:00.000Z" },
     { label: "#2 · Weekly window", title: "#2 · Weekly", percent: 0.05, resetsAt: "2026-10-05T10:00:00.000Z" },
   ]);
+});
+
+test("a report cached before the label fix keeps the base account unnumbered", () => {
+  const providers = [
+    provider({
+      family: "opencode-go",
+      label: "OpenCode Go (Pi)",
+      account: "#1",
+      slot: null,
+      windows: [{ id: "monthly", label: "Monthly window", usedPercent: 90, remainingPercent: 10, resetsAt: null }],
+    }),
+    provider({
+      family: "opencode-go",
+      label: "OpenCode Go (Pi)",
+      account: "#2",
+      slot: "2",
+      windows: [{ id: "monthly", label: "Monthly window", usedPercent: 5, remainingPercent: 95, resetsAt: null }],
+    }),
+  ];
+  const { record } = buildRecords(/** @type {any} */ ({ providers }), { now: NOW })[0];
+  assert.equal(record.accounts[0].id, "", "the legacy #1 becomes the unnumbered base entry");
+  assert.deepEqual(record.limits.map((limit) => limit.title), ["Monthly", "#2 · Monthly"]);
+  assert.equal(/#1/.test(JSON.stringify(record)), false);
 });
 
 test("failed accounts add no rows and are summarised by reason with slot ranges", () => {
@@ -199,7 +222,7 @@ test("failed accounts add no rows and are summarised by reason with slot ranges"
     provider({
       family: "opencode-go",
       label: "OpenCode Go (Pi)",
-      account: `#${index + 1}`,
+      account: index === 0 ? "" : `#${index + 1}`,
       slot: index === 0 ? null : String(index + 1),
       plan: "Go plan",
       ok: index < 2,
@@ -219,11 +242,11 @@ test("failed accounts add no rows and are summarised by reason with slot ranges"
   assert.equal(record.tierLabel, "2 of 6 accounts");
   assert.equal(record.usageStatusText, "4 of 6 accounts unavailable");
   assert.equal(record.authHelpText, "#3–#4 key rejected · #5–#6 no Go plan");
-  assert.deepEqual(record.limits.map((limit) => limit.title), ["#1 · Session", "#2 · Session"]);
+  assert.deepEqual(record.limits.map((limit) => limit.title), ["Session", "#2 · Session"]);
 });
 
 test("a multi-account family where every account fails keeps the single-failure shape", () => {
-  const providers = ["#1", "#2"].map((account, index) =>
+  const providers = ["", "#2"].map((account, index) =>
     provider({
       family: "opencode-go",
       label: "OpenCode Go (Pi)",
@@ -238,7 +261,7 @@ test("a multi-account family where every account fails keeps the single-failure 
   const { record } = buildRecords(/** @type {any} */ ({ providers }), { now: NOW })[0];
   assert.equal(record.ready, false);
   assert.equal(record.usageStatusText, "Credential rejected");
-  assert.equal(record.authHelpText, "#1–#2 credential rejected");
+  assert.equal(record.authHelpText, "base, #2 credential rejected");
   assert.equal(record.limits.length, 1);
   assert.ok(record.limits[0].percent < 0, "the panel filters percent < 0, so nothing is drawn");
 });
@@ -248,7 +271,7 @@ test("a multi-account record lists every window of every account, failed ones wi
     provider({
       family: "opencode-go",
       label: "OpenCode Go (Pi)",
-      account: "#1",
+      account: "",
       slot: null,
       windows: [
         { id: "5h", label: "5h window", usedPercent: 2, remainingPercent: 98, resetsAt: "2026-10-04T05:10:00.000Z" },
@@ -279,7 +302,7 @@ test("a multi-account record lists every window of every account, failed ones wi
   const { record } = buildRecords(/** @type {any} */ ({ providers }), { now: NOW })[0];
   assert.deepEqual(record.accounts, [
     {
-      id: "#1",
+      id: "",
       ok: true,
       status: "",
       limits: [
@@ -293,7 +316,7 @@ test("a multi-account record lists every window of every account, failed ones wi
   ]);
   // The flattened limits Omarchy's built-in panel reads are unchanged.
   assert.deepEqual(record.limits, [
-    { label: "#1 · Monthly window", title: "#1 · Monthly", percent: 0.9, resetsAt: "" },
+    { label: "Monthly window", title: "Monthly", percent: 0.9, resetsAt: "" },
   ]);
 });
 
