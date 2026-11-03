@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## [calver-released]
+## [0.11.5] - 2026-11-03
 
 <!-- USER-EDITABLE SECTION START -->
 A fullscreen `/usage` with browsable history, and a refresh about three times faster.
