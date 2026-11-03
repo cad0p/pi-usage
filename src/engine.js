@@ -149,6 +149,47 @@ export function resolveClaudeCredentials(input) {
   };
 }
 
+/** Default number of accounts of one family queried at the same time. */
+export const DEFAULT_ACCOUNT_CONCURRENCY = 8;
+
+/**
+ * `PI_QUOTA_ACCOUNT_CONCURRENCY` (1-32) bounds the parallel account requests of
+ * one family; 1 restores the sequential behaviour.
+ *
+ * @param {Record<string, string | undefined>} env
+ * @returns {number}
+ */
+export function accountConcurrency(env) {
+  const value = Number.parseInt(env.PI_QUOTA_ACCOUNT_CONCURRENCY ?? "", 10);
+  if (!Number.isFinite(value) || value < 1) return DEFAULT_ACCOUNT_CONCURRENCY;
+  return Math.min(32, value);
+}
+
+/**
+ * Map with at most `limit` calls in flight, results in input order.
+ *
+ * @template T, R
+ * @param {T[]} items
+ * @param {number} limit
+ * @param {(item: T, index: number) => Promise<R>} fn
+ * @returns {Promise<R[]>}
+ */
+export async function mapBounded(items, limit, fn) {
+  /** @type {R[]} */
+  const results = new Array(items.length);
+  let next = 0;
+  const worker = async () => {
+    while (next < items.length) {
+      const index = next++;
+      results[index] = await fn(items[index], index);
+    }
+  };
+  // A non-numeric limit would otherwise start no worker and return holes.
+  const bounded = Number.isFinite(limit) ? Math.max(1, Math.floor(limit)) : 1;
+  await Promise.all(Array.from({ length: Math.min(bounded, items.length) }, worker));
+  return results;
+}
+
 /** @type {Record<string, (credential: any, options?: any) => Promise<import("./model.js").QuotaResult>>} */
 const PROVIDERS = {
   claude: fetchClaude,
@@ -314,17 +355,18 @@ export async function collectQuota(options = {}) {
         return;
       }
 
-      /** @type {import("./model.js").QuotaResult[]} */
-      const results = [];
-      const familyWarnList = [];
-      for (const credential of credentials) {
+      // Accounts of one family are independent requests, so they run in
+      // parallel (bounded): with 14 OpenCode Go keys a sequential loop cost
+      // ~3.8 s, a parallel one costs about one round trip. Results keep the
+      // credential order, and the backoff bookkeeping is replayed in that same
+      // order afterwards, so the final backoff state is exactly what the
+      // sequential loop produced.
+      const fetchQuota = PROVIDERS[family];
+      const outcomes = await mapBounded(credentials, accountConcurrency(env), async (credential) => {
         const freshness = checkFreshness(credential, now);
-        if (!freshness.fresh) {
-          familyWarnList.push(
-            `${family}: the ${expiredTokenName(credential)} expired ${Math.abs(freshness.expiresInMin ?? 0)}m ago; ${refreshHint(credential)}`,
-          );
-        }
-        const fetchQuota = PROVIDERS[family];
+        const warning = freshness.fresh
+          ? null
+          : `${family}: the ${expiredTokenName(credential)} expired ${Math.abs(freshness.expiresInMin ?? 0)}m ago; ${refreshHint(credential)}`;
         try {
           const result = await fetchQuota(credential, {
             now,
@@ -341,18 +383,7 @@ export async function collectQuota(options = {}) {
           // The renderers group siblings by family; the record builder needs the
           // slot to label each account without re-parsing its display string.
           result.slot = credential.slot ?? null;
-          if (isThrottled(result.error)) {
-            const seconds = recordBackoff(family, {
-              retryAfterSec: retryAfterFromError(result.error),
-              now,
-              env,
-              home: options.home,
-            }).seconds;
-            familyWarnList.push(`${family}: throttled upstream; pausing that family for ${seconds}s`);
-          } else if (result.ok || isAuthFailure(result.error)) {
-            clearBackoff(family, { env, home: options.home });
-          }
-          results.push(result);
+          return { result, warning, crashed: false };
         } catch (error) {
           // A provider must never take the whole report down.
           const crashed = degradedResult({
@@ -365,8 +396,35 @@ export async function collectQuota(options = {}) {
             expiresInMin: freshness.expiresInMin,
           });
           crashed.slot = credential.slot ?? null;
-          results.push(crashed);
+          return { result: crashed, warning, crashed: true };
         }
+      });
+
+      /** @type {import("./model.js").QuotaResult[]} */
+      const results = [];
+      const familyWarnList = [];
+      for (const { result, warning, crashed } of outcomes) {
+        if (warning) familyWarnList.push(warning);
+        if (!crashed) {
+          // Bookkeeping must degrade like the provider call it follows: a
+          // failing backoff write is a warning, never a rejected family.
+          try {
+            if (isThrottled(result.error)) {
+              const seconds = recordBackoff(family, {
+                retryAfterSec: retryAfterFromError(result.error),
+                now,
+                env,
+                home: options.home,
+              }).seconds;
+              familyWarnList.push(`${family}: throttled upstream; pausing that family for ${seconds}s`);
+            } else if (result.ok || isAuthFailure(result.error)) {
+              clearBackoff(family, { env, home: options.home });
+            }
+          } catch (error) {
+            familyWarnList.push(`${family}: could not update the backoff state: ${/** @type {{ message?: string }} */ (error)?.message ?? String(error)}`);
+          }
+        }
+        results.push(result);
       }
       byFamily[family] = results;
       familyWarnings[family] = familyWarnList;

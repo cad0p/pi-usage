@@ -5,7 +5,40 @@
  * redaction of secrets and error normalization stay in one place.
  */
 
+import { readFileSync } from "node:fs";
+
 const DEFAULT_TIMEOUT_MS = 15000;
+
+/**
+ * The package's own User-Agent, sent on every request that does not set one.
+ *
+ * Without it Node's fetch announces itself as `node`, a generic HTTP-library
+ * name. OpenCode Go's terms ask clients for their own User-Agent and have warned
+ * and banned accounts over generic ones, and a usage poller that runs every few
+ * minutes against every key of a user is exactly the traffic that gets looked
+ * at. Providers that need a specific client string (Antigravity's CLI agent,
+ * the dashboard's browser agent) keep setting their own.
+ */
+export const PACKAGE_USER_AGENT = (() => {
+  try {
+    const pkg = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf-8"));
+    return `pi-usage/${pkg.version} (+https://github.com/cad0p/pi-usage)`;
+  } catch {
+    return "pi-usage (+https://github.com/cad0p/pi-usage)";
+  }
+})();
+
+/**
+ * Copy `headers` and add `User-Agent` unless one is already set (any case).
+ *
+ * @param {Record<string, string> | undefined} headers
+ * @returns {Record<string, string>}
+ */
+export function withUserAgent(headers) {
+  const out = { ...(headers ?? {}) };
+  if (!Object.keys(out).some((name) => name.toLowerCase() === "user-agent")) out["User-Agent"] = PACKAGE_USER_AGENT;
+  return out;
+}
 
 /**
  * Redact credential-looking substrings from arbitrary text before it can reach
@@ -96,7 +129,7 @@ export async function requestJson(url, options = {}) {
   try {
     const response = await fetchFn(url, {
       method: options.method ?? "GET",
-      headers: options.headers,
+      headers: withUserAgent(options.headers),
       body: options.body,
       signal: controller.signal,
     });
