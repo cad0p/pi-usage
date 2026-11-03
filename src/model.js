@@ -33,6 +33,10 @@
  * @property {string} source               Credential source description.
  * @property {"pi" | "claude-code"} [sourceKind]  Which kind of store produced it.
  * @property {string | null} expiresInMin  Credential freshness, when known.
+ * @property {true} [tokenRenewedInMemory]  Present only when the provider renewed
+ *                                          this token in memory for this run: the
+ *                                          stored credential's freshness then no
+ *                                          longer describes the request made.
  */
 
 /**
@@ -247,6 +251,7 @@ export function humanReset(seconds) {
  *   source: string,
  *   now?: number,
  *   expiresInMin?: number | null,
+ *   tokenRenewedInMemory?: boolean,
  *   windows?: QuotaWindow[],
  * }} input
  * @returns {QuotaResult}
@@ -256,7 +261,7 @@ export function degradedResult(input) {
     input.notConfigured ??
       (typeof input.error === "string" && input.error.startsWith("no ") && input.error.includes("credential in the Pi store")),
   );
-  return {
+  const result = {
     family: input.family,
     label: input.label,
     account: input.account ?? "unknown",
@@ -270,6 +275,27 @@ export function degradedResult(input) {
     sourceKind: input.sourceKind,
     expiresInMin: input.expiresInMin ?? null,
   };
+  // Only ever present when a provider renewed the token in memory: a field on
+  // every result would be one more thing the JSON feed promises to keep.
+  if (input.tokenRenewedInMemory === true) result.tokenRenewedInMemory = true;
+  return result;
+}
+
+/**
+ * Which field `displayIdentity` would print for this credential.
+ *
+ * A provider that adds a second identifier of its own (Antigravity's Cloud Code
+ * project) needs to know whether the identity already *is* that identifier, or
+ * it prints the same value twice.
+ *
+ * @param {{ email?: string | null, accountId?: string | null, projectId?: string | null, identity?: string }} credential
+ * @returns {"email" | "accountId" | "projectId" | "identity" | "none"}
+ */
+export function identityKind(credential) {
+  if (credential.email) return "email";
+  if (credential.accountId) return "accountId";
+  if (credential.projectId) return "projectId";
+  return credential.identity ? "identity" : "none";
 }
 
 /**
@@ -279,10 +305,18 @@ export function degradedResult(input) {
  * @returns {string}
  */
 export function displayIdentity(credential) {
-  if (credential.email) return credential.email;
-  if (credential.accountId) return `${credential.accountId.slice(0, 8)}…`;
-  if (credential.projectId) return `project ${credential.projectId.slice(0, 8)}…`;
-  return credential.identity ? `id ${credential.identity.slice(0, 8)}…` : "unknown";
+  switch (identityKind(credential)) {
+    case "email":
+      return /** @type {string} */ (credential.email);
+    case "accountId":
+      return `${/** @type {string} */ (credential.accountId).slice(0, 8)}…`;
+    case "projectId":
+      return `project ${/** @type {string} */ (credential.projectId).slice(0, 8)}…`;
+    case "identity":
+      return `id ${/** @type {string} */ (credential.identity).slice(0, 8)}…`;
+    default:
+      return "unknown";
+  }
 }
 
 /**

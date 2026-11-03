@@ -307,6 +307,30 @@ test("the panel names the Claude store that was actually read", () => {
   assert.equal(fromStore.includes("Claude Code CLI"), false, "Pi's own entry is the unremarkable default");
 });
 
+test("the Antigravity header prints the project once and claims no expiry after a renewal", () => {
+  const plainPaint = (_key, text) => text;
+  const base = {
+    family: "antigravity",
+    label: "Antigravity (Pi)",
+    account: "project rising-f…",
+    plan: null,
+    windows: [windowFixture({ id: "gemini-weekly", label: "Gemini · weekly", usedPercent: 0, remainingPercent: 100 })],
+    error: null,
+    ok: true,
+    updatedAt: "2030-01-01T00:00:00.000Z",
+    source: "/tmp/auth.json",
+    expiresInMin: null,
+    tokenRenewedInMemory: true,
+  };
+
+  const header = renderProviderLines(base, plainPaint)[0];
+  assert.equal(header.split("rising-f…").length - 1, 1, `the project is one identity: ${header}`);
+  assert.equal(/token/i.test(header), false, `a renewed token is not expiring: ${header}`);
+
+  const stale = renderProviderLines({ ...base, expiresInMin: -271_316, tokenRenewedInMemory: undefined }, plainPaint)[0];
+  assert.match(stale, /token EXPIRED/, "a credential that really is expired still says so");
+});
+
 test("the box widget borders and content align to the exact same visible width", () => {
   const plainPaint = (key, text) => text;
   const lines = renderBoxWidget([providerFixture()], plainPaint, 0);

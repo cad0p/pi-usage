@@ -71,6 +71,20 @@ test("describeOAuthClient explains where the client came from", () => {
   assert.match(describeOAuthClient({ client: resolveOAuthClient({ env: {}, sourcePath: path }) }), /builtin public Google/);
 });
 
+test("describeOAuthClient resolves the client from the caller's environment like the refresh did", () => {
+  const env = { ANTIGRAVITY_CLIENT_ID: "id-env", ANTIGRAVITY_CLIENT_SECRET: "secret-env" };
+  assert.match(
+    describeOAuthClient({ env, sourcePath: "/nope.ts" }),
+    /client from ANTIGRAVITY_CLIENT_ID\/SECRET/,
+    "the environment's client is the one the request went out with",
+  );
+  // …and without that environment the description still names the package or
+  // the builtin, never a client nobody used.
+  const fromBuiltin = describeOAuthClient({ env: {}, sourcePath: "/nope.ts" });
+  assert.match(fromBuiltin, /builtin public Google/);
+  assert.equal(/ANTIGRAVITY_CLIENT_ID/.test(fromBuiltin), false);
+});
+
 test("a refresh returns rotated tokens without writing anything", async () => {
   let authHeader = null;
   const { fetchFn, calls } = routedFetch([
@@ -92,6 +106,27 @@ test("a refresh returns rotated tokens without writing anything", async () => {
   assert.equal(/** @type {{ refresh: string }} */ (result).refresh, "1//refresh");
   assert.ok(authHeader.includes("grant_type=refresh_token"));
   assert.equal(calls.length, 1);
+});
+
+test("a refresh sends the client the caller's environment names", async () => {
+  let body = "";
+  const { fetchFn } = routedFetch([
+    [
+      "oauth2.googleapis.com",
+      (_url, init) => {
+        body = String(init.body);
+        return jsonResponse({ access_token: "ya29.env-client", expires_in: 3600 });
+      },
+    ],
+  ]);
+  const env = { ANTIGRAVITY_CLIENT_ID: "id-env", ANTIGRAVITY_CLIENT_SECRET: "secret-env" };
+  const account = { access: "ya29.stale", refresh: "1//keep", expiresAtMs: 1 };
+  const result = await ensureFreshAccessToken(account, { fetchFn, now: 1_800_000_000_000, env });
+
+  assert.equal(result.refreshed, true);
+  const sent = new URLSearchParams(body);
+  assert.equal(sent.get("client_id"), "id-env");
+  assert.equal(sent.get("client_secret"), "secret-env");
 });
 
 test("a failed refresh reports an error instead of throwing", async () => {

@@ -89,11 +89,15 @@ export function resolveOAuthClient(options = {}) {
 }
 
 /**
- * @param {{ client?: { clientId: string, clientSecret: string }, fetchFn?: typeof fetch, timeoutMs?: number }} [options]
+ * Describe the OAuth client a refresh used, resolved the same way the refresh
+ * resolved it: a description of the environment's client while the request went
+ * out with the installed package's would name the wrong credential source.
+ *
+ * @param {{ client?: { clientId: string, clientSecret: string }, env?: Record<string, string | undefined>, sourcePath?: string }} [options]
  * @returns {string}
  */
 export function describeOAuthClient(options = {}) {
-  const client = options.client ?? resolveOAuthClient();
+  const client = options.client ?? resolveOAuthClient({ env: options.env, sourcePath: options.sourcePath });
   return client.source === "env"
     ? "client from ANTIGRAVITY_CLIENT_ID/SECRET"
     : client.source === "pi-antigravity"
@@ -108,12 +112,15 @@ export function describeOAuthClient(options = {}) {
  *   fetchFn?: typeof fetch,
  *   timeoutMs?: number,
  *   now?: number,
+ *   env?: Record<string, string | undefined>,
  * }} [options]
  * @returns {Promise<{ access: string, refresh: string, expires: number } | { error: string }>}
  */
 export async function refreshAccessToken(refreshToken, options = {}) {
   if (!refreshToken) return { error: "no refresh token available" };
-  const client = options.client ?? resolveOAuthClient();
+  // The caller's environment decides the client, so the one that describes a
+  // failed refresh (describeOAuthClient) is the one that was actually used.
+  const client = options.client ?? resolveOAuthClient({ env: options.env });
 
   const response = await requestJson(GOOGLE_TOKEN_URL, {
     method: "POST",
@@ -152,6 +159,7 @@ export async function refreshAccessToken(refreshToken, options = {}) {
  *   now?: number,
  *   bufferMs?: number,
  *   enabled?: boolean,
+ *   env?: Record<string, string | undefined>,
  * }} [options]
  * @returns {Promise<{ ok: boolean, refreshed: boolean, error?: string }>}
  */

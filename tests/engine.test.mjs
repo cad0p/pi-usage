@@ -383,6 +383,136 @@ test("neither Claude source configured degrades as not-configured, not as a fail
   assert.match(claude.error, /no claude credential/);
 });
 
+test("an Antigravity token renewed in memory never warns that the stored one expired", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-quota-antigravity-renewed-"));
+  const store = join(home, "auth.json");
+  writeFileSync(
+    store,
+    JSON.stringify({
+      antigravity: {
+        type: "oauth",
+        access: "ya29.STALE",
+        refresh: "1//FAKE-google-refresh-for-fixtures-only",
+        projectId: "rising-fixture-project",
+        expires: NOW - 271_316 * 60_000,
+      },
+    }),
+  );
+  const { fetchFn } = routedFetch([
+    ["oauth2.googleapis.com", () => jsonResponse({ access_token: "ya29.RENEWED", expires_in: 3600 })],
+    ["cloudcode", () => jsonResponse(antigravityUsageBody())],
+  ]);
+
+  const report = await collectQuota({
+    paths: [store],
+    claudeCodePaths: [],
+    now: NOW,
+    fetchFn,
+    families: ["antigravity"],
+    env: { ANTIGRAVITY_CLIENT_ID: "id-fixture", ANTIGRAVITY_CLIENT_SECRET: "secret-fixture" },
+    home,
+    stores: [],
+    allowBrowser: false,
+  });
+
+  const provider = report.providers[0];
+  assert.equal(provider.ok, true);
+  assert.equal(provider.expiresInMin, null, "the run used a token that is not expiring");
+  assert.equal(provider.tokenRenewedInMemory, true);
+  assert.equal(
+    report.warnings.some((warning) => /antigravity: .*expired/.test(warning)),
+    false,
+    "the stored copy is stale, but this run did not use it",
+  );
+});
+
+test("a renewed Antigravity token keeps its warning silent even when the quota call failed", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-quota-antigravity-renewed-fail-"));
+  const store = join(home, "auth.json");
+  writeFileSync(
+    store,
+    JSON.stringify({
+      antigravity: {
+        type: "oauth",
+        access: "ya29.STALE",
+        refresh: "1//FAKE-google-refresh-for-fixtures-only",
+        projectId: "rising-fixture-project",
+        expires: NOW - 60_000,
+      },
+    }),
+  );
+  // The renewal succeeds, so the stored expiry explains nothing; the quota call
+  // then fails for a reason of its own, and only that reason belongs on screen.
+  const { fetchFn } = routedFetch([
+    ["oauth2.googleapis.com", () => jsonResponse({ access_token: "ya29.RENEWED", expires_in: 3600 })],
+    ["cloudcode", () => jsonResponse({ error: { code: 500, message: "backend error" } }, { status: 500 })],
+  ]);
+
+  const report = await collectQuota({
+    paths: [store],
+    claudeCodePaths: [],
+    now: NOW,
+    fetchFn,
+    families: ["antigravity"],
+    env: { ANTIGRAVITY_CLIENT_ID: "id-fixture", ANTIGRAVITY_CLIENT_SECRET: "secret-fixture" },
+    home,
+    stores: [],
+    allowBrowser: false,
+  });
+
+  const provider = report.providers[0];
+  assert.equal(provider.ok, false);
+  assert.equal(provider.expiresInMin, null);
+  assert.equal(provider.tokenRenewedInMemory, true, "the degraded result carries the renewal");
+  assert.match(provider.error ?? "", /Antigravity quota request failed/);
+  assert.equal(
+    report.warnings.some((warning) => /antigravity: .*expired/.test(warning)),
+    false,
+    "the stored countdown is not the explanation for a failure after a successful renewal",
+  );
+});
+
+test("an Antigravity token that could not be renewed still warns about the stored expiry", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-quota-antigravity-stale-"));
+  const store = join(home, "auth.json");
+  writeFileSync(
+    store,
+    JSON.stringify({
+      antigravity: {
+        type: "oauth",
+        access: "ya29.STALE",
+        refresh: "1//FAKE-google-refresh-for-fixtures-only",
+        projectId: "rising-fixture-project",
+        expires: NOW - 60_000,
+      },
+    }),
+  );
+  const { fetchFn } = routedFetch([
+    ["oauth2.googleapis.com", () => jsonResponse({ error: "invalid_grant" }, { status: 400 })],
+    ["cloudcode", () => jsonResponse({ error: { code: 401, message: "invalid credentials" } }, { status: 401 })],
+  ]);
+
+  const report = await collectQuota({
+    paths: [store],
+    claudeCodePaths: [],
+    now: NOW,
+    fetchFn,
+    families: ["antigravity"],
+    env: { ANTIGRAVITY_CLIENT_ID: "id-fixture", ANTIGRAVITY_CLIENT_SECRET: "secret-fixture" },
+    home,
+    stores: [],
+    allowBrowser: false,
+  });
+
+  const provider = report.providers[0];
+  assert.equal(provider.ok, false);
+  assert.equal(provider.expiresInMin, -1, "nothing was renewed: the stored expiry is the truth");
+  assert.ok(
+    report.warnings.some((warning) => /antigravity: the Pi token expired 1m ago; use that provider in Pi to refresh it/.test(warning)),
+    "the warning must survive a failed renewal",
+  );
+});
+
 test("warnings from parallel provider fetches are deterministically ordered by families", async () => {
   const home = mkdtempSync(join(tmpdir(), "pi-quota-warn-order-"));
   const fetchFn = /** @type {typeof fetch} */ (async (url) => {

@@ -40,7 +40,9 @@ shuvquota, and it never writes to a credential file.
 * Antigravity's access token **may** be refreshed, but only in memory. Google
   does not rotate that refresh token, so Pi's stored copy stays valid. Claude and
   Codex are never refreshed, because they **do** rotate and persisting a rotated
-  token would break Pi.
+  token would break Pi. Every surface reports the token the run *used*: a renewal
+  that succeeded clears the stored "token expired" claim, and only a failed one
+  leaves the expiry (and the warning) on screen.
 * The Claude Code store (`~/.claude/.credentials.json`) is opened read-only too, and
   its refresh token is never even read into memory, so nothing here can rotate a
   token the installed `claude` owns. `~/.claude.json` is read only for the account
@@ -450,6 +452,12 @@ Rp suite) without external network daemons or closed-source intermediaries:
 * **Percentages and Countdown**: `usedPercent` and `remainingPercent` report
   percentages (0..100); `resetsInSec` provides the exact integer seconds until
   reset, immune to local clock skew.
+* **`expiresInMin` and `tokenRenewedInMemory`**: the freshness of the credential the
+  run actually used. Antigravity's token is renewed in memory, so its result
+  carries `tokenRenewedInMemory: true` and `expiresInMin: null` instead of Pi's
+  stale stored countdown; a renewal that failed keeps the stored value, which is
+  what the panel's `token EXPIRED` badge and the warning line describe. The field
+  is only present when a renewal happened.
 * **`notConfigured` vs `ok`**: unconfigured providers report `notConfigured: true`,
   allowing consumers to cleanly omit them without displaying false-positive
   error indicators.
@@ -837,7 +845,7 @@ extensions/quota-panel.ts      Pi TUI line and /usage
 ## Tests
 
 ```bash
-node --test tests/*.test.mjs     # 404 tests, fake tokens only, no network
+node --test tests/*.test.mjs     # 413 tests, fake tokens only, no network
 ```
 
 Modules covered: `auth.json` parsing and de-duplication, the Claude Code store
