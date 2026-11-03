@@ -63,6 +63,59 @@ export function resolveCachePath(options = {}) {
 }
 
 /**
+ * Read the cache envelope, or null when there is not one this version understands.
+ *
+ * @param {string} path
+ * @returns {Record<string, any> | null}
+ */
+function readPayload(path) {
+  let raw;
+  try {
+    raw = readFileSync(path, "utf-8");
+  } catch {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === "object" ? /** @type {Record<string, any>} */ (parsed) : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The fetch time of every family a cached report carries.
+ *
+ * The report is written family by family — the Pi extension repaints and saves
+ * as each one lands — so `savedAt` says when the *last* family was written and
+ * nothing about the others. Judging the whole file by it served Claude's
+ * five-minute-old numbers to a reader a minute later, only because Codex had
+ * just been saved. Each family therefore keeps its own clock. A cache written
+ * before that field existed carries only `savedAt`, and every family falls
+ * back to it.
+ *
+ * @param {Record<string, any>} parsed
+ * @param {string[]} families
+ * @returns {Record<string, number>}
+ */
+function payloadClocks(parsed, families) {
+  const savedAt = typeof parsed.savedAt === "number" && Number.isFinite(parsed.savedAt) ? parsed.savedAt : null;
+  /** @type {Record<string, number>} */
+  const clocks = {};
+  const raw = parsed.fetchedAt;
+  if (raw && typeof raw === "object" && !Array.isArray(raw)) {
+    for (const [family, value] of Object.entries(raw)) {
+      if (typeof value === "number" && Number.isFinite(value)) clocks[family] = value;
+    }
+  }
+  for (const family of families) {
+    if (typeof clocks[family] === "number") continue;
+    if (savedAt !== null) clocks[family] = savedAt;
+  }
+  return clocks;
+}
+
+/**
  * @param {{
  *   path?: string,
  *   ttlMs?: number,
@@ -71,27 +124,20 @@ export function resolveCachePath(options = {}) {
  *   home?: string,
  *   key?: string,       Settings fingerprint; a cached report saved under another key is a miss.
  * }} [options]
- * @returns {{ report: import("./engine.js").PiQuotaReport, ageMs: number, path: string } | null}
+ * @returns {{
+ *   report: import("./engine.js").PiQuotaReport,
+ *   ageMs: number,
+ *   fetchedAt: Record<string, number>,
+ *   path: string,
+ * } | null}
  */
 export function readCache(options = {}) {
   const path = options.path ?? resolveCachePath(options);
   const ttlMs = options.ttlMs ?? DEFAULT_TTL_MS;
   const now = options.now ?? Date.now();
 
-  let raw;
-  try {
-    raw = readFileSync(path, "utf-8");
-  } catch {
-    return null;
-  }
-
-  let parsed;
-  try {
-    parsed = JSON.parse(raw);
-  } catch {
-    return null;
-  }
-  if (!parsed || typeof parsed !== "object") return null;
+  const parsed = readPayload(path);
+  if (!parsed) return null;
   const report = /** @type {{ report?: import("./engine.js").PiQuotaReport }} */ (parsed).report;
   if (!report || !Array.isArray(report.providers)) return null;
 
@@ -99,7 +145,13 @@ export function readCache(options = {}) {
     ? /** @type {number} */ (/** @type {{ savedAt?: number }} */ (parsed).savedAt)
     : null;
   if (savedAt === null) return null;
-  const ageMs = now - savedAt;
+  const families = Array.from(new Set(report.providers.map((provider) => provider.family)));
+  const fetchedAt = payloadClocks(parsed, families);
+  // The oldest family decides the hit: a report is only as fresh as its stalest
+  // part, which is what the single-`savedAt` rule meant before per-family clocks.
+  const ageMs = families.length > 0
+    ? Math.max(...families.map((family) => now - (fetchedAt[family] ?? savedAt)))
+    : now - savedAt;
   if (ageMs > ttlMs) return null;
   // A report collected under other settings (e.g. another Claude source) answers a
   // different question, so it is a miss rather than a stale hit.
@@ -116,7 +168,7 @@ export function readCache(options = {}) {
     }
   }
 
-  return { report, ageMs, path };
+  return { report, ageMs, fetchedAt, path };
 }
 
 /**
@@ -128,24 +180,31 @@ export function readCache(options = {}) {
  *   home?: string,
  *   merge?: boolean,
  *   key?: string,
+ *   fetchedAtMs?: Record<string, number>,  Each family's own fetch time; absent ones are this write's.
  * }} [options]
  * @returns {{ ok: boolean, path: string, error?: string }}
  */
 export function writeCache(report, options = {}) {
   const path = options.path ?? resolveCachePath(options);
   const now = options.now ?? Date.now();
+  const existing = readCache({ ...options, path, ttlMs: Number.POSITIVE_INFINITY });
   let finalReport = report;
-  if (options.merge) {
-    const existing = readCache({ ...options, path, ttlMs: Number.POSITIVE_INFINITY });
-    if (existing?.report) {
-      finalReport = mergeReportIntoCache(existing.report, report);
-    }
+  if (options.merge && existing?.report) {
+    finalReport = mergeReportIntoCache(existing.report, report);
   }
-  const payload = JSON.stringify(
-    options.key === undefined ? { savedAt: now, report: finalReport } : { savedAt: now, key: options.key, report: finalReport },
-    null,
-    2,
-  );
+  const written = new Set((report.providers ?? []).map((provider) => provider.family));
+  const provided = options.fetchedAtMs ?? {};
+  /** @type {Record<string, number>} */
+  const fetchedAt = {};
+  for (const family of new Set((finalReport.providers ?? []).map((provider) => provider.family))) {
+    // A family this write produced was fetched now unless the caller knows a
+    // better time; a family merged in from the cache keeps the clock it had.
+    const own = provided[family];
+    const at = typeof own === "number" && Number.isFinite(own) ? own : (written.has(family) ? now : existing?.fetchedAt?.[family]);
+    fetchedAt[family] = typeof at === "number" && Number.isFinite(at) ? at : now;
+  }
+  const envelope = { savedAt: now, ...(options.key === undefined ? {} : { key: options.key }), fetchedAt, report: finalReport };
+  const payload = JSON.stringify(envelope, null, 2);
 
   try {
     mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
@@ -211,10 +270,16 @@ export function describeCache(options = {}) {
 export async function withCache(options, loader) {
   const requested = options.families;
   if (!options.force) {
-    const hit = readCache(options);
+    // Freshness is decided per family below, so the read must not apply one
+    // TTL to the whole file first.
+    const hit = readCache({ ...options, ttlMs: Number.POSITIVE_INFINITY });
     if (hit) {
-      const allPresent = !requested || requested.every((fam) => fam in hit.report.byFamily);
-      if (allPresent) {
+      const ttlMs = options.ttlMs ?? DEFAULT_TTL_MS;
+      const now = options.now ?? Date.now();
+      const present = new Set(hit.report.providers.map((provider) => provider.family));
+      const wanted = requested ?? Array.from(present);
+      const fresh = wanted.every((family) => present.has(family) && now - (hit.fetchedAt[family] ?? 0) <= ttlMs);
+      if (fresh) {
         const filteredReport = requested
           ? {
               ...hit.report,
@@ -224,7 +289,10 @@ export async function withCache(options, loader) {
               ),
             }
           : hit.report;
-        return { report: filteredReport, cached: true, ageMs: hit.ageMs };
+        const ageMs = wanted.length > 0
+          ? Math.max(...wanted.map((family) => now - (hit.fetchedAt[family] ?? now)))
+          : hit.ageMs;
+        return { report: filteredReport, cached: true, ageMs };
       }
     }
   }

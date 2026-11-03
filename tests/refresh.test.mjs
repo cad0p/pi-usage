@@ -275,19 +275,27 @@ test("the merged report is written back so the CLI surfaces benefit too", async 
   const dir = mkdtempSync(join(tmpdir(), "pi-quota-refresh-"));
   const cachePath = join(dir, "usage.json");
   const statePath = join(dir, "refresh.json");
-  writeRefreshState({ fetchedAtMs: {} }, { statePath });
+  // Claude's copy is inside its 300 s clock, so it is carried, not refetched.
+  writeCache(report(["claude"]), { path: cachePath, now: NOW - 30_000 });
+  writeRefreshState({ fetchedAtMs: { claude: NOW - 30_000 } }, { statePath });
 
   await collectWithCadence({
     families: ALL,
     cachePath,
     statePath,
     now: NOW,
+    ttls: resolveFamilyTtls({ defaultTtlSec: 60 }),
     loader: async (families) => report(families),
   });
 
   const written = JSON.parse(readFileSync(cachePath, "utf-8"));
   assert.equal(written.savedAt, NOW);
   assert.deepEqual(written.report.providers.map((p) => p.family), ALL);
+  // The cache carries the clocks this layer decided on: a reader that only sees
+  // the cache must not think the carried family was fetched just now.
+  assert.equal(written.fetchedAt.claude, NOW - 30_000, "the carried family keeps its own fetch time");
+  assert.equal(written.fetchedAt.codex, NOW, "the fetched ones are stamped with this run");
+  assert.equal(written.fetchedAt["opencode-go"], NOW);
 });
 
 test("an empty cache fetches everything in one call", async () => {

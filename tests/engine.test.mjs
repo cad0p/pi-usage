@@ -259,6 +259,56 @@ test("cache round-trips, respects the TTL and stores no secrets", async () => {
   assert.equal(readCache({ path }), null);
 });
 
+test("the cache judges each family by its own fetch time", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "pi-quota-cache-clocks-"));
+  const path = join(directory, "usage.json");
+  const { fetchFn } = fullRoutes();
+  const report = await collectQuota({ paths: [FIXTURE], claudeCodePaths: [], now: NOW, fetchFn, env: {}, stores: [], allowBrowser: false });
+
+  // The Pi extension writes the report family by family: Claude was fetched
+  // 200 s before the rest, and the file itself was written a moment ago.
+  assert.equal(
+    writeCache(report, {
+      path,
+      now: NOW,
+      fetchedAtMs: { claude: NOW - 200_000, codex: NOW, antigravity: NOW, "opencode-go": NOW },
+    }).ok,
+    true,
+  );
+  const hit = readCache({ path, now: NOW + 5_000, ttlMs: Number.POSITIVE_INFINITY });
+  assert.ok(hit);
+  assert.equal(hit.fetchedAt.claude, NOW - 200_000, "a family's own clock is kept");
+  assert.equal(hit.ageMs, 205_000, "the report is as old as its oldest family");
+  assert.equal(readCache({ path, now: NOW + 5_000, ttlMs: 60_000 }), null, "and one stale family expires the whole-file read");
+
+  let loads = 0;
+  const loader = async () => {
+    loads += 1;
+    return report;
+  };
+  const codex = await withCache({ path, now: NOW + 5_000, ttlMs: 60_000, families: ["codex"] }, loader);
+  assert.equal(codex.cached, true, "a family inside its own TTL is served");
+  assert.equal(loads, 0);
+
+  const claude = await withCache({ path, now: NOW + 5_000, ttlMs: 60_000, families: ["claude"] }, loader);
+  assert.equal(claude.cached, false, "Claude's 200 s old copy is not a 60 s answer, however new the file is");
+  assert.equal(loads, 1);
+});
+
+test("a cache written before per-family clocks is still aged by its savedAt", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "pi-quota-cache-legacy-"));
+  const path = join(directory, "usage.json");
+  const { fetchFn } = fullRoutes();
+  const report = await collectQuota({ paths: [FIXTURE], claudeCodePaths: [], now: NOW, fetchFn, env: {}, stores: [], allowBrowser: false });
+
+  writeFileSync(path, JSON.stringify({ savedAt: NOW, report }, null, 2), "utf-8");
+  const hit = readCache({ path, now: NOW + 5_000, ttlMs: 60_000 });
+  assert.ok(hit, "an old file is still readable");
+  assert.equal(hit.fetchedAt.claude, NOW, "every family falls back to savedAt");
+  assert.equal(hit.fetchedAt["opencode-go"], NOW);
+  assert.equal(readCache({ path, now: NOW + 61_000, ttlMs: 60_000 }), null, "and it still expires as a whole");
+});
+
 test("withCache refreshes once and then serves the cached copy", async () => {
   const directory = mkdtempSync(join(tmpdir(), "pi-quota-cache-"));
   const path = join(directory, "usage.json");

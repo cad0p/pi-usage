@@ -2309,7 +2309,10 @@ export default function quotaPanelExtension(pi: ExtensionAPI, dependencies: Exte
 
   function persistReport(): void {
     if (!report) return;
-    writeCache(report as any, { key: PI_QUOTA_CACHE_KEY });
+    // Every family keeps the clock it was fetched on: this report is written one
+    // family at a time, and stamping the whole file with "now" made Claude's
+    // five-minute-old numbers look as fresh as the Codex ones saved beside them.
+    writeCache(report as any, { key: PI_QUOTA_CACHE_KEY, fetchedAtMs: readRefreshState().fetchedAtMs });
   }
 
   function updateFamilyClock(family: string): void {

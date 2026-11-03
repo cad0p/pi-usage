@@ -67,7 +67,7 @@ shuvquota, and it never writes to a credential file.
 
   | Path | What |
   | --- | --- |
-  | `~/.cache/pi-quota/usage.json` | the report cache |
+  | `~/.cache/pi-quota/usage.json` | the report cache, with each family's own fetch time |
   | `~/.cache/pi-quota/local-sessions.json` | per-session-file offsets and open token days |
   | `${PI_CODING_AGENT_DIR:-~/.pi/agent}/pi-usage/totals.json`, `tokens-YYYY-MM.json` | frozen token history, plus `.corrupt-<ts>` backups for corrupt files |
   | `~/.cache/pi-quota/refresh-state.json` | each family's own refresh clock |
@@ -856,7 +856,7 @@ extensions/quota-panel.ts      Pi TUI line and /usage
 ## Tests
 
 ```bash
-node --test tests/*.test.mjs     # 432 tests, fake tokens only, no network
+node --test tests/*.test.mjs     # 435 tests, fake tokens only, no network
 ```
 
 Modules covered: `auth.json` parsing and de-duplication, the Claude Code store

@@ -14,6 +14,8 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 
+import { readCache, withCache, writeCache } from "../src/cache.js";
+import { writeRefreshState } from "../src/refresh.js";
 import { mergeLastGood } from "../src/sticky.js";
 
 const EXTENSION = new URL("./extension-test-entry.mjs", import.meta.url).href;
@@ -1627,6 +1629,41 @@ test("the scan's own warnings reach the report the surfaces read", async () => {
 
   const panel = plain(renderWidget(harness.widgets.at(-1)).join("\n"));
   assert.match(panel, /warn: local token stats: could not read/, "the scan's notes are part of the report");
+});
+
+test("a partial refresh keeps every family's own fetch time in the cache", async () => {
+  const module = await import(EXTENSION);
+  const harness = makeHarness({ report: overlayReport() });
+  const cachePath = join(harness.cacheHome, "pi-quota", "usage.json");
+  const T = Date.now();
+  // Claude was fetched 50 s ago: inside its 300 s clock, outside the CLI's 60 s
+  // one. Codex's clock is 70 s old, so this refresh fetches Codex alone and
+  // writes the cache again.
+  const clocks = { claude: T - 50_000, codex: T - 70_000, antigravity: T - 50_000, "opencode-go": T - 50_000 };
+  writeCache(withFamilies(overlayReport()), { path: cachePath, now: T, fetchedAtMs: clocks });
+  writeRefreshState({ fetchedAtMs: clocks });
+
+  module.default(harness.pi);
+  await startSession(harness, null);
+  await harness.commands.find((command) => command.name === "usage").definition.handler("panel", harness.ctx);
+  await settle();
+
+  const cached = readCache({ path: cachePath, ttlMs: Number.POSITIVE_INFINITY });
+  assert.ok(cached);
+  assert.equal(cached.fetchedAt.claude, T - 50_000, "Claude's clock is not restamped by Codex's write");
+  assert.ok(cached.fetchedAt.codex >= T, "the family that was fetched carries this run's time");
+
+  // What the terminal sees: 60 s later, Claude's copy is too old and Codex's is not.
+  let loads = 0;
+  const loader = async () => {
+    loads += 1;
+    return withFamilies(overlayReport());
+  };
+  const later = T + 10_000;
+  await withCache({ path: cachePath, now: later, ttlMs: 55_000, key: "claude-source:auto", families: ["claude"] }, loader);
+  assert.equal(loads, 1, "piquota --json must not serve a 60 s old Claude as fresh");
+  await withCache({ path: cachePath, now: later, ttlMs: 55_000, key: "claude-source:auto", families: ["codex"] }, loader);
+  assert.equal(loads, 1, "while Codex's copy, written by this run, still answers");
 });
 
 test("subcommands toggle the line, the panel, the footer and hide everything", async () => {
