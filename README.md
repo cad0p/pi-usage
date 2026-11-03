@@ -282,7 +282,9 @@ memory is empty. It never waits for network work before the first frame. Opening
 default; Claude's 300-second throttle-safe interval is preserved); `r` forces
 all enabled families. Families run independently and repaint as they finish. A
 failed refresh is a line in the view, never a thrown error. The local session
-scan runs in a Node worker thread, not on the TUI event loop. Every provider is a section:
+scan runs in a Node worker thread, not on the TUI event loop, and a shutdown or
+`/reload` stops it mid-scan: it releases its history lock and writes nothing.
+Every provider is a section:
 the header is the brand-coloured name line, the body lists every window with its
 used-fraction bar, reset countdown and the token rows for today, the last seven
 days, the prompts and the heaviest models. All sections start expanded; the fold
@@ -854,7 +856,7 @@ extensions/quota-panel.ts      Pi TUI line and /usage
 ## Tests
 
 ```bash
-node --test tests/*.test.mjs     # 425 tests, fake tokens only, no network
+node --test tests/*.test.mjs     # 430 tests, fake tokens only, no network
 ```
 
 Modules covered: `auth.json` parsing and de-duplication, the Claude Code store

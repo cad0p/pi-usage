@@ -145,7 +145,21 @@ const RECENT_DAYS = 7;
  * @property {number} [now]            Report time; decides which local day is "today".
  * @property {number} [budgetMs]       Wall-clock budget for this scan.
  * @property {() => number} [clock]    Time source; tests inject one to drive the budget.
+ * @property {() => boolean} [shouldStop] The host wants the scan to end now (session shutdown, /reload).
+ * @property {(lock: { path: string, token: string | null }) => void} [onLock] Receives the lock
+ *   this scan holds, so a host that has to kill the worker can still release it.
  */
+
+/**
+ * The host asked the scan to stop. Thrown out of the scan loop so the `finally`
+ * releases the history lock and nothing after the interruption is written.
+ */
+export class LocalScanAbortedError extends Error {
+  constructor() {
+    super("local token stats scan stopped");
+    this.name = "LocalScanAbortedError";
+  }
+}
 
 /**
  * One session file's cache entry.
@@ -1135,6 +1149,10 @@ export function buildLocalStats(input = {}) {
  * }>}
  */export async function collectLocalStats(options = {}) {
   const clock = options.clock ?? Date.now;
+  const hostStopped = options.shouldStop;
+  const stopNow = () => {
+    if (hostStopped?.() === true) throw new LocalScanAbortedError();
+  };
   const startedAt = clock();
   const now = options.now ?? Date.now();
   const today = localDayKey(now);
@@ -1164,6 +1182,9 @@ export function buildLocalStats(input = {}) {
   // delta twice. A run that cannot take it still answers, from what is on disk.
   const lockPath = `${cachePath}.lock`;
   const lock = acquireHistoryLock({ lockPath, now: clock() });
+  // The host gets the token, not just the path: whoever releases this lock must
+  // prove it is this scan's, never another run's.
+  if (lock.acquired) options.onLock?.({ path: lock.path, token: lock.token });
   if (!lock.acquired) {
     // Read-only path: `canWrite: false` keeps it from rebuilding or repairing
     // anything the run that does hold the lock is writing right now.
@@ -1277,6 +1298,7 @@ export function buildLocalStats(input = {}) {
     };
 
     for (const path of listen) {
+      stopNow();
       if (!keepLock()) break;
       if (!partial && overBudget()) partial = true;
       if (partial) break;
@@ -1373,7 +1395,7 @@ export function buildLocalStats(input = {}) {
           startOffset,
           days,
           now,
-          shouldStop: overBudget,
+          shouldStop: () => overBudget() || hostStopped?.() === true,
           onUsage: (usage) => {
             if (lastFrozenDay && usage.day <= lastFrozenDay) {
               // Frozen days are never reconstructed on a rescan. Incremental
@@ -1464,6 +1486,11 @@ export function buildLocalStats(input = {}) {
         },
       };
     }
+
+    // A stop that arrived while the last file was being read has to end the run
+    // here: freezing days and writing the cache are the writes a shutdown must
+    // not race. Everything before this point is undoable read-only work.
+    stopNow();
 
     const openRows = buildOpenRows(next);
     const pendingBeforeApply = pendingLate.size;

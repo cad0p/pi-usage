@@ -154,6 +154,23 @@ function withFamilies(report) {
   };
 }
 
+/**
+ * A local-stats scan handle shaped like the one `startLocalStatsWorker` returns.
+ * Tests drive its result directly; `stop` is recorded so the lifecycle is
+ * observable without a real worker thread.
+ */
+function scanHandle(result, { stop } = {}) {
+  const handle = {
+    result: result instanceof Error ? Promise.reject(result) : Promise.resolve(result),
+    stopped: 0,
+    stop: async () => {
+      handle.stopped += 1;
+      if (stop) await stop();
+    },
+  };
+  return handle;
+}
+
 function makeHarness(options = {}) {
   const commands = [];
   const handlers = new Map();
@@ -169,7 +186,7 @@ function makeHarness(options = {}) {
       const current = withFamilies(options.report ?? REPORT);
       return { ...current, localStats: current.localStats ?? {}, localStatsMeta: current.localStatsMeta ?? null };
     }),
-    collectLocalStats: options.collectLocalStats ?? (async () => ({ byFamily: options.report?.localStats ?? {}, warnings: [], scan: options.report?.localStatsMeta ?? { partial: false } })),
+    startLocalStats: options.startLocalStats ?? (() => scanHandle({ byFamily: options.report?.localStats ?? {}, warnings: [], scan: options.report?.localStatsMeta ?? { partial: false } })),
     getProviderAuth: options.getProviderAuth ?? (async () => undefined),
     loadHistory: options.loadHistory ?? (async (month) => historyPayload(month ?? "2030-01", [month ?? "2030-01"])),
     publishOmarchy: options.publishOmarchy ?? (() => {}),
@@ -1559,9 +1576,9 @@ test("PI_QUOTA_LOCAL_STATS=0 disables the extension's worker scan", async () => 
   try {
     let scans = 0;
     const harness = makeHarness({ report: overlayReport() });
-    harness.dependencies.collectLocalStats = async () => {
+    harness.dependencies.startLocalStats = () => {
       scans += 1;
-      return { byFamily: {}, warnings: [], scan: { partial: false } };
+      return scanHandle({ byFamily: {}, warnings: [], scan: { partial: false } });
     };
     module.default(harness.pi);
     await harness.commands.find((command) => command.name === "usage").definition.handler("refresh", harness.ctx);
@@ -1619,6 +1636,40 @@ test("session_shutdown clears both the footer and the widget", async () => {
 
   assert.equal(harness.statuses.at(-1), undefined);
   assert.equal(harness.widgets.at(-1), undefined);
+});
+
+test("session_shutdown stops the local scan instead of letting it run on", async () => {
+  const module = await import(EXTENSION);
+  const harness = makeHarness({ report: overlayReport() });
+  let stopped = false;
+  let finishScan;
+  let handle = null;
+  harness.dependencies.startLocalStats = () => {
+    handle = {
+      // A cold scan is still running when the session ends; that is the case a
+      // shutdown has to end, so the handle stays pending until it is told to stop.
+      result: new Promise((resolve) => {
+        finishScan = () => resolve({ byFamily: {}, warnings: [], scan: { partial: false } });
+      }),
+      stopped: 0,
+      stop: async () => {
+        handle.stopped += 1;
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        stopped = true;
+        finishScan();
+      },
+    };
+    return handle;
+  };
+  module.default(harness.pi);
+  await startSession(harness, null);
+  await harness.commands.find((command) => command.name === "usage").definition.handler("refresh", harness.ctx);
+  assert.ok(handle, "the refresh started the scan");
+
+  await harness.handlers.get("session_shutdown")({}, harness.ctx);
+
+  assert.equal(handle.stopped, 1, "the scan is told to stop, not left to finish in a dead session");
+  assert.equal(stopped, true, "Pi awaits session_shutdown (it is how /reload and /quit end a session), so the stop finished first");
 });
 
 test("the line stays compact enough to fit one row", async () => {

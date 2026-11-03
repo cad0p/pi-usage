@@ -34,7 +34,7 @@ import { mergeReportIntoCache, writeCache } from "../src/cache.js";
 import { normalizeClaudeSourceMode, collectFamily, enabledFamilies, FAMILIES } from "../src/engine.js";
 import { historyJson } from "../src/cli/commands/stats.js";
 import { resolveHistoryDir } from "../src/local/history.js";
-import { collectLocalStatsInWorker } from "../src/local/worker.js";
+import { startLocalStatsWorker } from "../src/local/worker.js";
 import { publishRecords } from "../src/omarchy/publish.js";
 import { buildRecords } from "../src/omarchy/record.js";
 import { skippedFamilies } from "../src/cli/commands/omarchy.js";
@@ -135,9 +135,19 @@ type Theme = {
   bg?: (key: string, text: string) => string;
 };
 
+/**
+ * One running local token scan. It is a handle, not a promise, because the scan
+ * can outlive the session that started it: a shutdown has to be able to end it
+ * and have its lock and cache left clean.
+ */
+type LocalStatsScan = {
+  result: Promise<{ byFamily: Record<string, LocalFamilyStats>; warnings: string[]; scan: { partial?: boolean } | null }>;
+  stop: () => Promise<void>;
+};
+
 type ExtensionDependencies = {
   collectFamily?: typeof collectFamily;
-  collectLocalStats?: typeof collectLocalStatsInWorker;
+  startLocalStats?: () => LocalStatsScan;
   getProviderAuth?: (ctx: UiContext, provider: string) => Promise<{ auth?: { apiKey?: string }; accountId?: string; source?: string } | undefined>;
   loadHistory?: (month: string | null) => Promise<HistoryPayload> | HistoryPayload;
   publishOmarchy?: (report: QuotaReport, prune: boolean) => void;
@@ -2152,7 +2162,7 @@ export class UsageOverlay {
 
 export default function quotaPanelExtension(pi: ExtensionAPI, dependencies: ExtensionDependencies = {}): void {
   const loadFamily = dependencies.collectFamily ?? collectFamily;
-  const scanLocalStats = dependencies.collectLocalStats ?? collectLocalStatsInWorker;
+  const startScan = dependencies.startLocalStats ?? (() => startLocalStatsWorker() as LocalStatsScan);
   const getProviderAuth = dependencies.getProviderAuth ?? (async (ctx, provider) => ctx.modelRegistry?.getProviderAuth?.(provider));
   const readHistory = (month: string | null) => dependencies.loadHistory
     ? dependencies.loadHistory(month)
@@ -2169,7 +2179,8 @@ export default function quotaPanelExtension(pi: ExtensionAPI, dependencies: Exte
   let resultGeneration = 0;
   let prunedGeneration = 0;
   let localStatsInFlight: Promise<void> | null = null;
-  let localStatsResult: Awaited<ReturnType<typeof collectLocalStatsInWorker>> | null = null;
+  let localStatsScan: LocalStatsScan | null = null;
+  let localStatsResult: Awaited<LocalStatsScan["result"]> | null = null;
   let timer: ReturnType<typeof setInterval> | null = null;
   let agentEndTimer: ReturnType<typeof setTimeout> | null = null;
   let panelVisible = false;
@@ -2288,7 +2299,9 @@ export default function quotaPanelExtension(pi: ExtensionAPI, dependencies: Exte
 
   function startLocalStats(ctx: UiContext): void {
     if (process.env.PI_QUOTA_LOCAL_STATS === "0" || localStatsInFlight) return;
-    const task = scanLocalStats()
+    const scan = startScan();
+    localStatsScan = scan;
+    const task = scan.result
       .then((result) => {
         if (disposed) return;
         localStatsResult = result;
@@ -2308,9 +2321,23 @@ export default function quotaPanelExtension(pi: ExtensionAPI, dependencies: Exte
         // The scan is optional; a worker failure never delays or erases quotas.
       })
       .finally(() => {
+        if (localStatsScan === scan) localStatsScan = null;
         if (localStatsInFlight === task) localStatsInFlight = null;
       });
     localStatsInFlight = task;
+  }
+
+  /**
+   * End the local scan this session started. Nothing it began may outlive the
+   * session: a /quit or /reload one second into a cold scan would otherwise
+   * keep reading the session store and hold the token-history lock until the
+   * 120 s stale timeout, making the next scan read-only.
+   */
+  async function stopLocalStats(): Promise<void> {
+    const scan = localStatsScan;
+    localStatsScan = null;
+    if (!scan) return;
+    await scan.stop();
   }
 
   async function refreshFamily(ctx: UiContext, family: string, force: boolean): Promise<boolean> {
@@ -2601,6 +2628,9 @@ export default function quotaPanelExtension(pi: ExtensionAPI, dependencies: Exte
       ui.ui.setStatus(STATUS_KEY, undefined);
       ui.ui.setWidget(WIDGET_KEY, undefined);
     }
+    // Pi awaits session_shutdown (reason "reload" included), so the scan is gone
+    // and its lock released before the next session or the process starts.
+    await stopLocalStats();
   });
 
   /**
