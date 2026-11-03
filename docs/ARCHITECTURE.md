@@ -97,6 +97,7 @@ Any modification to this codebase MUST uphold these non-negotiable guarantees:
    - Never compare raw escape strings in key handling. `data === "\u001b"` is the bug behind issue #33: a terminal that negotiates the kitty keyboard protocol sends `Esc` as `\x1b[27u`, so every raw comparison silently stopped matching.
    - Key handling answers both encodings: the legacy escape sequences and the kitty keyboard protocol's CSI sequences, including CSI-u printables and shifted letters, with and without the modifier field. A key release must never act as a press; a repeat is a press, because a legacy terminal's OS repeat is byte-identical to the first press.
    - Every key in a legend gets a table test with a legacy row, a kitty press row and a kitty release row, plus a kitty repeat row where repeats act. The unit table and the overlay tests must both carry those rows.
+   - The local equivalent is guarded against drift by `tests/pi-tui-drift.test.mjs`: it loads pi-tui from the host when one is installed (and skips in CI, which installs nothing) and compares both decoders over a generated encoding table for every legend key, with the kitty protocol flag on and off. Every disagreement must be an allowlist entry with a one-line reason, and a stale entry fails, so a pi-tui change surfaces as a test failure instead of a dead key.
 
 ## Code Conventions
 
