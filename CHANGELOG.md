@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## [calver-released]
+## [0.11.6] - 2026-11-03
 
 <!-- USER-EDITABLE SECTION START -->
 `/usage` refreshes inside pi with no CLI child, each provider on its own, and every key works under the kitty keyboard protocol.
