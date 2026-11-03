@@ -129,6 +129,24 @@ test("a refresh sends the client the caller's environment names", async () => {
   assert.equal(sent.get("client_secret"), "secret-env");
 });
 
+test("refreshAccessToken uses the same sourcePath as the client description", async () => {
+  const fixture = fakePiAntigravity();
+  let sent = "";
+  const { fetchFn } = routedFetch([[
+    "oauth2.googleapis.com",
+    (_url, init) => {
+      sent = String(init.body);
+      return jsonResponse({ access_token: "ya29.source-path", expires_in: 3600 });
+    },
+  ]]);
+  const result = await refreshAccessToken("1//refresh", { sourcePath: fixture.path, fetchFn });
+  assert.equal("error" in result, false);
+  const body = new URLSearchParams(sent);
+  assert.equal(body.get("client_id"), fixture.clientId);
+  assert.equal(body.get("client_secret"), fixture.clientSecret);
+  assert.match(describeOAuthClient({ env: {}, sourcePath: fixture.path }), /read from the installed pi-antigravity package/);
+});
+
 test("a failed refresh reports an error instead of throwing", async () => {
   const { fetchFn } = routedFetch([["oauth2.googleapis.com", () => jsonResponse({ error: "invalid_grant" }, { status: 400 })]]);
   const result = await refreshAccessToken("1//refresh", { client: { clientId: "id", clientSecret: "secret" }, fetchFn });
@@ -136,6 +154,32 @@ test("a failed refresh reports an error instead of throwing", async () => {
   assert.match(/** @type {{ error: string }} */ (result).error, /token refresh failed/);
 
   assert.equal("error" in (await refreshAccessToken("", { fetchFn })), true);
+});
+
+test("an in-memory Antigravity renewal is reused across account objects", async () => {
+  const now = 1_800_000_000_000;
+  const { fetchFn, calls } = routedFetch([[
+    "oauth2.googleapis.com",
+    () => jsonResponse({ access_token: "ya29.process-cached", expires_in: 3600 }),
+  ]]);
+  const first = { access: "ya29.stored", refresh: "1//same", expiresAtMs: 1 };
+  const refreshed = await ensureFreshAccessToken(first, {
+    fetchFn,
+    now,
+    cacheKey: "antigravity-fixture-account",
+    client: { clientId: "id", clientSecret: "secret" },
+  });
+  const second = { access: "ya29.stored-again", refresh: "1//same", expiresAtMs: 1 };
+  const reused = await ensureFreshAccessToken(second, {
+    fetchFn,
+    now: now + 1_000,
+    cacheKey: "antigravity-fixture-account",
+    client: { clientId: "id", clientSecret: "secret" },
+  });
+  assert.equal(refreshed.refreshed, true);
+  assert.equal(reused.refreshed, true);
+  assert.equal(second.access, "ya29.process-cached");
+  assert.equal(calls.length, 1, "the process cache avoids a second token request");
 });
 
 test("ensureFreshAccessToken mutates the in-memory account only", async () => {

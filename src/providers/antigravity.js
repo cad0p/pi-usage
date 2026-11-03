@@ -11,8 +11,8 @@
  * Response shape: `groups[].buckets[]` with
  * `{ bucketId, displayName, window, resetTime, remainingFraction, description }`.
  *
- * Google does not rotate this refresh token, but Pi owns the credential and this
- * project is read-only, so no refresh is performed here either.
+ * Google does not rotate this refresh token, so an expired access token may be
+ * renewed in memory. The renewed value is cached only for this process lifetime.
  */
 
 import { buildWindow, clampPercent, degradedResult, displayIdentity, finiteNumber, identityKind, stringValue, windowFromName } from "../model.js";
@@ -158,6 +158,7 @@ export async function fetchQuota(credential, options = {}) {
     now,
     enabled: options.refresh,
     env: options.env,
+    cacheKey: `${credential.source}\\u0000${credential.identity}`,
   });
   // `expiresInMin` arrives from the engine as the freshness of the *stored*
   // credential, and that is only the truth about this run when the refresh

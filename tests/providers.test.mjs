@@ -156,7 +156,7 @@ test("antigravity: a renewal that failed keeps the credential's expiry warning",
     refresh: "1//FAKE",
     projectId: "rising-fixture-project",
     expires: 1_700_000_000_000,
-  }, "/tmp/auth.json");
+  }, "/tmp/auth-expired-no-renewal.json");
   assert.ok(credential);
 
   const result = await fetchAntigravity(credential, {
