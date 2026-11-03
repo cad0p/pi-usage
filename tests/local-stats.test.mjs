@@ -686,7 +686,7 @@ test("a copy chain resolves to its root, so deleting a middle copy changes nothi
   assert.equal(root.byFamily.claude.todayPrompts, 2, "with the root gone the copy is adopted, once");
 });
 
-test("an unreadable month file never shrinks the rollup permanently", async (t) => {
+test("an unreadable month never causes a reduced totals.json write", async (t) => {
   if (process.getuid?.() === 0) {
     t.skip("permissions are not enforced for root");
     return;
@@ -697,30 +697,119 @@ test("an unreadable month file never shrinks the rollup permanently", async (t) 
     assistantLine({ ts: tsForDay(-1), usage: { input: 1_000, output: 0, cacheRead: 0, cacheWrite: 0 } }),
   ]);
   await scan(tree);
-  const complete = totalsOf(tree);
+  assert.equal(totalsOf(tree).families.claude.totalPrompts, 2);
   const september = resolveMonthPath(tree.historyDir, "2026-09");
-  assert.equal(complete.families.claude.totalPrompts, 2);
 
-  // A permission error is temporary: the days it holds must not be dropped from
-  // the rollup just because the file could not be read once (finding N9).
+  // If the rollup is lost while a month is unreadable, rebuilding from the
+  // readable subset would permanently drop that month's frozen counts (N9).
   chmodSync(september, 0o000);
   rmSync(tree.totalsPath, { force: true });
   try {
     const blocked = await scan(tree);
     assert.ok(blocked.warnings.some((warning) => warning.includes("could not be read")), blocked.warnings.join(" | "));
-    const partial = totalsOf(tree);
-    assert.deepEqual(partial.incompleteMonths, ["2026-09"], "the rollup says which month it is missing");
-    assert.equal(partial.families.claude.totalPrompts, 1, "only the readable day is in it");
-    assert.equal(blocked.scan.frozenDays, 0, "nothing is frozen while the history is incomplete");
+    assert.equal(existsSync(tree.totalsPath), false, "no reduced totals.json is written");
+    assert.equal(blocked.scan.frozenDays, 0);
   } finally {
     chmodSync(september, 0o600);
   }
 
   const healed = await scan(tree);
-  assert.equal(totalsOf(tree).incompleteMonths, undefined, "a readable month heals the rollup by itself");
   assert.equal(totalsOf(tree).families.claude.totalPrompts, 2);
-  assert.equal(totalsOf(tree).lastFrozenDay, complete.lastFrozenDay);
   assert.equal(healed.byFamily.claude.totalPrompts, 2);
+});
+
+test("an unreadable in-window month keeps its open day cached and does not rescan repeatedly", async (t) => {
+  if (process.getuid?.() === 0) {
+    t.skip("permissions are not enforced for root");
+    return;
+  }
+  const tree = tempTree();
+  const frozenRows = {
+    claude: {
+      sessions: 1,
+      slots: { "": { sessions: 1, models: { m1: { input: 100, output: 0, cacheRead: 0, cacheWrite: 0, messages: 1 } } } },
+    },
+  };
+  const baseline = emptyTotals();
+  applyDayToTotals(baseline, "2026-10-31", frozenRows);
+  baseline.lastFrozenDay = "2026-10-31";
+  writeJsonAtomic(resolveMonthPath(tree.historyDir, "2026-10"), {
+    schemaVersion: 1,
+    month: "2026-10",
+    days: { "2026-10-31": frozenRows },
+  });
+  writeJsonAtomic(tree.totalsPath, totalsToJson(baseline));
+  const november = resolveMonthPath(tree.historyDir, MONTH);
+  writeJsonAtomic(november, { schemaVersion: 1, month: MONTH, days: {} });
+  const before = readFileSync(tree.totalsPath, "utf-8");
+  const session = writeSession(tree.sessions, "a.jsonl", [
+    assistantLine({ ts: tsForDay(-1), usage: { input: 300, output: 0, cacheRead: 0, cacheWrite: 0 } }),
+    assistantLine({ ts: tsForDay(0), usage: { input: 400, output: 0, cacheRead: 0, cacheWrite: 0 } }),
+  ]);
+
+  chmodSync(november, 0o000);
+  try {
+    const first = await scan(tree);
+    assert.equal(first.scan.scanned, 1);
+    assert.equal(first.scan.frozenDays, 0);
+    assert.ok(first.warnings.some((warning) => warning.includes("could not read")), first.warnings.join(" | "));
+    assert.equal(readFileSync(tree.totalsPath, "utf-8"), before, "the existing rollup stays byte-identical");
+    const day = localDayKey(Date.parse(tsForDay(-1)));
+    assert.ok(readJson(tree.cachePath).files[session].days[day], "the closed day remains open in the cache");
+
+    const repeated = await scan(tree);
+    assert.equal(repeated.scan.scanned, 0, "an unreadable window month does not force a full-store rescan");
+    assert.equal(repeated.scan.frozenDays, 0);
+    assert.equal(readFileSync(tree.totalsPath, "utf-8"), before);
+    assert.ok(readJson(tree.cachePath).files[session].days[day]);
+  } finally {
+    chmodSync(november, 0o600);
+  }
+
+  const readable = await scan(tree);
+  assert.equal(readable.scan.scanned, 0, "the cached day freezes when the month becomes readable");
+  assert.equal(readable.scan.frozenDays, 1);
+  assert.equal(totalsOf(tree).families.claude.totalPrompts, 2);
+  assert.equal(monthOf(tree).days[localDayKey(Date.parse(tsForDay(-1)))].claude.slots[""].models["claude-opus-5-5"].messages, 1);
+});
+
+test("late writes wait in cache while their month is unreadable and apply once readable", async (t) => {
+  if (process.getuid?.() === 0) {
+    t.skip("permissions are not enforced for root");
+    return;
+  }
+  const tree = tempTree();
+  const session = writeSession(tree.sessions, "a.jsonl", [
+    assistantLine({ ts: tsForDay(-1), usage: { input: 100, output: 0, cacheRead: 0, cacheWrite: 0 } }),
+    assistantLine({ ts: tsForDay(0), usage: { input: 100, output: 0, cacheRead: 0, cacheWrite: 0 } }),
+  ]);
+  await scan(tree);
+  const frozenTotals = readFileSync(tree.totalsPath, "utf-8");
+  const month = resolveMonthPath(tree.historyDir, MONTH);
+  chmodSync(month, 0o000);
+  try {
+    appendSession(session, [assistantLine({ ts: tsForDay(-1), usage: { input: 200, output: 0, cacheRead: 0, cacheWrite: 0 } })]);
+    const blocked = await scan(tree);
+    assert.equal(blocked.scan.scanned, 1);
+    assert.equal(readFileSync(tree.totalsPath, "utf-8"), frozenTotals);
+    const day = localDayKey(Date.parse(tsForDay(-1)));
+    assert.ok(readJson(tree.cachePath).pendingLate[day], "the unapplied late delta is retained in the cache");
+
+    const repeated = await scan(tree);
+    assert.equal(repeated.scan.scanned, 0, "the pending delta is retried without rescanning sessions");
+    assert.equal(readFileSync(tree.totalsPath, "utf-8"), frozenTotals);
+  } finally {
+    chmodSync(month, 0o600);
+  }
+
+  await scan(tree);
+  assert.equal(totalsOf(tree).families.claude.totalPrompts, 2);
+  assert.equal(totalsOf(tree).families.claude.totalSessions, 1);
+  assert.equal(monthOf(tree).days[localDayKey(Date.parse(tsForDay(-1)))].claude.slots[""].models["claude-opus-5-5"].messages, 2);
+  assert.equal(readJson(tree.cachePath).pendingLate, undefined);
+  const healed = totalsOf(tree);
+  await scan(tree);
+  assert.deepEqual(totalsOf(tree), healed, "a late delta is not applied twice");
 });
 
 test("a read-only reader never repairs a corrupt month file", async () => {
@@ -756,24 +845,45 @@ test("a quarantined month says what was lost and where the copy is", async () =>
   ]);
   await scan(tree);
   const month = resolveMonthPath(tree.historyDir, MONTH);
+  const totalsBefore = readFileSync(tree.totalsPath, "utf-8");
   writeFileSync(month, "{truncated", "utf-8");
 
   const result = await scan(tree);
   const warning = result.warnings.find((entry) => entry.includes("corrupt or from another version"));
   assert.ok(warning, result.warnings.join(" | "));
   assert.match(warning, new RegExp(resolveMonthPath(tree.historyDir, MONTH).replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
-  assert.match(warning, /\.corrupt-<timestamp>/, "the copy is named so it can be restored");
+  assert.match(warning, /\.corrupt-\d+/, "the copy is named so it can be restored");
   assert.ok(readdirSync(tree.historyDir).some((name) => name.includes(".corrupt-")));
-  // The day whose session file still exists is re-frozen from disk, so the
-  // window and the rollup agree instead of drifting apart.
-  assert.equal(result.byFamily.claude.recentDays.at(-2).messageCount, 400);
+  // Frozen details are not reconstructed from surviving sessions.
+  assert.equal(result.byFamily.claude.recentDays.at(-2).messageCount, 0);
   assert.equal(result.byFamily.claude.totalPrompts, 2, "the rollup still counts the rebuilt day, plus today");
   assert.equal(totalsOf(tree).families.claude.totalPrompts, 1, "the rollup holds the frozen day only, never today");
-  // The day's daily detail is back in a month file, so the next run's window
-  // does not need the repair pass again.
   assert.equal(result.scan.frozenDays, 0);
-  assert.ok(existsSync(resolveMonthPath(tree.historyDir, MONTH)));
-  assert.equal(monthOf(tree).days[localDayKey(Date.parse(tsForDay(-1)))].claude.slots[""].models["claude-opus-5-5"].input, 400);
+  assert.equal(existsSync(resolveMonthPath(tree.historyDir, MONTH)), false, "the quarantined month is not recreated");
+  assert.equal(readFileSync(tree.totalsPath, "utf-8"), totalsBefore, "the rollup is unchanged");
+});
+
+test("a deleted session cannot shrink a quarantined frozen day or a totals rebuild", async () => {
+  const tree = tempTree();
+  writeSession(tree.sessions, "a.jsonl", [assistantLine({ ts: tsForDay(-1) })]);
+  const deleted = writeSession(tree.sessions, "b.jsonl", [assistantLine({ ts: tsForDay(-1) }), assistantLine({ ts: tsForDay(-1) })]);
+  await scan(tree);
+  const month = resolveMonthPath(tree.historyDir, MONTH);
+  const totalsBefore = readFileSync(tree.totalsPath, "utf-8");
+  const day = localDayKey(Date.parse(tsForDay(-1)));
+  assert.equal(monthOf(tree).days[day].claude.slots[""].models["claude-opus-5-5"].messages, 3);
+
+  unlinkSync(deleted);
+  writeFileSync(month, "{bad", "utf-8");
+  const result = await scan(tree);
+  assert.equal(existsSync(month), false);
+  assert.equal(result.byFamily.claude.recentDays.find((entry) => entry.date === day).messageCount, 0);
+  assert.equal(totalsOf(tree).families.claude.totalPrompts, 3, "the session deletion does not shrink totals.json");
+
+  const rebuilt = rebuildTotalsFromMonths({ historyDir: tree.historyDir, warnings: [] });
+  assert.equal(rebuilt.ok, false, "rebuild-totals refuses the incomplete month set");
+  assert.match(rebuilt.error, /quarantined month history/);
+  assert.equal(readFileSync(tree.totalsPath, "utf-8"), totalsBefore, "the refused rebuild leaves the rollup untouched");
 });
 
 test("a lost rollup is rebuilt from the month files, not from the surviving sessions", async () => {

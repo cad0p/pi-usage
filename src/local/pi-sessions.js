@@ -457,25 +457,6 @@ function addUsage(days, usage) {
 }
 
 /**
- * Add a late-written line to an already-frozen day. Session counts are omitted:
- * `history.js` explains why re-counting them would be worse than leaving them.
- *
- * @param {Record<string, DayRows>} lateRows
- * @param {NonNullable<ReturnType<typeof usageFromLine>>} usage
- */
-function addLateUsage(lateRows, usage) {
-  const dayRows = lateRows[usage.day] ?? (lateRows[usage.day] = {});
-  const familyRow = dayRows[usage.family] ?? (dayRows[usage.family] = { sessions: 0, slots: {} });
-  const slotRow = familyRow.slots[usage.slot] ?? (familyRow.slots[usage.slot] = { sessions: 0, models: {} });
-  const bucket = slotRow.models[usage.model] ?? (slotRow.models[usage.model] = emptyBucket());
-  bucket.input += usage.input;
-  bucket.output += usage.output;
-  bucket.cacheRead += usage.cacheRead;
-  bucket.cacheWrite += usage.cacheWrite;
-  bucket.messages += 1;
-}
-
-/**
  * @param {DaysMap} days
  * @returns {SessionFileEntry["days"]}
  */
@@ -747,24 +728,25 @@ function listSessionFiles(roots) {
  * is a cache miss (a full rescan), never a crash.
  *
  * @param {string} path
- * @returns {{ files: Record<string, SessionFileEntry>, hit: boolean }}
+ * @returns {{ files: Record<string, SessionFileEntry>, hit: boolean, pendingLate: DaysMap }}
  */
 function readCacheFile(path) {
   let parsed;
   try {
     parsed = JSON.parse(readFileSync(path, "utf-8"));
   } catch {
-    return { files: {}, hit: false, historyWatermark: "" };
+    return { files: {}, hit: false, historyWatermark: "", pendingLate: emptyDays() };
   }
   if (!parsed || typeof parsed !== "object" || parsed.schemaVersion !== LOCAL_STATS_SCHEMA_VERSION) {
-    return { files: {}, hit: false, historyWatermark: "" };
+    return { files: {}, hit: false, historyWatermark: "", pendingLate: emptyDays() };
   }
   if (!parsed.files || typeof parsed.files !== "object" || Array.isArray(parsed.files)) {
-    return { files: {}, hit: false, historyWatermark: "" };
+    return { files: {}, hit: false, historyWatermark: "", pendingLate: emptyDays() };
   }
   // The last `lastFrozenDay` this cache was written against. An empty rollup
   // next to a non-empty watermark is a lost history, not a fresh one.
   const historyWatermark = typeof parsed.historyWatermark === "string" ? parsed.historyWatermark : "";
+  const pendingLate = decodeDays(parsed.pendingLate);
 
   /** @type {Record<string, SessionFileEntry>} */
   const files = {};
@@ -786,19 +768,21 @@ function readCacheFile(path) {
       days: /** @type {SessionFileEntry["days"]} */ (entry.days),
     };
   }
-  return { files, hit: true, historyWatermark };
+  return { files, hit: true, historyWatermark, pendingLate };
 }
 
 /**
  * @param {string} path
  * @param {Record<string, SessionFileEntry>} files
  * @param {string} historyWatermark The `lastFrozenDay` this cache is written against.
+ * @param {SessionFileEntry["days"]} [pendingLate] Late deltas waiting for an unreadable month.
  * @returns {{ ok: boolean, error?: string }}
  */
-function writeCacheFile(path, files, historyWatermark = "") {
+function writeCacheFile(path, files, historyWatermark = "", pendingLate = {}) {
   // `historyWatermark` records which `lastFrozenDay` this cache belongs to, so a
-  // later run can tell a lost rollup from a fresh install.
-  const payload = `${JSON.stringify({ schemaVersion: LOCAL_STATS_SCHEMA_VERSION, historyWatermark, files })}\n`;
+  // later run can tell a lost rollup from a fresh install. Pending late rows are
+  // aggregate deltas retained until their month can be updated.
+  const payload = `${JSON.stringify({ schemaVersion: LOCAL_STATS_SCHEMA_VERSION, historyWatermark, files, ...(Object.keys(pendingLate).length > 0 ? { pendingLate } : {}) })}\n`;
   const temporary = `${path}.${process.pid}.tmp`;
   try {
     mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
@@ -876,6 +860,33 @@ function buildOpenRows(files) {
       dayRows[family] = { sessions: familyAgg.files.size, slots };
     }
     rows[day] = dayRows;
+  }
+  return rows;
+}
+
+/**
+ * Turn cached, not-yet-applied late deltas into durable-history rows.
+ * Session counts stay zero because the original frozen day already counted them.
+ *
+ * @param {DaysMap} days
+ * @returns {Record<string, DayRows>}
+ */
+function buildLateRows(days) {
+  /** @type {Record<string, DayRows>} */
+  const rows = {};
+  for (const [day, tuples] of days) {
+    const dayRows = (rows[day] ??= {});
+    for (const tuple of tuples.values()) {
+      const [family, slot, model] = tuple;
+      const familyRow = (dayRows[family] ??= { sessions: 0, slots: {} });
+      const slotRow = (familyRow.slots[slot] ??= { sessions: 0, models: {} });
+      const bucket = (slotRow.models[model] ??= emptyBucket());
+      bucket.input += count(tuple[3]);
+      bucket.output += count(tuple[4]);
+      bucket.cacheRead += count(tuple[5]);
+      bucket.cacheWrite += count(tuple[6]);
+      bucket.messages += count(tuple[7]);
+    }
   }
   return rows;
 }
@@ -1180,21 +1191,11 @@ export function buildLocalStats(input = {}) {
       history.totals.lastFrozenDay === "" &&
       typeof cached.historyWatermark === "string" &&
       cached.historyWatermark !== "";
-    // Months inside the reporting window whose file is gone or was just
-    // quarantined: their days are still in the rollup, so they are rebuilt from
-    // the sessions and written back as daily detail (review finding N12).
+    // Damaged or unreadable month files affect only their daily detail. They
+    // never trigger a session rescan: frozen days are not reconstructed from
+    // surviving session files.
     const windowDates = recentLocalDates(now, RECENT_DAYS);
-    const window = /** @type {any} */ (loadWindowDays({ historyDir, dates: windowDates, warnings, canWrite: true, returnDamaged: true }));
-    /** @type {Set<string>} */
-    const repairDays = new Set();
-    if (window.damaged.length > 0) {
-      const damagedMonths = new Set(window.damaged);
-      for (const date of windowDates) {
-        if (!damagedMonths.has(date.slice(0, 7))) continue;
-        if (history.totals.lastFrozenDay && date <= history.totals.lastFrozenDay) repairDays.add(date);
-      }
-    }
-    const rescanAll = !cached.hit || history.rescanAll || lostHistory || repairDays.size > 0;
+    const rescanAll = !cached.hit || history.rescanAll || lostHistory;
     const lastFrozenDay = history.totals.lastFrozenDay;
 
     const overBudget = () => clock() - startedAt > budgetMs;
@@ -1237,10 +1238,7 @@ export function buildLocalStats(input = {}) {
 
     /** @type {Record<string, SessionFileEntry>} */
     const next = {};
-    /** @type {Record<string, DayRows>} */
-    const lateRows = {};
-    /** @type {Record<string, DayRows>} */
-    const repairRows = {};
+    const pendingLate = cached.pendingLate;
     let changed = !cached.hit;
     let scanned = 0;
     let reused = 0;
@@ -1361,17 +1359,11 @@ export function buildLocalStats(input = {}) {
           now,
           shouldStop: overBudget,
           onUsage: (usage) => {
-            if (repairDays.has(usage.day)) {
-              // The row is rebuilt for a day whose month file was lost; the
-              // rollup keeps its totals, so this never adds to them.
-              addLateUsage(repairRows, usage);
-              return;
-            }
             if (lastFrozenDay && usage.day <= lastFrozenDay) {
-              // Frozen days are never recomputed. A first-time read (append) of
-              // bytes belonging to one is a late write and goes to history.
+              // Frozen days are never reconstructed on a rescan. Incremental
+              // late writes stay in the cache until their month accepts them.
               if (rescan) return;
-              addLateUsage(lateRows, usage);
+              addUsage(pendingLate, usage);
               return;
             }
             addUsage(days, usage);
@@ -1458,18 +1450,22 @@ export function buildLocalStats(input = {}) {
     }
 
     const openRows = buildOpenRows(next);
+    const pendingBeforeApply = pendingLate.size;
     const applied = applyDurable({
       historyDir,
       totals: history.totals,
       openRows,
-      lateRows,
-      repairRows,
+      lateRows: buildLateRows(pendingLate),
       today,
       partial,
       writable: history.writable,
       ensure: !history.exists,
       warnings,
     });
+    for (const day of pendingLate.keys()) {
+      if (!applied.pendingLateDays.has(day)) pendingLate.delete(day);
+    }
+    if (pendingLate.size !== pendingBeforeApply) changed = true;
 
     // A day that is in the rollup (frozen now, or already frozen before a crash)
     // must leave the disposable cache; otherwise a rescan would see it twice.
@@ -1485,7 +1481,7 @@ export function buildLocalStats(input = {}) {
 
     if (changed) {
       const written = refreshHistoryLock(lock)
-        ? writeCacheFile(cachePath, next, history.totals.lastFrozenDay)
+        ? writeCacheFile(cachePath, next, history.totals.lastFrozenDay, encodeDays(pendingLate))
         : { ok: true };
       if (!written.ok) {
         warnings.push(`local token stats: could not write the scan cache at ${cachePath}: ${written.error}`);

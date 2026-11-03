@@ -62,7 +62,7 @@ shuvquota, and it never writes to a credential file.
   | --- | --- |
   | `~/.cache/pi-quota/usage.json` | the report cache |
   | `~/.cache/pi-quota/local-sessions.json` | per-session-file offsets and open token days |
-  | `${PI_CODING_AGENT_DIR:-~/.pi/agent}/pi-usage/totals.json`, `tokens-YYYY-MM.json` | frozen token history, plus `.corrupt-<ts>` siblings when one is unreadable |
+  | `${PI_CODING_AGENT_DIR:-~/.pi/agent}/pi-usage/totals.json`, `tokens-YYYY-MM.json` | frozen token history, plus `.corrupt-<ts>` backups for corrupt files |
   | `~/.cache/pi-quota/refresh-state.json` | each family's own refresh clock |
   | `~/.cache/pi-quota/last-published.json`, `last-good.json`, `backoff.json` | sticky snapshots and throttle state |
   | `~/.config/pi-quota/opencode-cookie` | only after `piquota auth opencode`, mode `600` |
@@ -527,7 +527,7 @@ history is Pi data, so it lives next to Pi's agent directory:
 | --- | --- |
 | `${PI_CODING_AGENT_DIR:-~/.pi/agent}/pi-usage/totals.json` | all-time rollup per family and account (models, prompts, session-days, active dates) plus `lastFrozenDay` |
 | `${PI_CODING_AGENT_DIR:-~/.pi/agent}/pi-usage/tokens-YYYY-MM.json` | the frozen days of one local month, keyed day → family → slot → model |
-| `~/.cache/pi-quota/local-sessions.json` | per-session-file size, mtime, byte offset and copy fingerprint, plus open days only |
+| `~/.cache/pi-quota/local-sessions.json` | per-session-file size, mtime, byte offset and copy fingerprint, open days, and pending late deltas for unreadable months |
 
 > `~/.pi` is often a git repository. Add `agent/pi-usage/` to that repo's
 > `.gitignore` if you do not want your token counts committed.
@@ -537,9 +537,11 @@ month file and into `totals.json`, then drops it from the per-file cache. The
 month file is written first and the totals second; the `lastFrozenDay` watermark
 makes a restart re-freeze a half-written day idempotently (the month write is a
 SET per day) instead of adding it twice. A late write to an already-frozen day —
-a session that appends just past midnight — increments both stores directly; a
-crash between those two writes can double that one small delta. A
-budget-truncated scan never freezes: history is only written from complete runs.
+a session that appends just past midnight — increments both stores directly; if
+its month is temporarily unreadable, the delta stays in the cache until a later
+run can write it. A crash between the month and totals writes can double that
+one small delta. A budget-truncated scan never freezes: history is only written
+from complete runs.
 
 Consequences, all covered by tests: history survives session deletion and cache
 loss. A lost or corrupt `totals.json` is moved aside as
@@ -548,24 +550,29 @@ authoritative record of frozen days — not from the session files, because a
 session deleted since then would otherwise shrink history. Frozen days are never
 recomputed, so a replaced session file cannot rewrite them either.
 
-Two repair rules keep a damaged month from quietly costing days. A month file
-that cannot be *read* (permissions, I/O) is left alone: the rollup is written
-with an `incompleteMonths` marker and rebuilt on the next run, so restoring the
-permission heals the history by itself. A month file that is *corrupt* is moved
-aside by the lock owner (never by a read-only run) with a warning naming the file
-and its `.corrupt-<ts>` copy, and the days it held are rebuilt from the session
-files that still exist so "tokens by day" and the rollup stay consistent. A lost *month* file loses only that month's daily detail — the all-time
-totals stay — and `piquota stats --rebuild-totals` recomputes `totals.json` from
-every month file, recovering days whose session files are already gone — and it
-refuses to run when there is no month file at all while `totals.json` still has
-data, because replacing that rollup with an empty one turns a missing directory
-into permanently lost history. A normal run reads only `totals.json` plus the
-month files covering the last seven days (current month, and the previous one
-early in a month), so years of history never slow a run: on this machine 45
-frozen days cost ~28 KB in total — `totals.json` 6.9 KB and two month files of
-5.4 KB and 16 KB. A day inside that window is read from its month file once it is
-frozen, so a late write to it shows up in "tokens by day" immediately instead of
-waiting for the week to roll over.
+Damaged month files are handled without rebuilding frozen days from sessions. A
+month that cannot be *read* (permissions, I/O) is left alone: the run warns, keeps
+its open days in the cache, and does not freeze them until the month is readable.
+Other history proceeds normally, and this alone does not force a full session
+rescan. A rollup rebuild never writes `totals.json` from an incomplete month set.
+
+A *corrupt* or foreign-version month is moved aside by the lock owner (never by a
+read-only run) to `.corrupt-<ts>`. Its warning names the file and directs you to copy the
+`.corrupt-<ts>` backup back to the original month path if recoverable. Frozen days are never rebuilt from sessions: their
+daily rows are missing (shown as 0) in `recentDays`, while `totals.json` retains
+the all-time counts, so the two views may disagree. `piquota stats --rebuild-totals`
+refuses while a quarantined month has not been restored. A lost *month* file
+loses that month's daily detail; normal runs keep the all-time totals, and a
+rebuild can recover counts from every remaining month file even if sessions are
+gone. Rebuild refuses when there is no month file at all while `totals.json`
+still has data, because replacing that rollup with an empty one would turn a
+missing directory into permanently lost history. A normal run reads only
+`totals.json` plus the month files covering the last seven days (current month,
+and the previous one early in a month), so years of history never slow a run: on
+this machine 45 frozen days cost ~28 KB in total — `totals.json` 6.9 KB and two
+month files of 5.4 KB and 16 KB. A day inside that window is read from its month
+file once frozen, so late writes appear in "tokens by day" without waiting for
+the week to roll over.
 
 Cost: the first run streams each session file once — 1.56 GB across 608 files
 in 3.0 s here; later runs read only the bytes appended since the previous scan
@@ -666,7 +673,7 @@ extensions/quota-panel.ts      Pi TUI line and /usage
 ## Tests
 
 ```bash
-node --test tests/*.test.mjs     # 325 tests, fake tokens only, no network
+node --test tests/*.test.mjs     # 328 tests, fake tokens only, no network
 ```
 
 Modules covered: `auth.json` parsing and de-duplication, the Claude Code store
