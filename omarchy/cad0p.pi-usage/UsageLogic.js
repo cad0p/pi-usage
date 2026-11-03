@@ -581,9 +581,13 @@ function currencyPrefix(currency) {
   return code + " "
 }
 
+var MAX_MONEY_AMOUNT = 999999.99
+
 function formatMoney(value, currency) {
   var amount = Number(value)
-  if (!isFinite(amount)) amount = 0
+  // A non-finite amount is unknown, not zero: "$0.00" would read as an empty balance.
+  if (!isFinite(amount)) return "—"
+  amount = Math.max(-MAX_MONEY_AMOUNT, Math.min(amount, MAX_MONEY_AMOUNT))
   return currencyPrefix(currency) + amount.toFixed(2)
 }
 

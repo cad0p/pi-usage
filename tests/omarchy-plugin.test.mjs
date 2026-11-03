@@ -222,7 +222,17 @@ test("two records that claim one id become one section, newest wins", () => {
   const providers = plain(Logic.visibleProviders([newer, timeless, older], {}));
   assert.equal(providers.length, 1, "one id is one section");
   assert.equal(providers[0].limits[0].percent, 0.8, "the newest updatedAt wins");
-  assert.deepEqual(plain(Logic.visibleProviders([timeless, older, newer], {})).map((/** @type {any} */ p) => p.providerId), ["codex"]);
+  const reordered = plain(Logic.visibleProviders([timeless, older, newer], {}));
+  assert.deepEqual(reordered.map((/** @type {any} */ p) => p.providerId), ["codex"]);
+  assert.equal(reordered[0].limits[0].percent, 0.8, "the newest wins when it arrives last, too");
+});
+
+test("a corrupt balance renders a bounded amount, never an exponent", () => {
+  assert.equal(Logic.formatMoney(12.5, "USD"), "$12.50");
+  assert.equal(Logic.formatMoney(Infinity, "USD"), "—");
+  assert.equal(Logic.formatMoney(NaN, "EUR"), "—");
+  assert.equal(Logic.formatMoney(1e308, "USD"), "$999999.99", "an absurd balance is clamped");
+  assert.equal(Logic.formatMoney(-1e308, "USD"), "$-999999.99");
 });
 
 test("limit percentages are clamped to the normalized range", () => {
