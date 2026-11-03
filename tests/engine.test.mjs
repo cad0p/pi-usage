@@ -477,3 +477,49 @@ test("mapBounded keeps input order and never exceeds its limit", async () => {
   assert.equal(accountConcurrency({ PI_QUOTA_ACCOUNT_CONCURRENCY: "3" }), 3);
   assert.equal(accountConcurrency({ PI_QUOTA_ACCOUNT_CONCURRENCY: "99" }), 32);
 });
+
+test("mapBounded treats a non-numeric limit as 1 instead of returning holes", async () => {
+  const { mapBounded } = await import("../src/engine.js");
+  assert.deepEqual(await mapBounded([1, 2, 3], Number.NaN, async (value) => value * 2), [2, 4, 6]);
+  assert.deepEqual(await mapBounded([1, 2], undefined, async (value) => value), [1, 2]);
+});
+
+test("every request carries the package User-Agent unless the provider sets its own", async () => {
+  const { requestJson, PACKAGE_USER_AGENT, withUserAgent } = await import("../src/http.js");
+  const version = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf-8")).version;
+  assert.equal(PACKAGE_USER_AGENT, `pi-usage/${version} (+https://github.com/cad0p/pi-usage)`);
+  assert.doesNotMatch(PACKAGE_USER_AGENT, /^node/i);
+
+  const seen = [];
+  const fetchFn = async (_url, init) => {
+    seen.push(init.headers);
+    return jsonResponse({ ok: true });
+  };
+  await requestJson("https://opencode.ai/zen/go/v1/usage", { headers: { Authorization: "Bearer x" }, fetchFn });
+  await requestJson("https://example.invalid/", { fetchFn });
+  await requestJson("https://example.invalid/", { headers: { "user-agent": "antigravity/cli" }, fetchFn });
+  assert.equal(seen[0]["User-Agent"], PACKAGE_USER_AGENT);
+  assert.equal(seen[0].Authorization, "Bearer x");
+  assert.equal(seen[1]["User-Agent"], PACKAGE_USER_AGENT);
+  assert.equal(seen[2]["user-agent"], "antigravity/cli");
+  assert.equal(seen[2]["User-Agent"], undefined, "a provider's own agent is never duplicated");
+
+  const original = { Accept: "application/json" };
+  withUserAgent(original);
+  assert.deepEqual(original, { Accept: "application/json" }, "the caller's headers object is not mutated");
+});
+
+test("the OpenCode Go usage request is sent with the package User-Agent", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "pi-quota-ua-"));
+  const authPath = join(directory, "auth.json");
+  writeFileSync(authPath, JSON.stringify({ "opencode-go": { type: "api_key", key: "oc-base" } }));
+  const agents = [];
+  const fetchFn = async (url, init) => {
+    if (String(url).includes("zen/go/v1/usage")) agents.push(init.headers["User-Agent"]);
+    const window = { status: "ok", percent: 1, resetsAt: "2027-01-01T00:00:00.000Z" };
+    return jsonResponse({ usage: { rolling: window, weekly: window, monthly: window } });
+  };
+  await collectQuota({ paths: [authPath], claudeCodePaths: [], now: NOW, fetchFn, families: ["opencode-go"], env: {}, home: directory, stores: [], allowBrowser: false });
+  assert.equal(agents.length, 1);
+  assert.match(agents[0], /^pi-usage\/\d+\.\d+\.\d+/);
+});

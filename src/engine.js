@@ -184,7 +184,9 @@ export async function mapBounded(items, limit, fn) {
       results[index] = await fn(items[index], index);
     }
   };
-  await Promise.all(Array.from({ length: Math.min(Math.max(1, limit), items.length) }, worker));
+  // A non-numeric limit would otherwise start no worker and return holes.
+  const bounded = Number.isFinite(limit) ? Math.max(1, Math.floor(limit)) : 1;
+  await Promise.all(Array.from({ length: Math.min(bounded, items.length) }, worker));
   return results;
 }
 
@@ -404,16 +406,22 @@ export async function collectQuota(options = {}) {
       for (const { result, warning, crashed } of outcomes) {
         if (warning) familyWarnList.push(warning);
         if (!crashed) {
-          if (isThrottled(result.error)) {
-            const seconds = recordBackoff(family, {
-              retryAfterSec: retryAfterFromError(result.error),
-              now,
-              env,
-              home: options.home,
-            }).seconds;
-            familyWarnList.push(`${family}: throttled upstream; pausing that family for ${seconds}s`);
-          } else if (result.ok || isAuthFailure(result.error)) {
-            clearBackoff(family, { env, home: options.home });
+          // Bookkeeping must degrade like the provider call it follows: a
+          // failing backoff write is a warning, never a rejected family.
+          try {
+            if (isThrottled(result.error)) {
+              const seconds = recordBackoff(family, {
+                retryAfterSec: retryAfterFromError(result.error),
+                now,
+                env,
+                home: options.home,
+              }).seconds;
+              familyWarnList.push(`${family}: throttled upstream; pausing that family for ${seconds}s`);
+            } else if (result.ok || isAuthFailure(result.error)) {
+              clearBackoff(family, { env, home: options.home });
+            }
+          } catch (error) {
+            familyWarnList.push(`${family}: could not update the backoff state: ${/** @type {{ message?: string }} */ (error)?.message ?? String(error)}`);
           }
         }
         results.push(result);

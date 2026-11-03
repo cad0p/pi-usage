@@ -96,6 +96,7 @@ Omarchy:
 Environment:
   PI_QUOTA_LOCAL_STATS=0          skip the token scan of Pi's session files
   PI_QUOTA_LOCAL_STATS_BUDGET_MS  wall-clock budget for that scan (default 12000)
+  PI_QUOTA_ACCOUNT_CONCURRENCY    accounts of one provider queried at once (1-32, default 8)
 
 Guarantees:
   * ~/.pi/agent/auth.json is opened read-only. Never written, synced or refreshed.
