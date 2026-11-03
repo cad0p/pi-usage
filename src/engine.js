@@ -6,7 +6,7 @@
  * degraded result with an actionable message.
  */
 
-import { checkFreshness, LABEL_BY_FAMILY, loadPiCredentials, resolveAuthPaths } from "./auth/pi-auth.js";
+import { checkFreshness, LABEL_BY_FAMILY, loadPiCredentials, normalizeCredential, resolveAuthPaths } from "./auth/pi-auth.js";
 import { loadClaudeCodeCredential } from "./auth/claude-code-auth.js";
 import { redact } from "./http.js";
 import { collectLocalStats } from "./local/pi-sessions.js";
@@ -239,6 +239,12 @@ const PROVIDERS = {
  *     tests and library callers never read a real home directory; the CLI turns
  *     it on with a time budget. Pass an object to inject session roots or a
  *     cache path, or false to disable it explicitly.
+ *   onFamily?: (family: string, report: PiQuotaReport) => void | Promise<void>,
+ *     Called once a family has settled, before the other families necessarily
+ *     finish. The report fragment contains only that family's results.
+ *   authOverrides?: Record<string, { access: string, expiresAtMs?: number | null, accountId?: string | null }>,
+ *     Optional in-memory OAuth access tokens supplied by the host runtime. Never
+ *     persisted or included in reports.
  * }} [options]
  * @returns {Promise<PiQuotaReport>}
  */
@@ -254,6 +260,37 @@ export async function collectQuota(options = {}) {
     usersRoot: options.usersRoot,
     paths: options.paths,
   });
+
+  // Pi's extension host may have resolved/renewed an OAuth token through Pi's
+  // own locked auth path. Apply only to the matching provider in memory; the
+  // underlying file reader remains read-only and the token never reaches output.
+  for (const [provider, auth] of Object.entries(options.authOverrides ?? {})) {
+    if (typeof auth?.access !== "string" || auth.access === "") continue;
+    let matched = false;
+    for (const credential of loaded.credentials) {
+      if (credential.provider !== provider) continue;
+      credential.access = auth.access;
+      credential.expiresAtMs = auth.expiresAtMs ?? null;
+      if (typeof auth.accountId === "string" && auth.accountId !== "") credential.accountId = auth.accountId;
+      matched = true;
+    }
+    // Pi may own auth from a non-default agent directory that the standalone
+    // read-only path discovery does not know about. A host-resolved OAuth token
+    // is sufficient to create the in-memory provider entry; never persist it.
+    if (!matched) {
+      const credential = normalizeCredential(
+        provider,
+        {
+          type: "oauth",
+          access: auth.access,
+          expires: auth.expiresAtMs,
+          accountId: auth.accountId,
+        },
+        "Pi runtime auth",
+      );
+      if (credential) loaded.credentials.push(credential);
+    }
+  }
 
   // Claude is the one family with a second, non-Pi source, so it is resolved
   // before the per-family loop and then treated exactly like any other credential.
@@ -290,6 +327,43 @@ export async function collectQuota(options = {}) {
   /** @type {Record<string, string[]>} */
   const familyWarnings = {};
 
+  /**
+   * Publish a family fragment as soon as its provider work is complete. A
+   * callback failure is isolated from provider collection and becomes a warning
+   * on the final report.
+   *
+   * @param {string} family
+   * @param {import("./model.js").QuotaResult[]} results
+   */
+  const emitFamily = async (family, results) => {
+    for (const provider of results) {
+      provider.primaryWindowId = selectPrimaryWindow(provider.windows ?? [])?.id ?? null;
+    }
+    byFamily[family] = results;
+    familyWarnings[family] ??= [];
+    if (!options.onFamily) return;
+    const fragment = {
+      engine: "pi-quota",
+      schemaVersion: 1,
+      readOnly: true,
+      generatedAt: new Date(now).toISOString(),
+      sources: loaded.paths,
+      claudeSource: { mode: claude.mode, paths: claude.claudeCodePaths, unavailable: claude.unavailable },
+      warnings: [...warnings, ...familyWarnings[family]],
+      providers: results,
+      byFamily: { [family]: results },
+      localStats: {},
+      localStatsMeta: null,
+    };
+    try {
+      await options.onFamily(family, fragment);
+    } catch (error) {
+      familyWarnings[family].push(
+        `${family}: family callback failed: ${redact(/** @type {{ message?: string }} */ (error)?.message ?? String(error))}`,
+      );
+    }
+  };
+
   const hasOpenAi = loaded.rawProviders?.includes("openai") || Boolean(env.OPENAI_API_KEY);
 
   // The local scan runs beside the network calls: a first full scan of the
@@ -310,7 +384,7 @@ export async function collectQuota(options = {}) {
         // `notConfigured` is stated rather than inferred: the message now names a
         // second source, and every renderer keys off this flag to avoid painting a
         // failure icon for a provider the user simply does not use.
-        byFamily[family] = [
+        await emitFamily(family, [
           degradedResult({
             family,
             label: LABEL_BY_FAMILY[family] ?? family,
@@ -319,7 +393,7 @@ export async function collectQuota(options = {}) {
             source: loaded.paths[0] ?? resolveAuthPaths({ env, home: options.home })[0] ?? "~/.pi/agent/auth.json",
             now,
           }),
-        ];
+        ]);
         return;
       }
 
@@ -340,7 +414,7 @@ export async function collectQuota(options = {}) {
 
       const throttle = backoffState(family, { now, env, home: options.home });
       if (throttle.active && !options.force) {
-        byFamily[family] = [
+        await emitFamily(family, [
           degradedResult({
             family,
             label: LABEL_BY_FAMILY[family] ?? family,
@@ -351,7 +425,7 @@ export async function collectQuota(options = {}) {
             source: credentials[0].source,
             now,
           }),
-        ];
+        ]);
         return;
       }
 
@@ -430,8 +504,8 @@ export async function collectQuota(options = {}) {
         }
         results.push(result);
       }
-      byFamily[family] = results;
       familyWarnings[family] = familyWarnList;
+      await emitFamily(family, results);
     }),
   );
 
@@ -529,4 +603,17 @@ function refreshHint(credential) {
  */
 export function firstForFamily(report, family) {
   return report.byFamily[family]?.[0] ?? null;
+}
+
+/**
+ * Collect a single family using the same normalized engine and callback
+ * semantics as collectQuota. This is useful to independent refresh schedulers:
+ * an in-flight family does not serialize another family's request.
+ *
+ * @param {string} family
+ * @param {Parameters<typeof collectQuota>[0]} [options]
+ * @returns {Promise<PiQuotaReport>}
+ */
+export function collectFamily(family, options = {}) {
+  return collectQuota({ ...options, families: [family] });
 }

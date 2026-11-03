@@ -26,14 +26,25 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
-// `mergeLastGood` is intentionally NOT imported here: it lives in src/sticky.js
-// and the CLI (`bin/piquota.js`) already applies it on every `--json` run, so the
-// extension sees a report whose transiently-failed families already carry the last
-// good snapshot in `provider.note`. The classifier below mirrors src/providers/error-kind.js
-// so the extension can render category-specific glyphs without depending on the repo.
+import { extractChatGptAccountId, extractExpiresAtMs } from "../src/auth/jwt.js";
+import { mergeReportIntoCache, writeCache } from "../src/cache.js";
+import { normalizeClaudeSourceMode, collectFamily, enabledFamilies, FAMILIES } from "../src/engine.js";
+import { historyJson } from "../src/cli/commands/stats.js";
+import { resolveHistoryDir } from "../src/local/history.js";
+import { startLocalStatsWorker } from "../src/local/worker.js";
+import { publishRecords } from "../src/omarchy/publish.js";
+import { buildRecords } from "../src/omarchy/record.js";
+import { skippedFamilies } from "../src/cli/commands/omarchy.js";
+import { mergeLastGood } from "../src/sticky.js";
+import { readRefreshState, resolveFamilyTtls, staleFamilies, writeRefreshState } from "../src/refresh.js";
+
+// The in-process collector does not pass through the CLI's sticky layer, so this
+// extension applies the same last-good merge as the CLI before painting or publishing.
+// The classifier below mirrors src/providers/error-kind.js so the extension can
+// render category-specific glyphs without depending on the repo.
 
 const STATUS_KEY = "00-quota";
 const WIDGET_KEY = "quota-line";
@@ -42,7 +53,12 @@ const RAIL_KEY = "quota";
 const SIDEBAR_STATE_KEY = Symbol.for("gentle-pi.experimental-sidebar.state");
 const REFRESH_MS = Number(process.env.PI_QUOTA_REFRESH_MS) || 300_000;
 const AGENT_END_DEBOUNCE_MS = 1_500;
-const EXEC_TIMEOUT_MS = 30_000;
+/** The report cache is keyed by the Claude source its numbers came from. */
+const CLAUDE_SOURCE_CACHE_PREFIX = "claude-source:";
+
+function cacheKeyFor(source: string): string {
+  return `${CLAUDE_SOURCE_CACHE_PREFIX}${normalizeClaudeSourceMode(source)}`;
+}
 
 type QuotaWindow = {
   id: string;
@@ -124,9 +140,32 @@ type Theme = {
   bg?: (key: string, text: string) => string;
 };
 
+/**
+ * One running local token scan. It is a handle, not a promise, because the scan
+ * can outlive the session that started it: a shutdown has to be able to end it
+ * and have its lock and cache left clean.
+ */
+type LocalStatsScan = {
+  result: Promise<{ byFamily: Record<string, LocalFamilyStats>; warnings: string[]; scan: { partial?: boolean } | null }>;
+  stop: () => Promise<void>;
+};
+
+type ExtensionDependencies = {
+  collectFamily?: typeof collectFamily;
+  startLocalStats?: () => LocalStatsScan;
+  getProviderAuth?: (ctx: UiContext, provider: string) => Promise<{ auth?: { apiKey?: string }; accountId?: string; source?: string } | undefined>;
+  loadHistory?: (month: string | null) => Promise<HistoryPayload> | HistoryPayload;
+  publishOmarchy?: (report: QuotaReport, prune: boolean) => void;
+  railPatcherPath?: string;
+};
+
 /** Only the UI surface this extension uses. */
 type UiContext = {
   hasUI: boolean;
+  /** Pi resolves/renews its OAuth credentials under its own auth-store lock. */
+  modelRegistry?: {
+    getProviderAuth?: (provider: string) => Promise<{ auth?: { apiKey?: string }; source?: string } | undefined>;
+  };
   /** Pi's run mode; `custom` components only exist in the TUI. */
   mode?: string;
   ui: {
@@ -193,23 +232,7 @@ function usedOf(window: QuotaWindow | null): number | null {
   return null;
 }
 
-function resolveCliPath(): string | null {
-  const override = process.env.PI_QUOTA_BIN;
-  if (override && existsSync(override)) return override;
-  try {
-    const sibling = fileURLToPath(new URL("../bin/piquota.js", import.meta.url));
-    if (existsSync(sibling)) return sibling;
-  } catch {}
-  for (const candidate of [
-    join(homedir(), ".local", "share", "pi-quota", "bin", "piquota.js"),
-    join(homedir(), ".local", "bin", "piquota"),
-    join(homedir(), ".pi", "agent", "npm", "node_modules", "@cad0p", "pi-usage", "bin", "piquota.js"),
-    join(homedir(), ".pi", "agent", "npm", "node_modules", "@j3pf", "piquota", "bin", "piquota.js"),
-  ]) {
-    if (existsSync(candidate)) return candidate;
-  }
-  return null;
-}
+
 
 /**
  * Rank by how soon a window constrains you: 5h/session first, then daily,
@@ -1104,15 +1127,19 @@ type UsageOverlayOptions = {
   getRows: () => number;
   /** The newest report the extension holds, or null before the first one. */
   getReport: () => QuotaReport | null;
-  /** The last refresh failure, shown as a line instead of thrown. */
-  getError: () => string | null;
+  /**
+   * Every family's refresh failure, one line each, in family order. A failure
+   * is not cleared by another family's success: the families finish out of
+   * order, and a single shared slot made the last arrival erase the others.
+   */
+  getErrors: () => string[];
   isRefreshing: () => boolean;
   /** Run the same forced refresh `/usage` always ran, in the background. */
   refresh: () => void;
   /**
-   * Ask the extension to run `piquota stats --json` for one month (null: newest).
-   * The request id comes back with the answer, so a slow fetch cannot apply a
-   * month the last keypress did not ask for.
+   * Ask the extension to read one month in-process (null: current month). The
+   * request id comes back with the answer, so a slow read cannot apply a month
+   * the last keypress did not ask for.
    */
   loadHistory: (month: string | null, request: number) => void;
 };
@@ -1156,18 +1183,20 @@ const HISTORY_HINTS: ReadonlyArray<readonly [string, string]> = [
   ["esc/q", "close"],
 ];
 
-/** The report cache the CLI writes after every successful run. */
+/** The report cache the CLI and in-process extension share. */
 function reportCachePath(): string {
   const cacheHome = process.env.XDG_CACHE_HOME || join(homedir(), ".cache");
   return join(cacheHome, "pi-quota", "usage.json");
 }
 
 /**
- * The last report the CLI cached, read synchronously so the overlay can paint
- * on the same keystroke as /usage. Read-only, age is irrelevant for a first
- * frame, and a missing or malformed cache is simply "no cached report".
+ * The last report on disk, read synchronously so the overlay paints on the same
+ * keystroke as /usage: read-only, age is irrelevant for a first frame, and a
+ * missing or malformed cache is simply "no cached report". The key travels back
+ * with it because it names the Claude source those numbers came from, and a
+ * later partial write has to keep describing the same data.
  */
-function readCachedReport(): QuotaReport | null {
+function readCachedReport(): { report: QuotaReport; key: string | null } | null {
   try {
     const parsed = JSON.parse(readFileSync(reportCachePath(), "utf-8"));
     const report = parsed?.report;
@@ -1181,7 +1210,10 @@ function readCachedReport(): QuotaReport | null {
         if (!Number.isNaN(resetsAtMs)) window.resetsInSec = Math.max(0, Math.round((resetsAtMs - now) / 1000));
       }
     }
-    return report as QuotaReport;
+    return {
+      report: report as QuotaReport,
+      key: typeof parsed?.key === "string" ? parsed.key : null,
+    };
   } catch {
     return null;
   }
@@ -1212,30 +1244,21 @@ function redactCause(value: string): string {
     .replace(/\b((?:__Host-console_session|auth)=)[^;\s]+/gi, "$1<redacted>");
 }
 
-/**
- * One short, redacted line for a failed `stats --json` run: the CLI's own first
- * stderr line when it printed one, otherwise its exit status. The raw parse
- * error ("Unexpected end of JSON input") says nothing about why the read failed.
- */
-function cliFailureLine(result: { stdout?: string; stderr?: string; code?: number; killed?: boolean } | null | undefined): string {
-  const first = String(result?.stderr ?? "")
-    .split("\n")
-    .map((line) => line.trim())
-    .find((line) => line !== "");
-  const code = Number(result?.code);
-  const cause = first
-    ? redactCause(first)
-    : result?.killed
-      ? "piquota stats was stopped (timeout)"
-      : Number.isFinite(code) && code !== 0
-        ? `piquota stats exited ${code}`
-        : "piquota stats --json printed no history payload";
-  return capCause(cause);
-}
-
 /** A stderr line or a thrown message can quote a whole path list; the frame gets one line. */
 function capCause(cause: string): string {
   return cause.length > 160 ? `${cause.slice(0, 157)}…` : cause;
+}
+
+/** Append warnings that are not already there: a repeated scan repeats its notes. */
+function mergeWarnings(existing: string[], added: string[] | undefined): string[] {
+  const seen = new Set(existing);
+  const merged = [...existing];
+  for (const warning of added ?? []) {
+    if (typeof warning !== "string" || warning === "" || seen.has(warning)) continue;
+    seen.add(warning);
+    merged.push(warning);
+  }
+  return merged;
 }
 
 /** Local YYYY-MM-DD, the history's day key. */
@@ -1467,7 +1490,7 @@ export class UsageOverlay {
   }
 
   /**
-   * A month (or the first payload, with the month list) arrived from the CLI.
+   * A month (or the first payload, with the month list) arrived from the in-process reader.
    * Every answer is cached — a later ← must not refetch what already arrived —
    * but only the answer to the newest request may move the page: ←/→ overlap,
    * and a late answer for a month the last keypress did not ask for used to snap
@@ -1644,8 +1667,9 @@ export class UsageOverlay {
         this.pushRow(rows, `  ${this.theme.fg("error", `! ${failure}`)}${hint}`, -1, false);
       }
     } else {
-      const error = this.options.getError();
-      if (error) rows.push({ text: `  ${this.theme.fg("error", `! ${error}`)}`, section: -1, header: false });
+      for (const error of this.options.getErrors()) {
+        rows.push({ text: `  ${this.theme.fg("error", `! ${error}`)}`, section: -1, header: false });
+      }
     }
     if (!layout) {
       // Distinct states, distinct lines: a failed fetch used to say "loading
@@ -2116,7 +2140,7 @@ export class UsageOverlay {
     } else {
       const report = this.options.getReport();
       if (report) parts.push(this.theme.fg("dim", updatedAtLabel(report)));
-      if (this.options.getError()) parts.push(this.theme.fg("error", "refresh failed"));
+      if (this.options.getErrors().length > 0) parts.push(this.theme.fg("error", "refresh failed"));
     }
     if (this.view === "history") {
       const status = this.historyStatus;
@@ -2163,9 +2187,34 @@ export class UsageOverlay {
   }
 }
 
-export default function quotaPanelExtension(pi: ExtensionAPI): void {
+export default function quotaPanelExtension(pi: ExtensionAPI, dependencies: ExtensionDependencies = {}): void {
+  const loadFamily = dependencies.collectFamily ?? collectFamily;
+  const startScan = dependencies.startLocalStats ?? (() => startLocalStatsWorker() as LocalStatsScan);
+  const getProviderAuth = dependencies.getProviderAuth ?? (async (ctx, provider) => ctx.modelRegistry?.getProviderAuth?.(provider));
+  const readHistory = (month: string | null) => dependencies.loadHistory
+    ? dependencies.loadHistory(month)
+    : (historyJson({ historyDir: resolveHistoryDir(), month }) as HistoryPayload);
+  const publishOmarchy = dependencies.publishOmarchy ?? ((value, prune) => {
+    const skip = skippedFamilies(process.env);
+    const reportToPublish = skip.size > 0
+      ? { ...value, providers: value.providers.filter((provider) => !skip.has(provider.family)) }
+      : value;
+    publishRecords(buildRecords(reportToPublish as any), { prune });
+  });
   let report: QuotaReport | null = null;
-  let refreshing = false;
+  const inFlight = new Map<string, Promise<boolean>>();
+  let resultGeneration = 0;
+  let prunedGeneration = 0;
+  let localStatsInFlight: Promise<void> | null = null;
+  let localStatsScan: LocalStatsScan | null = null;
+  let localStatsResult: Awaited<LocalStatsScan["result"]> | null = null;
+  /**
+   * The notes the scan produced (its own warnings, or the one line a failure
+   * becomes). They live here, not only in the report, because the scan can
+   * finish before the first family does: it is the report that is late then,
+   * not the warning.
+   */
+  let localStatsWarnings: string[] = [];
   let timer: ReturnType<typeof setInterval> | null = null;
   let agentEndTimer: ReturnType<typeof setTimeout> | null = null;
   let panelVisible = false;
@@ -2188,22 +2237,30 @@ export default function quotaPanelExtension(pi: ExtensionAPI): void {
   let explicitBox = false;
   /** gentle-pi owns the footer and truncates it from the end, so start off. */
   let statusVisible = false;
-  let lastError: string | null = null;
+  /** One failure per family: an out-of-order success must not hide another's. */
+  const familyErrors = new Map<string, string>();
+  /**
+   * The Claude source the report in memory actually came from. The extension
+   * forces Pi's own OAuth when Pi resolves a token, and that is a different
+   * fact from what PI_QUOTA_CLAUDE_SOURCE says: keying the cache by the setting
+   * alone stored Pi-sourced numbers under the CLI's auto/claude-code key, where
+   * the next reader asked the other question and was served them anyway.
+   */
+  let claudeSourceUsed: string | null = null;
   let disposed = false;
   /** True once the installed gentle-pi is known to paint a rail slot for this card. */
   let railMode = false;
 
   /**
-   * Load the rail inspector from the installed CLI tree. A missing patcher disables
-   * native-layout detection; the runtime chaining hook remains available.
+   * Load the rail inspector from this package, not from a quota CLI subprocess.
+   * A missing patcher disables native-layout detection; the runtime chaining
+   * hook remains available.
    */
   async function loadRailPatcher(): Promise<{
     resolveGentlePiLayout: (options?: { dir?: string }) => { layoutPath: string; present: boolean };
     inspectRailPatch: (options: { layoutPath: string }) => { state: string };
   } | null> {
-    const cli = resolveCliPath();
-    if (!cli) return null;
-    const modulePath = join(dirname(cli), "..", "src", "gentle-pi", "rail-patch.js");
+    const modulePath = dependencies.railPatcherPath ?? fileURLToPath(new URL("../src/gentle-pi/rail-patch.js", import.meta.url));
     if (!existsSync(modulePath)) return null;
     try {
       return await import(pathToFileURL(modulePath).href);
@@ -2223,35 +2280,211 @@ export default function quotaPanelExtension(pi: ExtensionAPI): void {
     railMode = inspection.state === "patched";
   }
 
-  /**
-   * Run the CLI. A report run owns `lastError`; the advisory `omarchy` publish
-   * writes human text, not JSON, and must never surface as a quota failure.
-   */
-  async function runCli(args: string[], options: { reportErrors?: boolean } = {}): Promise<QuotaReport | null> {
-    const reportErrors = options.reportErrors !== false;
-    const cli = resolveCliPath();
-    if (!cli) {
-      if (reportErrors) lastError = "piquota not installed: run install.sh from the pi-quota repo";
-      return null;
-    }
+  /** Whether a family refresh is in flight; the header shows it while one is. */
+  function isRefreshing(): boolean {
+    return inFlight.size > 0;
+  }
+
+  /** Resolve Pi's own auth for the two rotating OAuth providers. Tokens stay local to this call. */
+  async function authOverridesFor(ctx: UiContext, family: string): Promise<Record<string, { access: string; expiresAtMs: number | null; accountId?: string }> | undefined> {
+    const provider = family === "claude" ? "anthropic" : family === "codex" ? "openai-codex" : null;
+    if (!provider) return undefined;
     try {
-      const runner = /node(\.exe)?$/i.test(process.execPath) ? process.execPath : "node";
-      const result = await pi.exec(runner, [cli, ...args], { timeout: EXEC_TIMEOUT_MS });
-      if (!result.stdout || result.stdout.trim() === "") {
-        if (reportErrors) lastError = result.stderr?.trim() || "piquota produced no output";
-        return null;
-      }
-      const parsed = JSON.parse(result.stdout) as QuotaReport;
-      if (!parsed || !Array.isArray(parsed.providers)) {
-        if (reportErrors) lastError = "piquota output was not a quota report";
-        return null;
-      }
-      if (reportErrors) lastError = null;
-      return parsed;
-    } catch (error) {
-      if (reportErrors) lastError = (error as { message?: string })?.message ?? String(error);
-      return null;
+      const resolved = await getProviderAuth(ctx, provider);
+      // Pi can resolve api_key credentials through the same method. Quota
+      // endpoints here require the subscription OAuth access token, not an API
+      // key; only Pi's OAuth result is eligible for the in-memory override.
+      if (resolved?.source !== "OAuth") return undefined;
+      const token = resolved.auth?.apiKey;
+      if (typeof token !== "string" || token.length === 0) return undefined;
+      const accountId = (typeof resolved?.accountId === "string" && resolved.accountId) || extractChatGptAccountId(token) || undefined;
+      return {
+        [provider]: {
+          access: token,
+          expiresAtMs: extractExpiresAtMs(token),
+          ...(family === "codex" && accountId ? { accountId } : {}),
+        },
+      };
+    } catch {
+      // Never put arbitrary auth errors in a TUI frame; the engine will report its read-only credential state.
+      return undefined;
     }
+  }
+
+  function mergeFamilyReport(fragment: QuotaReport): void {
+    const prior = report;
+    const merged = mergeReportIntoCache(prior, fragment as any) as QuotaReport;
+    merged.localStats = localStatsResult?.byFamily ?? prior?.localStats ?? fragment.localStats ?? {};
+    merged.localStatsMeta = localStatsResult?.scan ?? prior?.localStatsMeta ?? fragment.localStatsMeta ?? null;
+    merged.warnings = mergeWarnings(merged.warnings ?? [], localStatsWarnings);
+    const families = enabledFamilies({ env: process.env, requested: FAMILIES });
+    const ordering = [...families, ...Object.keys(merged.byFamily).filter((family) => !families.includes(family))];
+    merged.providers = ordering.flatMap((family) => merged.providers.filter((provider) => provider.family === family));
+    merged.byFamily = Object.fromEntries(
+      ordering
+        .map((family) => [family, merged.providers.filter((provider) => provider.family === family)] as const)
+        .filter(([, providers]) => providers.length > 0),
+    );
+    report = merged;
+  }
+
+  /**
+   * The report in memory, or the one on disk. Reading the cache also adopts the
+   * Claude source its key names, so a codex-only write keeps describing the
+   * Claude numbers the file already holds.
+   */
+  function ensureReport(): QuotaReport | null {
+    if (report) return report;
+    const cached = readCachedReport();
+    if (!cached) return null;
+    const stored = cached.key?.startsWith(CLAUDE_SOURCE_CACHE_PREFIX)
+      ? cached.key.slice(CLAUDE_SOURCE_CACHE_PREFIX.length)
+      : null;
+    if (stored) claudeSourceUsed = normalizeClaudeSourceMode(stored);
+    report = cached.report;
+    return report;
+  }
+
+  /** The key this report belongs under: the source it used, not the setting. */
+  function cacheKey(): string {
+    return cacheKeyFor(claudeSourceUsed ?? process.env.PI_QUOTA_CLAUDE_SOURCE ?? "");
+  }
+
+  function persistReport(freshFamilies: string[] = []): void {
+    if (!report) return;
+    // Every family keeps the clock it was fetched on: this report is written one
+    // family at a time, and stamping the whole file with "now" made Claude's
+    // five-minute-old numbers look as fresh as the Codex ones saved beside them.
+    // Only the family that just resolved is "now"; a family without a clock in
+    // refresh-state keeps the cache's, or its own results' age.
+    writeCache(report as any, { key: cacheKey(), fetchedAtMs: readRefreshState().fetchedAtMs, freshFamilies });
+  }
+
+  function updateFamilyClock(family: string): void {
+    const state = readRefreshState();
+    writeRefreshState({ fetchedAtMs: { ...state.fetchedAtMs, [family]: Date.now() } });
+  }
+
+  function startLocalStats(ctx: UiContext): void {
+    if (process.env.PI_QUOTA_LOCAL_STATS === "0" || localStatsInFlight) return;
+    const scan = startScan();
+    localStatsScan = scan;
+    const task = scan.result
+      .then((result) => {
+        if (disposed) return;
+        localStatsResult = result;
+        // The scan's own notes (a corrupt cache, an unreadable file) are part of
+        // the report the CLI already publishes; dropping them here made the same
+        // scan quieter inside Pi than in the terminal.
+        localStatsWarnings = result.warnings ?? [];
+        if (report) {
+          report = {
+            ...report,
+            localStats: result.byFamily,
+            localStatsMeta: result.scan,
+            warnings: mergeWarnings(report.warnings, localStatsWarnings),
+          };
+          persistReport();
+          if (surfaceActive()) paintUi(ctx);
+          try {
+            publishOmarchy(report, false);
+          } catch {
+            // The quota view is independent of the optional Omarchy record writer.
+          }
+          overlayView?.redraw();
+        }
+      })
+      .catch((error: { name?: string; message?: string }) => {
+        // The scan is optional, so a failure never delays or erases quotas — but
+        // it is not the same as a scan that found nothing. The CLI reports a
+        // failed scan as one warning line; a swallowed worker error meant a
+        // crash in the scanner looked exactly like an empty token history.
+        if (disposed || error?.name === "AbortError") return;
+        const cause = capCause(redactCause(error?.message ?? String(error)).split("\n")[0]);
+        localStatsWarnings = mergeWarnings(localStatsWarnings, [`local token stats: ${cause}`]);
+        if (!report) return;
+        report = { ...report, warnings: mergeWarnings(report.warnings, localStatsWarnings) };
+        if (surfaceActive()) paintUi(ctx);
+        overlayView?.redraw();
+      })
+      .finally(() => {
+        if (localStatsScan === scan) localStatsScan = null;
+        if (localStatsInFlight === task) localStatsInFlight = null;
+      });
+    localStatsInFlight = task;
+  }
+
+  /**
+   * End the local scan this session started. Nothing it began may outlive the
+   * session: a /quit or /reload one second into a cold scan would otherwise
+   * keep reading the session store and hold the token-history lock until the
+   * 120 s stale timeout, making the next scan read-only.
+   */
+  async function stopLocalStats(): Promise<void> {
+    const scan = localStatsScan;
+    localStatsScan = null;
+    if (!scan) return;
+    await scan.stop();
+  }
+
+  async function refreshFamily(ctx: UiContext, family: string, force: boolean): Promise<boolean> {
+    const running = inFlight.get(family);
+    if (running) return running;
+    let task: Promise<boolean>;
+    task = (async () => {
+      try {
+        // Explicit delay seam used by the live progressive-refresh proof; absent in normal runs.
+        if (process.env.PI_QUOTA_DEBUG_DELAY_FAMILY === family) {
+          const delay = Math.max(0, Math.min(30_000, Number(process.env.PI_QUOTA_DEBUG_DELAY_MS) || 2_000));
+          await new Promise((resolve) => setTimeout(resolve, delay));
+        }
+        const authOverrides = await authOverridesFor(ctx, family);
+        const env = family === "claude" && authOverrides
+          ? { ...process.env, PI_QUOTA_CLAUDE_SOURCE: "pi" }
+          : process.env;
+        const fragment = await loadFamily(family, { force, authOverrides, env, localStats: false } as any);
+        if (disposed) return false;
+        if (family === "claude") claudeSourceUsed = normalizeClaudeSourceMode(env.PI_QUOTA_CLAUDE_SOURCE);
+        const stickyFragment = mergeLastGood(fragment as any, {}).report as QuotaReport;
+        mergeFamilyReport(stickyFragment);
+        updateFamilyClock(family);
+        persistReport([family]);
+        resultGeneration += 1;
+        familyErrors.delete(family);
+        try {
+          const familyReport = { ...stickyFragment, localStats: report?.localStats ?? stickyFragment.localStats ?? {} };
+          publishOmarchy(familyReport, false);
+        } catch {
+          // A bar-record failure must not turn a quota refresh into an error.
+        }
+        if (surfaceActive()) paintUi(ctx);
+        return true;
+      } catch (error) {
+        const message = (error as { message?: string })?.message ?? String(error);
+        familyErrors.set(family, capCause(redactCause(message).split("\n")[0]));
+        return false;
+      } finally {
+        if (inFlight.get(family) === task) inFlight.delete(family);
+        if (surfaceActive()) paintUi(ctx);
+        overlayView?.redraw();
+      }
+    })();
+    inFlight.set(family, task);
+    return task;
+  }
+
+  /**
+   * One line per failing family, in family order so the list does not reshuffle
+   * as families land. The name is short for the same reason: this is a row in a
+   * dense panel, not a log.
+   */
+  function errorLines(): string[] {
+    const order = [...enabledFamilies({ env: process.env, requested: FAMILIES })];
+    for (const family of familyErrors.keys()) if (!order.includes(family)) order.push(family);
+    return order.flatMap((family) => {
+      const message = familyErrors.get(family);
+      return message ? [`${SHORT_NAME[family] ?? family}: ${message}`] : [];
+    });
   }
 
   function paintUi(ctx: UiContext): void {
@@ -2402,21 +2635,42 @@ export default function quotaPanelExtension(pi: ExtensionAPI): void {
   }
 
   async function refresh(ctx: UiContext, force: boolean): Promise<void> {
-    if (refreshing) return;
-    refreshing = true;
-    try {
-      const next = await runCli(force ? ["--json", "--force"] : ["--json"]);
-      if (disposed) return;
-      if (next) {
-        report = next;
-        // A bare /usage overlay is not a pinned surface: only repaint the widget
-        // and the footer when something is actually on screen.
-        if (surfaceActive()) paintUi(ctx);
-        void runCli(["omarchy"], { reportErrors: false });
+    if (disposed) return;
+    report = ensureReport();
+    const families = enabledFamilies({ env: process.env, requested: FAMILIES });
+    const now = Date.now();
+    const fetchedAtMs = { ...readRefreshState().fetchedAtMs };
+    // Upgrade path: an older CLI cache has no per-family clock file, but each
+    // provider already carries its own updatedAt. Do not refetch fresh cached data
+    // merely because this extension version has not written clocks yet.
+    for (const family of families) {
+      if (typeof fetchedAtMs[family] === "number") continue;
+      const providerTimes = (report?.providers ?? [])
+        .filter((provider) => provider.family === family)
+        .map((provider) => Date.parse(provider.updatedAt))
+        .filter((time) => Number.isFinite(time));
+      const generatedAt = report?.generatedAt ? Date.parse(report.generatedAt) : NaN;
+      const fallback = providerTimes.length > 0 ? Math.max(...providerTimes) : generatedAt;
+      if (Number.isFinite(fallback)) fetchedAtMs[family] = fallback;
+    }
+    const staleByClock = new Set(staleFamilies({
+      fetchedAtMs,
+      ttls: resolveFamilyTtls({ families }),
+      families,
+      now,
+    }));
+    const cachedFamilies = new Set(report?.providers.map((provider) => provider.family) ?? []);
+    const selected = force ? families : families.filter((family) => !cachedFamilies.has(family) || staleByClock.has(family));
+    if (selected.length === 0) return;
+    startLocalStats(ctx);
+    const outcomes = await Promise.all(selected.map((family) => refreshFamily(ctx, family, force)));
+    if (outcomes.every(Boolean) && inFlight.size === 0 && report && resultGeneration !== prunedGeneration) {
+      try {
+        publishOmarchy(report, true);
+        prunedGeneration = resultGeneration;
+      } catch {
+        // Keep fresh quota data even if the optional final stale-record prune fails.
       }
-    } finally {
-      refreshing = false;
-      overlayView?.redraw();
     }
   }
 
@@ -2476,36 +2730,23 @@ export default function quotaPanelExtension(pi: ExtensionAPI): void {
       ui.ui.setStatus(STATUS_KEY, undefined);
       ui.ui.setWidget(WIDGET_KEY, undefined);
     }
+    // Pi awaits session_shutdown (reason "reload" included), so the scan is gone
+    // and its lock released before the next session or the process starts.
+    await stopLocalStats();
   });
 
   /**
-   * Run `piquota stats --json` for one month (null: the newest with a file) and
-   * hand the payload to the overlay. Read-only, no lock: the CLI only reads.
+   * Read one month (null: the current local month) in-process and hand the
+   * aggregate-only payload to the overlay. Read-only, no lock: historyJson only reads.
    *
-   * A failure is reported the way the report path reports one: the CLI's own
-   * stderr line or its exit status, redacted and on one line. The JSON parser's
+   * A reader failure is redacted and limited to one line. The JSON parser's
    * "Unexpected end of JSON input" says nothing about the cause.
    */
   async function loadHistory(month: string | null, request: number): Promise<void> {
-    const cli = resolveCliPath();
-    if (!cli) {
-      overlayView?.setHistoryError("piquota not installed: run install.sh from the pi-quota repo", request);
-      return;
-    }
     try {
-      const runner = /node(\.exe)?$/i.test(process.execPath) ? process.execPath : "node";
-      const argv = [cli, "stats", "--json", ...(month ? ["--month", month] : [])];
-      const result = await pi.exec(runner, argv, { timeout: EXEC_TIMEOUT_MS });
-      const stdout = typeof result?.stdout === "string" ? result.stdout : "";
-      let parsed: HistoryPayload | null = null;
-      try {
-        parsed = stdout.trim() === "" ? null : (JSON.parse(stdout) as HistoryPayload);
-      } catch {
-        // A truncated or non-JSON stdout: report the run, not the parser.
-        parsed = null;
-      }
+      const parsed = await readHistory(month);
       if (!parsed || !Array.isArray(parsed.months)) {
-        overlayView?.setHistoryError(cliFailureLine(result), request);
+        overlayView?.setHistoryError("piquota stats returned no history payload", request);
         return;
       }
       overlayView?.setHistory(parsed, request);
@@ -2522,9 +2763,9 @@ export default function quotaPanelExtension(pi: ExtensionAPI): void {
    */
   async function showOverlay(ctx: UiContext): Promise<void> {
     // Paint on the same keystroke: the report already in memory, otherwise the
-    // CLI's on-disk cache. The forced refresh runs behind the overlay and never
-    // delays the first frame.
-    if (!report) report = readCachedReport();
+    // on-disk cache. Only stale families refresh behind the overlay; the first
+    // frame never waits for the network.
+    report = ensureReport();
     const custom = ctx.ui.custom;
     if (typeof custom !== "function" || (ctx.mode !== undefined && ctx.mode !== "tui")) {
       // A host without custom components still gets the panel that /usage panel pins.
@@ -2532,7 +2773,8 @@ export default function quotaPanelExtension(pi: ExtensionAPI): void {
       lineVisible = false;
       boxVisible = false;
       explicitBox = false;
-      if (!report) await refresh(ctx, false);
+      report = ensureReport();
+      void refresh(ctx, false);
       ensurePolling(ctx);
       paintUi(ctx);
       ctx.ui.notify("This host has no fullscreen overlay; the quota panel is pinned above the editor", "info");
@@ -2545,8 +2787,8 @@ export default function quotaPanelExtension(pi: ExtensionAPI): void {
           requestRender: () => tui?.requestRender?.(),
           getRows: () => tui?.terminal?.rows ?? process.stdout.rows ?? 24,
           getReport: () => report,
-          getError: () => lastError,
-          isRefreshing: () => refreshing,
+          getErrors: () => errorLines(),
+          isRefreshing: () => isRefreshing(),
           refresh: () => {
             void refresh(ctx, true);
           },
@@ -2582,10 +2824,11 @@ export default function quotaPanelExtension(pi: ExtensionAPI): void {
     switch (action) {
       case "refresh":
         await refresh(ctx, true);
+        const failures = errorLines();
         ctx.ui.notify(
           report
             ? `Quota refreshed (${report.providers.filter((provider) => provider.ok).length}/${report.providers.length} providers)`
-            : `Quota refresh failed: ${lastError}`,
+            : `Quota refresh failed: ${failures.length > 1 ? `${failures[0]} (+${failures.length - 1} more)` : failures[0] ?? "unknown error"}`,
           report ? "info" : "error",
         );
         return;
@@ -2595,7 +2838,9 @@ export default function quotaPanelExtension(pi: ExtensionAPI): void {
         boxVisible = false;
         explicitBox = false;
         panelVisible = false;
+        report = ensureReport();
         if (!report) await refresh(ctx, false);
+        else void refresh(ctx, false);
         ensurePolling(ctx);
         paintUi(ctx);
         ctx.ui.notify("Quota line pinned above the editor", "info");
@@ -2605,7 +2850,9 @@ export default function quotaPanelExtension(pi: ExtensionAPI): void {
         lineVisible = false;
         boxVisible = false;
         explicitBox = false;
+        report = ensureReport();
         if (!report) await refresh(ctx, false);
+        else void refresh(ctx, false);
         ensurePolling(ctx);
         paintUi(ctx);
         ctx.ui.notify("Quota panel shown above the editor", "info");
@@ -2615,7 +2862,9 @@ export default function quotaPanelExtension(pi: ExtensionAPI): void {
         boxVisible = true;
         explicitBox = true;
         panelVisible = false;
+        report = ensureReport();
         if (!report) await refresh(ctx, false);
+        else void refresh(ctx, false);
         ensurePolling(ctx);
         paintUi(ctx);
         ctx.ui.notify("Quota box pinned above the editor", "info");
@@ -2642,7 +2891,7 @@ export default function quotaPanelExtension(pi: ExtensionAPI): void {
         paintUi(ctx);
         return;
       case "json":
-        ctx.ui.notify(`${resolveCliPath() ?? "piquota"} --json   (cached at ~/.cache/pi-quota/usage.json)`, "info");
+        ctx.ui.notify(`Report cache: ${reportCachePath()}`, "info");
         return;
       default:
         break;
@@ -2651,7 +2900,7 @@ export default function quotaPanelExtension(pi: ExtensionAPI): void {
     // Bare /usage (or an unknown argument): open the overlay with whatever the
     // extension already has, and refresh in the background behind it.
     const opening = showOverlay(ctx);
-    void refresh(ctx, true);
+    void refresh(ctx, false);
     await opening;
   };
 

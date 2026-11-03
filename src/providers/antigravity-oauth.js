@@ -41,6 +41,9 @@ const ANTIGRAVITY_OAUTH_SOURCES = [
   join(homedir(), ".pi", "agent", "npm", "node_modules", "pi-antigravity", "dist", "auth", "oauth.js"),
 ];
 
+/** Renewed Google access tokens live only in this process, until shortly before expiry. */
+const renewedAccessTokens = new Map();
+
 /**
  * Recover the two `atob("..." + "...")` literals from the installed package.
  *
@@ -113,14 +116,15 @@ export function describeOAuthClient(options = {}) {
  *   timeoutMs?: number,
  *   now?: number,
  *   env?: Record<string, string | undefined>,
+ *   sourcePath?: string,
  * }} [options]
  * @returns {Promise<{ access: string, refresh: string, expires: number } | { error: string }>}
  */
 export async function refreshAccessToken(refreshToken, options = {}) {
   if (!refreshToken) return { error: "no refresh token available" };
-  // The caller's environment decides the client, so the one that describes a
-  // failed refresh (describeOAuthClient) is the one that was actually used.
-  const client = options.client ?? resolveOAuthClient({ env: options.env });
+  // The caller's environment and package source decide the client. Keep these
+  // resolution inputs aligned with describeOAuthClient for an accurate failure.
+  const client = options.client ?? resolveOAuthClient({ env: options.env, sourcePath: options.sourcePath });
 
   const response = await requestJson(GOOGLE_TOKEN_URL, {
     method: "POST",
@@ -160,12 +164,29 @@ export async function refreshAccessToken(refreshToken, options = {}) {
  *   bufferMs?: number,
  *   enabled?: boolean,
  *   env?: Record<string, string | undefined>,
+ *   sourcePath?: string,
+ *   cacheKey?: string,
  * }} [options]
  * @returns {Promise<{ ok: boolean, refreshed: boolean, error?: string }>}
  */
 export async function ensureFreshAccessToken(account, options = {}) {
   const now = options.now ?? Date.now();
   const bufferMs = options.bufferMs ?? 5 * 60 * 1000;
+  const cacheKey = options.cacheKey;
+  if (cacheKey) {
+    const cached = renewedAccessTokens.get(cacheKey);
+    if (cached && cached.expiresAtMs - bufferMs > now) {
+      account.access = cached.access;
+      account.expiresAtMs = cached.expiresAtMs;
+      return { ok: true, refreshed: true };
+    }
+    if (cached) {
+      clearTimeout(cached.timer);
+      cached.access = "";
+      renewedAccessTokens.delete(cacheKey);
+    }
+  }
+
   const expiring = !account.expiresAtMs || account.expiresAtMs - bufferMs <= now;
   if (!expiring) return { ok: true, refreshed: false };
   if (options.enabled === false) return { ok: Boolean(account.access), refreshed: false, error: "refresh disabled" };
@@ -177,5 +198,16 @@ export async function ensureFreshAccessToken(account, options = {}) {
   account.access = result.access;
   account.refresh = result.refresh;
   account.expiresAtMs = result.expires;
+  if (cacheKey) {
+    const entry = { access: result.access, expiresAtMs: result.expires, timer: null };
+    const clearAfterMs = Math.max(1, result.expires - bufferMs - now);
+    entry.timer = setTimeout(() => {
+      if (renewedAccessTokens.get(cacheKey) !== entry) return;
+      entry.access = "";
+      renewedAccessTokens.delete(cacheKey);
+    }, clearAfterMs);
+    entry.timer.unref?.();
+    renewedAccessTokens.set(cacheKey, entry);
+  }
   return { ok: true, refreshed: true };
 }

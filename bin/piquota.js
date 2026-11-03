@@ -177,10 +177,20 @@ async function main() {
   }
 
   if (command === "omarchy") {
-    const load = async () => {
+    const load = async ({ onFamily } = {}) => {
       const everyFamily = enabledFamilies({ env: process.env });
+      const publishFamily = onFamily
+        ? async (family, fragment) => onFamily(family, mergeLastGood(fragment, {}).report)
+        : undefined;
       const loadFresh = () =>
-        collectQuota({ families: everyFamily, timeoutMs: args.timeoutMs, refresh, force: args.force, localStats: LOCAL_STATS });
+        collectQuota({
+          families: everyFamily,
+          timeoutMs: args.timeoutMs,
+          refresh,
+          force: args.force,
+          localStats: LOCAL_STATS,
+          onFamily: publishFamily,
+        });
       const fresh = args.noCache
         ? await loadFresh()
         : (await withCache({ ttlMs: args.ttlMs, force: args.force, families: everyFamily, key: CACHE_KEY }, loadFresh)).report;

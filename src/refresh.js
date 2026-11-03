@@ -278,7 +278,10 @@ export async function collectWithCadence(options) {
     : null;
 
   const report = mergeReports([cachedPart, fresh], { families, now, reused });
-  writeCache(report, { path: cachePath, now });
+  // The cache carries the same per-family clocks this layer decided on, so a
+  // reader that only sees the cache (the CLI, the extension's first frame)
+  // judges each family by the time it was actually fetched.
+  writeCache(report, { path: cachePath, now, fetchedAtMs });
   writeRefreshState({ fetchedAtMs }, { statePath });
 
   /** @type {Record<string, number>} */

@@ -9,7 +9,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 
-import { collectQuota } from "../src/engine.js";
+import { collectFamily, collectQuota } from "../src/engine.js";
 import { clearCache, readCache, withCache, writeCache } from "../src/cache.js";
 import {
   antigravityUsageBody,
@@ -68,6 +68,110 @@ test("collectQuota reports all five registered families when GitHub Actions is e
   assert.equal(byFamily["opencode-go"].ok, false);
   assert.match(byFamily["opencode-go"].error ?? "", /piquota auth opencode/);
   assert.equal(byFamily["github-actions"].ok, true);
+});
+
+test("host-resolved OAuth credentials override access and Codex identity only in memory", async () => {
+  const routes = fullRoutes().fetchFn;
+  const codexToken = [
+    "header",
+    Buffer.from(JSON.stringify({ exp: NOW / 1000 + 600 })).toString("base64url"),
+    "signature",
+  ].join(".");
+  let sentAuthorization = null;
+  let sentAccountId = null;
+  const fetchFn = async (input, init) => {
+    if (String(input).includes("chatgpt.com")) {
+      sentAuthorization = init.headers.Authorization;
+      sentAccountId = init.headers["chatgpt-account-id"];
+    }
+    return routes(input, init);
+  };
+  const report = await collectFamily("codex", {
+    paths: [FIXTURE],
+    claudeCodePaths: [],
+    now: NOW,
+    fetchFn,
+    env: {},
+    stores: [],
+    allowBrowser: false,
+    localStats: false,
+    authOverrides: {
+      "openai-codex": { access: codexToken, expiresAtMs: NOW + 600_000, accountId: "acct-from-pi" },
+    },
+  });
+
+  assert.equal(sentAuthorization, `Bearer ${codexToken}`);
+  assert.equal(sentAccountId, "acct-from-pi");
+  assert.equal(report.byFamily.codex[0].account, "acct-fro…", "the display identity is shortened; the full account id was sent in the request header");
+  assert.equal(JSON.stringify(report).includes(codexToken), false, "the report never carries a resolved auth token");
+});
+
+test("Pi OAuth overrides supply credentials when the standalone reader has no matching store entry", async () => {
+  const routes = fullRoutes().fetchFn;
+  let sentAuthorization = null;
+  const fetchFn = async (input, init) => {
+    if (String(input).includes("chatgpt.com")) sentAuthorization = init.headers.Authorization;
+    return routes(input, init);
+  };
+  const token = [
+    "header",
+    Buffer.from(JSON.stringify({
+      exp: NOW / 1000 + 600,
+      "https://api.openai.com/auth": { chatgpt_account_id: "acct-runtime" },
+    })).toString("base64url"),
+    "signature",
+  ].join(".");
+  const report = await collectFamily("codex", {
+    paths: [],
+    now: NOW,
+    fetchFn,
+    env: {},
+    stores: [],
+    allowBrowser: false,
+    localStats: false,
+    authOverrides: { "openai-codex": { access: token, expiresAtMs: NOW + 600_000 } },
+  });
+
+  assert.equal(sentAuthorization, `Bearer ${token}`);
+  assert.equal(report.byFamily.codex[0].account, "acct-run…");
+  assert.equal(report.byFamily.codex[0].source, "Pi runtime auth");
+  assert.equal(JSON.stringify(report).includes(token), false, "the synthesized credential is in-memory only");
+});
+
+test("collectQuota emits one-family fragments before slower families finish", async () => {
+  const routes = fullRoutes().fetchFn;
+  let releaseCodex;
+  const codexGate = new Promise((resolve) => { releaseCodex = resolve; });
+  const fetchFn = async (input, init) => {
+    if (String(input).includes("chatgpt.com")) await codexGate;
+    return routes(input, init);
+  };
+  let resolveFirst;
+  const firstFamily = new Promise((resolve) => { resolveFirst = resolve; });
+  const emitted = [];
+  const pending = collectQuota({
+    paths: [FIXTURE],
+    claudeCodePaths: [],
+    now: NOW,
+    fetchFn,
+    families: ["claude", "codex"],
+    env: {},
+    stores: [],
+    allowBrowser: false,
+    localStats: false,
+    onFamily: async (family, fragment) => {
+      emitted.push(family);
+      assert.deepEqual(new Set(fragment.providers.map((provider) => provider.family)), new Set([family]));
+      if (family === "claude") resolveFirst(family);
+    },
+  });
+
+  assert.equal(await Promise.race([firstFamily, new Promise((resolve) => setTimeout(() => resolve("timeout"), 250))]), "claude");
+  assert.deepEqual(emitted, ["claude"], "the Claude fragment arrives while Codex is still blocked");
+  releaseCodex();
+  const final = await pending;
+  assert.deepEqual(emitted, ["claude", "codex"]);
+  assert.equal(final.providers.length, 2);
 });
 
 test("collectQuota marks a family with no credential as degraded, not missing", async () => {
@@ -153,6 +257,90 @@ test("cache round-trips, respects the TTL and stores no secrets", async () => {
   assert.equal(raw.includes("fixture-signature"), false);
   assert.equal(clearCache({ path }).removed, true);
   assert.equal(readCache({ path }), null);
+});
+
+test("the cache judges each family by its own fetch time", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "pi-quota-cache-clocks-"));
+  const path = join(directory, "usage.json");
+  const { fetchFn } = fullRoutes();
+  const report = await collectQuota({ paths: [FIXTURE], claudeCodePaths: [], now: NOW, fetchFn, env: {}, stores: [], allowBrowser: false });
+
+  // The Pi extension writes the report family by family: Claude was fetched
+  // 200 s before the rest, and the file itself was written a moment ago.
+  assert.equal(
+    writeCache(report, {
+      path,
+      now: NOW,
+      fetchedAtMs: { claude: NOW - 200_000, codex: NOW, antigravity: NOW, "opencode-go": NOW },
+    }).ok,
+    true,
+  );
+  const hit = readCache({ path, now: NOW + 5_000, ttlMs: Number.POSITIVE_INFINITY });
+  assert.ok(hit);
+  assert.equal(hit.fetchedAt.claude, NOW - 200_000, "a family's own clock is kept");
+  assert.equal(hit.ageMs, 205_000, "the report is as old as its oldest family");
+  assert.equal(readCache({ path, now: NOW + 5_000, ttlMs: 60_000 }), null, "and one stale family expires the whole-file read");
+
+  let loads = 0;
+  const loader = async () => {
+    loads += 1;
+    return report;
+  };
+  const codex = await withCache({ path, now: NOW + 5_000, ttlMs: 60_000, families: ["codex"] }, loader);
+  assert.equal(codex.cached, true, "a family inside its own TTL is served");
+  assert.equal(loads, 0);
+
+  const claude = await withCache({ path, now: NOW + 5_000, ttlMs: 60_000, families: ["claude"] }, loader);
+  assert.equal(claude.cached, false, "Claude's 200 s old copy is not a 60 s answer, however new the file is");
+  assert.equal(loads, 1);
+});
+
+test("a write that did not fetch a family never restamps that family to now", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "pi-quota-cache-fresh-"));
+  const path = join(directory, "usage.json");
+  const { fetchFn } = fullRoutes();
+  const report = await collectQuota({ paths: [FIXTURE], claudeCodePaths: [], now: NOW, fetchFn, env: {}, stores: [], allowBrowser: false });
+  const HOUR = 3_600_000;
+  // Claude's results are an hour old and no clock names it (a deleted
+  // refresh-state, a mixed cache): the extension just fetched Codex and saves
+  // its whole in-memory report.
+  const aged = {
+    ...report,
+    providers: report.providers.map((provider) =>
+      provider.family === "claude" ? { ...provider, updatedAt: new Date(NOW - HOUR).toISOString() } : provider,
+    ),
+  };
+  assert.equal(writeCache(aged, { path, now: NOW, fetchedAtMs: { codex: NOW }, freshFamilies: ["codex"] }).ok, true);
+  const hit = readCache({ path, now: NOW, ttlMs: Number.POSITIVE_INFINITY });
+  assert.ok(hit);
+  assert.equal(hit.fetchedAt.codex, NOW);
+  assert.equal(hit.fetchedAt.claude, NOW - HOUR, "Claude is as old as its own results, not as new as the write");
+
+  // A second write keeps that clock instead of taking the newer one.
+  assert.equal(writeCache(aged, { path, now: NOW + 10_000, freshFamilies: ["codex"] }).ok, true);
+  assert.equal(readCache({ path, now: NOW + 10_000, ttlMs: Number.POSITIVE_INFINITY }).fetchedAt.claude, NOW - HOUR);
+
+  let loads = 0;
+  const claude = await withCache({ path, now: NOW + 10_000, ttlMs: 60_000, families: ["claude"] }, async () => {
+    loads += 1;
+    return report;
+  });
+  assert.equal(claude.cached, false, "the CLI does not serve the hour-old Claude copy as fresh");
+  assert.equal(loads, 1);
+});
+
+test("a cache written before per-family clocks is still aged by its savedAt", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "pi-quota-cache-legacy-"));
+  const path = join(directory, "usage.json");
+  const { fetchFn } = fullRoutes();
+  const report = await collectQuota({ paths: [FIXTURE], claudeCodePaths: [], now: NOW, fetchFn, env: {}, stores: [], allowBrowser: false });
+
+  writeFileSync(path, JSON.stringify({ savedAt: NOW, report }, null, 2), "utf-8");
+  const hit = readCache({ path, now: NOW + 5_000, ttlMs: 60_000 });
+  assert.ok(hit, "an old file is still readable");
+  assert.equal(hit.fetchedAt.claude, NOW, "every family falls back to savedAt");
+  assert.equal(hit.fetchedAt["opencode-go"], NOW);
+  assert.equal(readCache({ path, now: NOW + 61_000, ttlMs: 60_000 }), null, "and it still expires as a whole");
 });
 
 test("withCache refreshes once and then serves the cached copy", async () => {

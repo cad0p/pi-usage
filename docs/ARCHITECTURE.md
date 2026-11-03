@@ -11,7 +11,7 @@ Instructions, architecture rules, and testing guidelines for AI coding agents wo
 
 ### Core Philosophy
 1. **Credentials Pi Already Owns**: Do not duplicate authentication or invent new login workflows when credentials already exist in `~/.pi/agent/auth.json` or `~/.claude/.credentials.json`.
-2. **Strict Read-Only Guarantee**: Never mutate credential files on disk.
+2. **Read-Only by Default**: pi-usage never writes credential files. CLI/timer auth access is read-only; the Pi extension may ask Pi's `getProviderAuth` to resolve OAuth and Pi may persist its own renewal under its auth-store lock.
 3. **Zero Runtime Dependencies**: Written entirely in vanilla ES Modules targeting Node.js `>=22.19.0` using native `node:sqlite`, `node:fs`, and global `fetch`.
 
 ## Setup & Dev Environment
@@ -66,7 +66,8 @@ The project uses Node.js's built-in test runner (`node:test` and `node:assert/st
 Any modification to this codebase MUST uphold these non-negotiable guarantees:
 
 1. **Read-Only Credential Access**:
-   - `~/.pi/agent/auth.json` is opened strictly with `flag: "r"`. It must never be written, synced, or modified.
+   - pi-usage's direct read of `~/.pi/agent/auth.json` uses `flag: "r"`; pi-usage code must never write, sync, or modify it. The extension's sole exception is delegating OAuth resolution to Pi's `ctx.modelRegistry.getProviderAuth`; Pi may persist a renewal through its own locked auth-storage path.
+   - The CLI and systemd timer never call Pi auth resolution and remain strictly read-only on `auth.json`.
    - `~/.claude/.credentials.json` is opened read-only.
    - Pi's session files (`~/.pi/agent/sessions/**/*.jsonl`,
      `$PI_CODING_AGENT_DIR/sessions`, `~/.omp/agent/sessions`) are opened read-only
@@ -77,10 +78,10 @@ Any modification to this codebase MUST uphold these non-negotiable guarantees:
      output.
 2. **Token Refresh Invariants**:
    - **Antigravity**: Access tokens may be refreshed in memory using Google's public client, because Google refresh tokens do not rotate. The refreshed token must NEVER be written back to disk.
-   - **Claude and Codex**: NEVER refresh access tokens. Both Anthropic and OpenAI rotate refresh tokens; refreshing a token would invalidate the credentials owned by external CLI tools.
+   - **Claude and Codex**: pi-usage's engine, CLI, and systemd timer NEVER refresh these access tokens. In the Pi extension only, use `getProviderAuth("anthropic" | "openai-codex")`; Pi returns a fresh token directly or performs a near-expiry refresh and persists it under its own cross-process lock. pi-usage never reads refresh tokens for these providers or writes auth storage itself.
    - **Claude Code Store**: The refresh token from `~/.claude/.credentials.json` is never loaded into memory.
 3. **Zero Secret Leakage**:
-   - Never print, log, cache, or transmit tokens, refresh tokens, session keys, or API keys.
+   - Never print, log, persist, or serialize tokens, refresh tokens, session keys, or API keys. They are sent only in provider requests. The extension may hold Pi-resolved OAuth access tokens in memory for that refresh; Antigravity's renewed token is kept in a process-local cache until shortly before expiry, never on disk.
    - Redact email addresses and identity markers in exported JSON artifacts via `src/http.js:redact`.
 4. **Filesystem Boundaries**:
    - Caches and state files are restricted to `~/.cache/pi-quota/` (report cache, refresh/sticky state, and `local-sessions.json` for the token scan) and `~/.local/state/pi-quota/`.

@@ -61,7 +61,7 @@ function writeRecord(dir, id, record) {
  * no longer present.
  *
  * @param {Array<{ id: string, record: Record<string, unknown> }>} records
- * @param {{ dir?: string, env?: Record<string, string | undefined>, home?: string }} [options]
+ * @param {{ dir?: string, env?: Record<string, string | undefined>, home?: string, prune?: boolean }} [options]
  * @returns {{ dir: string, written: string[], removed: string[] }}
  */
 export function publishRecords(records, options = {}) {
@@ -74,15 +74,16 @@ export function publishRecords(records, options = {}) {
     written.push(writeRecord(dir, id, record));
   }
 
-  const keep = new Set(records.map(({ id }) => `${id}.json`));
   const removed = [];
-  for (const name of readdirSync(dir)) {
-    if (!name.startsWith(RECORD_PREFIX) || !name.endsWith(".json")) continue;
-    if (!isPiRecordId(name.slice(0, -".json".length)) || keep.has(name)) continue;
-    rmSync(join(dir, name), { force: true });
-    removed.push(join(dir, name));
+  if (options.prune !== false) {
+    const keep = new Set(records.map(({ id }) => `${id}.json`));
+    for (const name of readdirSync(dir)) {
+      if (!name.startsWith(RECORD_PREFIX) || !name.endsWith(".json")) continue;
+      if (!isPiRecordId(name.slice(0, -".json".length)) || keep.has(name)) continue;
+      rmSync(join(dir, name), { force: true });
+      removed.push(join(dir, name));
+    }
   }
-
 
   return { dir, written, removed };
 }

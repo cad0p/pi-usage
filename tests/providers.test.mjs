@@ -145,6 +145,52 @@ test("antigravity: the project prints once and a token renewed in memory is not 
   assert.equal(JSON.parse(/** @type {string} */ (quota.init.body)).project, "rising-fixture-project");
 });
 
+test("antigravity: a renewal is shared per account, never across accounts", async () => {
+  // The renewal is in memory and keyed by the credential's own source and
+  // identity, so two fetches of one account in a run cost one token request,
+  // while a second account gets its own. Without that key every fetch either
+  // renewed again or, worse, reused another account's token.
+  let renewals = 0;
+  const { fetchFn } = routedFetch([
+    [
+      "oauth2.googleapis.com",
+      () => {
+        renewals += 1;
+        return jsonResponse({ access_token: `ya29.REUSED-${renewals}`, expires_in: 3600 });
+      },
+    ],
+    ["cloudcode", () => jsonResponse(antigravityUsageBody())],
+  ]);
+  const credential = (source, projectId) => normalizeCredential("antigravity", {
+    type: "oauth",
+    access: "ya29.STALE",
+    refresh: "1//FAKE",
+    projectId,
+    expires: 1_700_000_000_000,
+  }, source);
+  const account = credential("/tmp/auth-agy-process-cache.json", "process-cache-fixture");
+  const sameAccount = credential("/tmp/auth-agy-process-cache.json", "process-cache-fixture");
+  const otherAccount = credential("/tmp/auth-agy-process-cache.json", "process-cache-other-fixture");
+  assert.ok(account && sameAccount && otherAccount);
+
+  const options = (now) => ({
+    now,
+    fetchFn,
+    refresh: true,
+    expiresInMin: -271_316,
+    env: { ANTIGRAVITY_CLIENT_ID: "id-fixture", ANTIGRAVITY_CLIENT_SECRET: "secret-fixture" },
+  });
+  const first = await fetchAntigravity(account, options(NOW));
+  const second = await fetchAntigravity(sameAccount, options(NOW + 1_000));
+  assert.equal(first.tokenRenewedInMemory, true);
+  assert.equal(second.tokenRenewedInMemory, true);
+  assert.equal(renewals, 1, "the same account reuses its renewal instead of asking Google again");
+
+  const other = await fetchAntigravity(otherAccount, options(NOW + 2_000));
+  assert.equal(other.tokenRenewedInMemory, true);
+  assert.equal(renewals, 2, "another account's renewal is its own");
+});
+
 test("antigravity: a renewal that failed keeps the credential's expiry warning", async () => {
   const { fetchFn } = routedFetch([
     ["oauth2.googleapis.com", () => jsonResponse({ error: "invalid_grant" }, { status: 400 })],
@@ -156,7 +202,7 @@ test("antigravity: a renewal that failed keeps the credential's expiry warning",
     refresh: "1//FAKE",
     projectId: "rising-fixture-project",
     expires: 1_700_000_000_000,
-  }, "/tmp/auth.json");
+  }, "/tmp/auth-expired-no-renewal.json");
   assert.ok(credential);
 
   const result = await fetchAntigravity(credential, {
