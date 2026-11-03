@@ -81,7 +81,8 @@ const KITTY_EQUIVALENTS = new Map([
 /** What a legacy terminal (or tmux, in either cursor mode) sends for each key. */
 const LEGACY = {
   escape: ["\u001b"],
-  enter: ["\r", "\n"],
+  // SS3 M is how xterm family terminals send the numpad Enter.
+  enter: ["\r", "\n", "\u001bOM"],
   tab: ["\t"],
   space: [" "],
   up: ["\u001b[A", "\u001bOA"],
@@ -98,8 +99,10 @@ const LEGACY = {
 const FUNCTIONAL_BY_NUMBER = { 1: FUNCTIONAL.home, 2: FUNCTIONAL.insert, 3: FUNCTIONAL.delete, 4: FUNCTIONAL.end, 5: FUNCTIONAL.pageUp, 6: FUNCTIONAL.pageDown, 7: FUNCTIONAL.home, 8: FUNCTIONAL.end };
 
 const CSI_U = /^\x1b\[(\d+)(?::(\d*))?(?::(\d+))?(?:;(\d+))?(?::(\d+))?u$/;
-const CSI_ARROW = /^\x1b\[(?:1)?(?:;(\d+))?(?::(\d+))?([ABCD])$/;
-const CSI_HOME_END = /^\x1b\[(?:1)?(?:;(\d+))?(?::(\d+))?([HF])$/;
+// A modifier field only ever follows "1;" — the bare forms (\x1b[1A, \x1b[1H)
+// are not sequences pi-tui accepts as arrows, so neither do we.
+const CSI_ARROW = /^\x1b\[1;(\d+)(?::(\d+))?([ABCD])$/;
+const CSI_HOME_END = /^\x1b\[1;(\d+)(?::(\d+))?([HF])$/;
 const CSI_FUNCTIONAL = /^\x1b\[(\d+)(?:;(\d+))?(?::(\d+))?~$/;
 const CSI_MODIFY_OTHER_KEYS = /^\x1b\[27;(\d+);(\d+)~$/;
 
@@ -147,13 +150,13 @@ function parseKey(data) {
   }
 
   match = data.match(CSI_ARROW);
-  if (match) return { codepoint: ARROW_BY_LETTER[match[3]], modifier: match[1] ? Number(match[1]) - 1 : 0, event: eventType(match[2]) };
+  if (match) return { codepoint: ARROW_BY_LETTER[match[3]], modifier: Number(match[1]) - 1, event: eventType(match[2]) };
 
   match = data.match(CSI_HOME_END);
   if (match) {
     return {
       codepoint: match[3] === "H" ? FUNCTIONAL.home : FUNCTIONAL.end,
-      modifier: match[1] ? Number(match[1]) - 1 : 0,
+      modifier: Number(match[1]) - 1,
       event: eventType(match[2]),
     };
   }

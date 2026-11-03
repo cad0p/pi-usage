@@ -1062,6 +1062,20 @@ test("a kitty repeat is a press, so a held key keeps moving as it does in tmux",
     await settle();
     assert.equal(range(), repeated, "the release pages nothing");
   }, { rows: 12 });
+
+  // A printable repeats too: the overlay must treat it as another press.
+  await withKeyOverlay(overlayReport(), async ({ overlay, frame }) => {
+    assert.match(frame(), /❯ ▾ Claude/, "the overlay opens on the first section");
+    overlay.component.handleInput("\u001b[106;1:1u");
+    await settle();
+    assert.match(frame(), /❯ ▾ OP-Go/, "a kitty j press moves once");
+    overlay.component.handleInput("\u001b[106;1:2u");
+    await settle();
+    assert.match(frame(), /❯ ▾ OP-Go/, "…and staying at the last section is not a drift");
+    overlay.component.handleInput("\u001b[107;1:2u");
+    await settle();
+    assert.match(frame(), /❯ ▾ Claude/, "a kitty k repeat walks back instead of being dropped");
+  });
 });
 
 test("a host without custom components keeps the pinned panel instead of failing", async () => {

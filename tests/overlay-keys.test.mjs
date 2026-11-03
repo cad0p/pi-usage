@@ -28,7 +28,7 @@ const NAMED_KEYS = [
   },
   {
     name: "enter",
-    legacy: ["\r", "\n"],
+    legacy: ["\r", "\n", `${ESC}OM`],
     press: [`${ESC}[13u`, `${ESC}[13;1u`, `${ESC}[57414u`],
     release: [`${ESC}[13;1:3u`],
     repeat: [`${ESC}[13;1:2u`],
@@ -190,6 +190,47 @@ test("kitty-encoded printables match their character, including shifted letters"
   }
 });
 
+/**
+ * The same kitty CSI-u sequence with an event type: 2 repeats, 3 releases.
+ *
+ * @param {string} sequence a press sequence
+ * @param {2 | 3} event
+ * @returns {string}
+ */
+function withEvent(sequence, event) {
+  const match = sequence.match(/^(\x1b\[[^u]*)u$/);
+  assert.ok(match, `${JSON.stringify(sequence)} is a CSI-u sequence`);
+  const [, fields] = match;
+  const withModifier = /;\d+(?::\d+)?$/.test(fields) ? `${fields}:${event}` : `${fields};1:${event}`;
+  return `${withModifier}u`;
+}
+
+test("a printable's release never acts and its repeat does", () => {
+  // The overlay's guard (isKeyRelease) is what makes a release inert; the
+  // decoder itself is event-agnostic, so "acts" is both together. A repeat is
+  // a press, exactly as in a legacy terminal where the OS repeats the byte.
+  const acts = (data, char) => matchesPrintable(data, char) && !isKeyRelease(data);
+  for (const entry of PRINTABLE_KEYS) {
+    const presses = [
+      `${ESC}[${entry.codepoint}u`,
+      `${ESC}[${entry.codepoint};1u`,
+      ...(entry.shifted ?? []),
+    ];
+    for (const press of presses) {
+      const release = withEvent(press, 3);
+      const repeat = withEvent(press, 2);
+      assert.equal(acts(release, entry.char), false, `${JSON.stringify(release)} releases "${entry.char}" and must not act`);
+      assert.equal(acts(repeat, entry.char), true, `${JSON.stringify(repeat)} repeats "${entry.char}" and must act`);
+      assert.equal(isKeyRelease(repeat), false);
+      assert.equal(isKeyRelease(release), true);
+      for (const other of PRINTABLE_KEYS) {
+        if (other.char === entry.char) continue;
+        assert.equal(acts(release, other.char), false, `${JSON.stringify(release)} is not "${other.char}" either`);
+      }
+    }
+  }
+});
+
 test("shifted symbols and modified keys are not the plain key", () => {
   // Kitty reports Shift+[ as "{" and Shift+1 as "!", never as the unshifted key.
   assert.equal(matchesPrintable(`${ESC}[91:123;2u`, "["), false);
@@ -217,6 +258,21 @@ test("shifted symbols and modified keys are not the plain key", () => {
   // break the arrows; the overlay still gets the plain key.
   assert.equal(matchesKey(`${ESC}[1;65B`, "down"), true);
   assert.equal(matchesKey(`${ESC}[1;129C`, "right"), true);
+});
+
+test("the bare one-modifier arrow form is not an arrow", () => {
+  // \x1b[1A / \x1b[1H carry no modifier field; pi-tui's own matcher rejects
+  // them, so accepting them would let a stray sequence move the cursor twice.
+  for (const sequence of [`${ESC}[1A`, `${ESC}[1B`, `${ESC}[1C`, `${ESC}[1D`, `${ESC}[1H`, `${ESC}[1F`]) {
+    assert.equal(isKeyRelease(sequence), false);
+    assert.equal(isKeyRepeat(sequence), false);
+    for (const entry of NAMED_KEYS) {
+      assert.equal(matchesKey(sequence, entry.name), false, `${JSON.stringify(sequence)} is not ${entry.name}`);
+    }
+  }
+  for (const [sequence, name] of [[`${ESC}[1;1A`, "up"], [`${ESC}[1;1B`, "down"], [`${ESC}[1;1H`, "home"], [`${ESC}[1;1F`, "end"]]) {
+    assert.equal(matchesKey(sequence, name), true, `…while ${JSON.stringify(sequence)} is ${name}`);
+  }
 });
 
 test("other keys, bare modifiers and pasted text are never legend keys", () => {
