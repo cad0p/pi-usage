@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## [calver-released]
+## [0.11.4] - 2026-11-03
 
 <!-- USER-EDITABLE SECTION START -->
 Token history, a scrolling bar panel, and Antigravity from Pi's own login.
