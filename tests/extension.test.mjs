@@ -969,7 +969,25 @@ const PRINTABLE_KEY_CASES = [
  * Run one key case twice: once with the legacy sequence, once with the kitty
  * press. A kitty release before the press must do nothing; the press must act.
  */
-async function checkKeyCase(entry, pressSequence) {
+/**
+ * The same kitty CSI sequence with its event type set to repeat (2): the
+ * terminal auto-repeating a held key, which the overlay treats as a press.
+ *
+ * @param {string} sequence a kitty press sequence
+ * @returns {string}
+ */
+function repeatOf(sequence) {
+  const match = sequence.match(/^\x1b\[(.+?)([A-Za-z~])$/);
+  assert.ok(match, `${JSON.stringify(sequence)} is a kitty CSI sequence`);
+  const [, body, final] = match;
+  const parts = body.split(";");
+  if (parts.length === 1) return `\x1b[${body};1:2${final}`;
+  const last = parts[parts.length - 1].split(":");
+  parts[parts.length - 1] = `${last[0]}:2`;
+  return `\x1b[${parts.join(";")}${final}`;
+}
+
+async function checkKeyCase(entry, pressSequence, variant = "press") {
   const calls = [];
   const report = entry.report ? entry.report() : overlayReport();
   const harnessOptions = { ...(entry.harness ?? {}) };
@@ -989,44 +1007,48 @@ async function checkKeyCase(entry, pressSequence) {
         overlay.component.handleInput(sequence);
         await settle();
       }
-      assert.equal(entry.happened(state().frame, state()), false, `${entry.action}: the setup leaves it undone`);
+      assert.equal(entry.happened(state().frame, state()), false, `${entry.action} (${variant}): the setup leaves it undone`);
       overlay.component.handleInput(entry.release);
       await settle();
-      assert.equal(entry.happened(state().frame, state()), false, `${entry.action}: a kitty release is not a press`);
+      assert.equal(entry.happened(state().frame, state()), false, `${entry.action} (${variant}): a kitty release is not a press`);
       overlay.component.handleInput(pressSequence);
       await settle();
-      assert.equal(entry.happened(state().frame, state()), true, `${entry.action}: ${JSON.stringify(pressSequence)} acts`);
+      assert.equal(entry.happened(state().frame, state()), true, `${entry.action} (${variant}): ${JSON.stringify(pressSequence)} acts`);
       overlay.component.handleInput(entry.release);
       await settle();
-      assert.equal(entry.happened(state().frame, state()), true, `${entry.action}: its release does not act a second time`);
+      assert.equal(entry.happened(state().frame, state()), true, `${entry.action} (${variant}): its release does not act a second time`);
     },
     { rows: entry.rows, harness: harnessOptions },
   );
 }
 
-test("every named legend key works from a legacy and a kitty terminal, and never on a release", async () => {
+test("every named legend key works from a legacy, a kitty press and a kitty repeat, and never on a release", async () => {
   for (const entry of NAMED_KEY_CASES) {
-    await checkKeyCase(entry, entry.legacy);
-    await checkKeyCase(entry, entry.press);
+    await checkKeyCase(entry, entry.legacy, "legacy");
+    await checkKeyCase(entry, entry.press, "kitty press");
+    await checkKeyCase(entry, repeatOf(entry.press), "kitty repeat");
   }
 });
 
-test("kitty-encoded printable keys act once, and their release does not act again", async () => {
+test("kitty-encoded printable keys act on press and repeat, and never on a release", async () => {
   for (const entry of PRINTABLE_KEY_CASES) {
     const kitty = { ...entry, legacy: entry.char };
-    await checkKeyCase(kitty, entry.char);
-    await checkKeyCase(kitty, entry.press);
+    await checkKeyCase(kitty, entry.char, "legacy");
+    await checkKeyCase(kitty, entry.press, "kitty press");
+    await checkKeyCase(kitty, repeatOf(entry.press), "kitty repeat");
   }
 });
 
-test("Esc closes /usage from Now and from History, in legacy and kitty encodings, never on a release", async () => {
+test("Esc closes /usage from Now and from History, on legacy, kitty press and kitty repeat, never on a release", async () => {
   const cases = [
     { view: "Now", setup: [], sequence: "\u001b" },
     { view: "Now", setup: [], sequence: "\u001b[27u" },
     { view: "Now", setup: [], sequence: "\u001b[27;1:1u" },
+    { view: "Now", setup: [], sequence: repeatOf("\u001b[27;1:1u") },
     { view: "History", setup: ["2"], sequence: "\u001b" },
     { view: "History", setup: ["2"], sequence: "\u001b[27u" },
     { view: "History", setup: ["2"], sequence: "\u001b[27;1:1u" },
+    { view: "History", setup: ["2"], sequence: repeatOf("\u001b[27;1:1u") },
   ];
   for (const entry of cases) {
     await withKeyOverlay(overlayReport(), async ({ overlay, frame }) => {

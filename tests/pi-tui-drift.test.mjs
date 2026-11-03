@@ -22,7 +22,12 @@ import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import test from "node:test";
 
-import { matchesKey as localMatchesKey, matchesPrintable } from "../src/overlay-keys.js";
+import {
+  isKeyRelease as localIsKeyRelease,
+  isKeyRepeat as localIsKeyRepeat,
+  matchesKey as localMatchesKey,
+  matchesPrintable,
+} from "../src/overlay-keys.js";
 
 const ESC = "\u001b";
 
@@ -200,10 +205,31 @@ function shiftedAlternatives(char, codepoint) {
     return [
       `${ESC}[${lowerCodepoint}:${codepoint};2u`,
       `${ESC}[${codepoint}:${lowerCodepoint};2u`,
-      `${ESC}[${lowerCodepoint};${codepoint}::2u`,
+      `${ESC}[${lowerCodepoint}:${codepoint}:${lowerCodepoint};2u`,
     ];
   }
   return [];
+}
+
+/** Whether a module has the five matcher functions this guard compares. */
+function hasMatcher(module) {
+  return typeof module?.matchesKey === "function"
+    && typeof module.decodePrintableKey === "function"
+    && typeof module.isKeyRelease === "function"
+    && typeof module.isKeyRepeat === "function"
+    && typeof module.setKittyProtocolActive === "function";
+}
+
+/** The matcher surface, with where it came from for the failure message. */
+function matcherFrom(module, from) {
+  return {
+    matchesKey: module.matchesKey,
+    decodePrintableKey: module.decodePrintableKey,
+    isKeyRelease: module.isKeyRelease,
+    isKeyRepeat: module.isKeyRepeat,
+    setKittyProtocolActive: module.setKittyProtocolActive,
+    from,
+  };
 }
 
 /**
@@ -211,7 +237,7 @@ function shiftedAlternatives(char, codepoint) {
  * newest Pi release install, or the managed npm tree. Returns null when the
  * host is not installed, which is the CI case.
  *
- * @returns {Promise<{ matchesKey: Function, decodePrintableKey: Function, setKittyProtocolActive: Function, from: string } | null>}
+ * @returns {Promise<{ matchesKey: Function, decodePrintableKey: Function, isKeyRelease: Function, isKeyRepeat: Function, setKittyProtocolActive: Function, from: string } | null>}
  */
 async function loadPiTui() {
   const candidates = [];
@@ -229,8 +255,8 @@ async function loadPiTui() {
   candidates.push(join(homedir(), ".pi/agent/npm/node_modules/@earendil-works/pi-tui/dist/keys.js"));
   try {
     const module = await import("@earendil-works/pi-tui");
-    if (typeof module.matchesKey === "function" && typeof module.setKittyProtocolActive === "function") {
-      return { matchesKey: module.matchesKey, decodePrintableKey: module.decodePrintableKey, setKittyProtocolActive: module.setKittyProtocolActive, from: "@earendil-works/pi-tui" };
+    if (hasMatcher(module)) {
+      return matcherFrom(module, "@earendil-works/pi-tui");
     }
   } catch {
     // Not resolvable from here; try the paths the host actually installs to.
@@ -239,9 +265,7 @@ async function loadPiTui() {
     if (!existsSync(path)) continue;
     try {
       const module = await import(pathToFileURL(path).href);
-      if (typeof module.matchesKey === "function" && typeof module.setKittyProtocolActive === "function") {
-        return { matchesKey: module.matchesKey, decodePrintableKey: module.decodePrintableKey, setKittyProtocolActive: module.setKittyProtocolActive, from: path };
-      }
+      if (hasMatcher(module)) return matcherFrom(module, path);
     } catch {
       // A half-installed release is not a drift signal.
     }
@@ -268,15 +292,17 @@ function piTuiPrintable(piTui, data, char) {
  * Compare both decoders over the generated table and return every
  * disagreement as a record.
  *
- * @param {{ matchesKey: Function, decodePrintableKey: Function, setKittyProtocolActive: Function }} piTui
+ * @param {{ matchesKey: Function, decodePrintableKey: Function, isKeyRelease: Function, isKeyRepeat: Function, setKittyProtocolActive: Function }} piTui
  * @param {boolean} kittyActive
  * @returns {Array<{ kind: string, key: string, sequence: string, local: boolean, pi: boolean }>}
  */
 function disagreements(piTui, kittyActive) {
   piTui.setKittyProtocolActive(kittyActive);
   const found = [];
+  const sequences = new Set();
   for (const { name, piKey } of NAMED) {
     for (const data of namedEncodings(name)) {
+      sequences.add(data);
       const local = localMatchesKey(data, name);
       const pi = piTui.matchesKey(data, piKey);
       if (local !== pi) found.push({ kind: "named", key: name, sequence: data, local, pi });
@@ -285,10 +311,22 @@ function disagreements(piTui, kittyActive) {
   for (const { char, codepoint } of PRINTABLES) {
     const encodings = [...printableEncodings(codepoint), ...shiftedAlternatives(char, codepoint)];
     for (const data of encodings) {
+      sequences.add(data);
       const local = matchesPrintable(data, char);
       const pi = piTuiPrintable(piTui, data, char);
       if (local !== pi) found.push({ kind: "print", key: char, sequence: data, local, pi });
     }
+  }
+  // Event detection is encoding-wide, not per key: compare it once over the
+  // same generated table. pi-tui's versions are substring heuristics, ours
+  // parse the sequence, so this is where a new heuristic shows up.
+  for (const data of sequences) {
+    const localRelease = localIsKeyRelease(data);
+    const piRelease = piTui.isKeyRelease(data);
+    if (localRelease !== piRelease) found.push({ kind: "event", key: "release", sequence: data, local: localRelease, pi: piRelease });
+    const localRepeat = localIsKeyRepeat(data);
+    const piRepeat = piTui.isKeyRepeat(data);
+    if (localRepeat !== piRepeat) found.push({ kind: "event", key: "repeat", sequence: data, local: localRepeat, pi: piRepeat });
   }
   return found;
 }
