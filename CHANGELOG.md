@@ -2,6 +2,34 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.4] - 2026-11-03
+
+<!-- USER-EDITABLE SECTION START -->
+Token history, a scrolling bar panel, and Antigravity from Pi's own login.
+
+- **Token stats from Pi's sessions:** tokens by day and by model per provider and account, read from `~/.pi/agent/sessions` with no extra credential. Incremental (a warm run reads only appended bytes) and durable: finished days are frozen into `${PI_CODING_AGENT_DIR:-~/.pi/agent}/pi-usage/` (`totals.json` + `tokens-YYYY-MM.json`) and survive session deletion and cache loss. Shown in `/usage` and in the Omarchy records; `piquota stats` inspects the history.
+- **AI Usage bar plugin (`cad0p.pi-usage`):** looks like Omarchy's Agents panel, but every provider is a collapsible section of one scrolling panel, multi-account providers list every window of every account, and tokens by day and by model are drawn as in the built-in. `install.sh --omarchy-plugin` links it from the pi package, so `pi update` updates it.
+- **No more writes into other Omarchy plugins:** `piquota omarchy` stopped copying provider marks into every `~/.config/omarchy/plugins/*/assets`.
+- **`/usage` glance:** bare `/usage` closes on the next prompt or a second `/usage` (`/usage panel` still pins), and each account line shows session, week and month.
+- **Antigravity:** read from Pi's `google-antigravity` login (the legacy `antigravity` key still works).
+- `docs/verification.md`: the checklist every change follows.
+<!-- USER-EDITABLE SECTION END -->
+
+### 🚀 Features
+
+- *(local)* Token stats by day and by model from Pi's session files (closes #16)
+- *(omarchy)* AI Usage bar plugin, every provider a collapsible section (closes #18)
+
+### 🐛 Bug Fixes
+
+- *(extension)* /usage glance closes on the next prompt; every window per account (closes #9)
+- *(auth)* Read Antigravity from Pi's google-antigravity login (closes #12)
+
+### 📚 Documentation
+
+- Add the verification checklist every change follows (closes #14)
+
+
 ## [0.11.3] - 2026-11-02
 
 <!-- USER-EDITABLE SECTION START -->
