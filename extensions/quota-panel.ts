@@ -2350,12 +2350,14 @@ export default function quotaPanelExtension(pi: ExtensionAPI, dependencies: Exte
     return cacheKeyFor(claudeSourceUsed ?? process.env.PI_QUOTA_CLAUDE_SOURCE ?? "");
   }
 
-  function persistReport(): void {
+  function persistReport(freshFamilies: string[] = []): void {
     if (!report) return;
     // Every family keeps the clock it was fetched on: this report is written one
     // family at a time, and stamping the whole file with "now" made Claude's
     // five-minute-old numbers look as fresh as the Codex ones saved beside them.
-    writeCache(report as any, { key: cacheKey(), fetchedAtMs: readRefreshState().fetchedAtMs });
+    // Only the family that just resolved is "now"; a family without a clock in
+    // refresh-state keeps the cache's, or its own results' age.
+    writeCache(report as any, { key: cacheKey(), fetchedAtMs: readRefreshState().fetchedAtMs, freshFamilies });
   }
 
   function updateFamilyClock(family: string): void {
@@ -2446,7 +2448,7 @@ export default function quotaPanelExtension(pi: ExtensionAPI, dependencies: Exte
         const stickyFragment = mergeLastGood(fragment as any, {}).report as QuotaReport;
         mergeFamilyReport(stickyFragment);
         updateFamilyClock(family);
-        persistReport();
+        persistReport([family]);
         resultGeneration += 1;
         familyErrors.delete(family);
         try {

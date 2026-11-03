@@ -172,6 +172,32 @@ export function readCache(options = {}) {
 }
 
 /**
+ * @param {unknown} value
+ * @returns {value is number}
+ */
+function finite(value) {
+  return typeof value === "number" && Number.isFinite(value);
+}
+
+/**
+ * The fetch time a family's own results carry: the oldest `updatedAt` among
+ * its accounts, or undefined when none parses.
+ *
+ * @param {import("./engine.js").PiQuotaReport} report
+ * @param {string} family
+ * @returns {number | undefined}
+ */
+function oldestUpdatedAt(report, family) {
+  let oldest;
+  for (const provider of report.providers ?? []) {
+    if (provider?.family !== family) continue;
+    const at = Date.parse(provider.updatedAt ?? "");
+    if (Number.isFinite(at) && (oldest === undefined || at < oldest)) oldest = at;
+  }
+  return oldest;
+}
+
+/**
  * @param {import("./engine.js").PiQuotaReport} report
  * @param {{
  *   path?: string,
@@ -180,7 +206,8 @@ export function readCache(options = {}) {
  *   home?: string,
  *   merge?: boolean,
  *   key?: string,
- *   fetchedAtMs?: Record<string, number>,  Each family's own fetch time; absent ones are this write's.
+ *   fetchedAtMs?: Record<string, number>,  Each family's own fetch time, when the caller knows it.
+ *   freshFamilies?: string[],  Families this write fetched just now; defaults to every family in `report`.
  * }} [options]
  * @returns {{ ok: boolean, path: string, error?: string }}
  */
@@ -192,16 +219,18 @@ export function writeCache(report, options = {}) {
   if (options.merge && existing?.report) {
     finalReport = mergeReportIntoCache(existing.report, report);
   }
-  const written = new Set((report.providers ?? []).map((provider) => provider.family));
+  const fresh = new Set(options.freshFamilies ?? (report.providers ?? []).map((provider) => provider.family));
   const provided = options.fetchedAtMs ?? {};
   /** @type {Record<string, number>} */
   const fetchedAt = {};
   for (const family of new Set((finalReport.providers ?? []).map((provider) => provider.family))) {
-    // A family this write produced was fetched now unless the caller knows a
-    // better time; a family merged in from the cache keeps the clock it had.
+    // A family this write fetched is "now" unless the caller knows a better
+    // time. Any other family keeps the clock it had; with no clock anywhere it
+    // is as old as its own results say, never restamped to now, which would
+    // let an hour-old copy pass as fresh merely because a neighbour was saved.
     const own = provided[family];
-    const at = typeof own === "number" && Number.isFinite(own) ? own : (written.has(family) ? now : existing?.fetchedAt?.[family]);
-    fetchedAt[family] = typeof at === "number" && Number.isFinite(at) ? at : now;
+    const at = finite(own) ? own : fresh.has(family) ? now : finite(existing?.fetchedAt?.[family]) ? existing.fetchedAt[family] : oldestUpdatedAt(finalReport, family);
+    fetchedAt[family] = finite(at) ? at : now;
   }
   const envelope = { savedAt: now, ...(options.key === undefined ? {} : { key: options.key }), fetchedAt, report: finalReport };
   const payload = JSON.stringify(envelope, null, 2);

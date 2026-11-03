@@ -295,6 +295,40 @@ test("the cache judges each family by its own fetch time", async () => {
   assert.equal(loads, 1);
 });
 
+test("a write that did not fetch a family never restamps that family to now", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "pi-quota-cache-fresh-"));
+  const path = join(directory, "usage.json");
+  const { fetchFn } = fullRoutes();
+  const report = await collectQuota({ paths: [FIXTURE], claudeCodePaths: [], now: NOW, fetchFn, env: {}, stores: [], allowBrowser: false });
+  const HOUR = 3_600_000;
+  // Claude's results are an hour old and no clock names it (a deleted
+  // refresh-state, a mixed cache): the extension just fetched Codex and saves
+  // its whole in-memory report.
+  const aged = {
+    ...report,
+    providers: report.providers.map((provider) =>
+      provider.family === "claude" ? { ...provider, updatedAt: new Date(NOW - HOUR).toISOString() } : provider,
+    ),
+  };
+  assert.equal(writeCache(aged, { path, now: NOW, fetchedAtMs: { codex: NOW }, freshFamilies: ["codex"] }).ok, true);
+  const hit = readCache({ path, now: NOW, ttlMs: Number.POSITIVE_INFINITY });
+  assert.ok(hit);
+  assert.equal(hit.fetchedAt.codex, NOW);
+  assert.equal(hit.fetchedAt.claude, NOW - HOUR, "Claude is as old as its own results, not as new as the write");
+
+  // A second write keeps that clock instead of taking the newer one.
+  assert.equal(writeCache(aged, { path, now: NOW + 10_000, freshFamilies: ["codex"] }).ok, true);
+  assert.equal(readCache({ path, now: NOW + 10_000, ttlMs: Number.POSITIVE_INFINITY }).fetchedAt.claude, NOW - HOUR);
+
+  let loads = 0;
+  const claude = await withCache({ path, now: NOW + 10_000, ttlMs: 60_000, families: ["claude"] }, async () => {
+    loads += 1;
+    return report;
+  });
+  assert.equal(claude.cached, false, "the CLI does not serve the hour-old Claude copy as fresh");
+  assert.equal(loads, 1);
+});
+
 test("a cache written before per-family clocks is still aged by its savedAt", async () => {
   const directory = mkdtempSync(join(tmpdir(), "pi-quota-cache-legacy-"));
   const path = join(directory, "usage.json");
