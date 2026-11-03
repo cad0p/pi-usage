@@ -1602,9 +1602,66 @@ test("the overlay opens on a loading line and shows a refresh failure in place",
   const pending = usage.definition.handler("", harness.ctx);
   assert.match(frameText(overlays[0]), /loading quota …/, "the first frame renders before the report lands");
   await settle();
-  assert.match(frameText(overlays[0]), /! piquota exploded/, "a failed refresh is a line, not a throw");
+  assert.match(frameText(overlays[0]), /! Claude: piquota exploded/, "a failed refresh is a line, naming the family, not a throw");
   assert.match(frameText(overlays[0]), /refresh failed/);
   assert.equal(harness.widgets.length, 0, "a failed bare /usage still paints no widget");
+
+  overlays[0].component.handleInput("\u001b");
+  await pending;
+});
+
+test("a family's failure survives another family's later success", async () => {
+  const module = await import(EXTENSION);
+  const harness = makeHarness({ report: overlayReport() });
+  let releaseCodex;
+  const codexGate = new Promise((resolve) => {
+    releaseCodex = resolve;
+  });
+  let claudeFails = true;
+  harness.dependencies.collectFamily = async (family) => {
+    if (family === "claude" && claudeFails) throw new Error("claude endpoint timed out");
+    if (family === "codex") await codexGate;
+    const current = withFamilies(overlayReport());
+    return { ...current, providers: current.providers.filter((provider) => provider.family === family) };
+  };
+  module.default(harness.pi);
+  await startSession(harness, null);
+  const overlays = installOverlay(harness);
+  const pending = harness.commands.find((command) => command.name === "usage").definition.handler("", harness.ctx);
+  await settle();
+  assert.match(frameText(overlays[0]), /Claude: claude endpoint timed out/, "the failure is on screen while the rest still run");
+
+  releaseCodex();
+  await settle();
+  const frame = frameText(overlays[0]);
+  assert.match(frame, /Claude: claude endpoint timed out/, "a later success in another family must not erase it");
+  assert.match(frame, /refresh failed/, "and the header still says the refresh was not clean");
+
+  // Retrying only that family clears only its line.
+  claudeFails = false;
+  overlays[0].component.handleInput("r");
+  await settle();
+  assert.doesNotMatch(frameText(overlays[0]), /claude endpoint timed out/, "the family's own retry clears its line");
+
+  overlays[0].component.handleInput("\u001b");
+  await pending;
+});
+
+test("a multi-line failure is one row, not a broken frame", async () => {
+  const module = await import(EXTENSION);
+  const harness = makeHarness({ report: overlayReport() });
+  harness.dependencies.collectFamily = async () => {
+    throw new Error("quota endpoint failed\n  at fetch (src/providers/claude.js:1:1)\n  at async collectQuota");
+  };
+  module.default(harness.pi);
+  await startSession(harness, null);
+  const overlays = installOverlay(harness);
+  const pending = harness.commands.find((command) => command.name === "usage").definition.handler("", harness.ctx);
+  await settle();
+
+  const frame = frameText(overlays[0]);
+  assert.match(frame, /! Claude: quota endpoint failed/);
+  assert.doesNotMatch(frame, /at fetch \(src\/providers/, "a stack trace is not painted into the frame");
 
   overlays[0].component.handleInput("\u001b");
   await pending;
@@ -1762,7 +1819,7 @@ test("a failing CLI reports an error instead of throwing", async () => {
 
   const usage = harness.commands.find((command) => command.name === "usage");
   await usage.definition.handler("refresh", harness.ctx);
-  assert.ok(harness.notifications.some((message) => message.startsWith("Quota refresh failed: piquota exploded")));
+  assert.ok(harness.notifications.some((message) => message.startsWith("Quota refresh failed: Claude: piquota exploded (+3 more)")));
 });
 
 test("session_shutdown clears both the footer and the widget", async () => {

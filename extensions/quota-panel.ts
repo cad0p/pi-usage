@@ -1127,8 +1127,12 @@ type UsageOverlayOptions = {
   getRows: () => number;
   /** The newest report the extension holds, or null before the first one. */
   getReport: () => QuotaReport | null;
-  /** The last refresh failure, shown as a line instead of thrown. */
-  getError: () => string | null;
+  /**
+   * Every family's refresh failure, one line each, in family order. A failure
+   * is not cleared by another family's success: the families finish out of
+   * order, and a single shared slot made the last arrival erase the others.
+   */
+  getErrors: () => string[];
   isRefreshing: () => boolean;
   /** Run the same forced refresh `/usage` always ran, in the background. */
   refresh: () => void;
@@ -1663,8 +1667,9 @@ export class UsageOverlay {
         this.pushRow(rows, `  ${this.theme.fg("error", `! ${failure}`)}${hint}`, -1, false);
       }
     } else {
-      const error = this.options.getError();
-      if (error) rows.push({ text: `  ${this.theme.fg("error", `! ${error}`)}`, section: -1, header: false });
+      for (const error of this.options.getErrors()) {
+        rows.push({ text: `  ${this.theme.fg("error", `! ${error}`)}`, section: -1, header: false });
+      }
     }
     if (!layout) {
       // Distinct states, distinct lines: a failed fetch used to say "loading
@@ -2135,7 +2140,7 @@ export class UsageOverlay {
     } else {
       const report = this.options.getReport();
       if (report) parts.push(this.theme.fg("dim", updatedAtLabel(report)));
-      if (this.options.getError()) parts.push(this.theme.fg("error", "refresh failed"));
+      if (this.options.getErrors().length > 0) parts.push(this.theme.fg("error", "refresh failed"));
     }
     if (this.view === "history") {
       const status = this.historyStatus;
@@ -2232,7 +2237,8 @@ export default function quotaPanelExtension(pi: ExtensionAPI, dependencies: Exte
   let explicitBox = false;
   /** gentle-pi owns the footer and truncates it from the end, so start off. */
   let statusVisible = false;
-  let lastError: string | null = null;
+  /** One failure per family: an out-of-order success must not hide another's. */
+  const familyErrors = new Map<string, string>();
   /**
    * The Claude source the report in memory actually came from. The extension
    * forces Pi's own OAuth when Pi resolves a token, and that is a different
@@ -2274,10 +2280,7 @@ export default function quotaPanelExtension(pi: ExtensionAPI, dependencies: Exte
     railMode = inspection.state === "patched";
   }
 
-  /**
-   * Run the CLI. A report run owns `lastError`; the advisory `omarchy` publish
-   * writes human text, not JSON, and must never surface as a quota failure.
-   */
+  /** Whether a family refresh is in flight; the header shows it while one is. */
   function isRefreshing(): boolean {
     return inFlight.size > 0;
   }
@@ -2445,7 +2448,7 @@ export default function quotaPanelExtension(pi: ExtensionAPI, dependencies: Exte
         updateFamilyClock(family);
         persistReport();
         resultGeneration += 1;
-        lastError = null;
+        familyErrors.delete(family);
         try {
           const familyReport = { ...stickyFragment, localStats: report?.localStats ?? stickyFragment.localStats ?? {} };
           publishOmarchy(familyReport, false);
@@ -2456,7 +2459,7 @@ export default function quotaPanelExtension(pi: ExtensionAPI, dependencies: Exte
         return true;
       } catch (error) {
         const message = (error as { message?: string })?.message ?? String(error);
-        lastError = capCause(redactCause(message).split("\\n")[0]);
+        familyErrors.set(family, capCause(redactCause(message).split("\n")[0]));
         return false;
       } finally {
         if (inFlight.get(family) === task) inFlight.delete(family);
@@ -2466,6 +2469,20 @@ export default function quotaPanelExtension(pi: ExtensionAPI, dependencies: Exte
     })();
     inFlight.set(family, task);
     return task;
+  }
+
+  /**
+   * One line per failing family, in family order so the list does not reshuffle
+   * as families land. The name is short for the same reason: this is a row in a
+   * dense panel, not a log.
+   */
+  function errorLines(): string[] {
+    const order = [...enabledFamilies({ env: process.env, requested: FAMILIES })];
+    for (const family of familyErrors.keys()) if (!order.includes(family)) order.push(family);
+    return order.flatMap((family) => {
+      const message = familyErrors.get(family);
+      return message ? [`${SHORT_NAME[family] ?? family}: ${message}`] : [];
+    });
   }
 
   function paintUi(ctx: UiContext): void {
@@ -2768,7 +2785,7 @@ export default function quotaPanelExtension(pi: ExtensionAPI, dependencies: Exte
           requestRender: () => tui?.requestRender?.(),
           getRows: () => tui?.terminal?.rows ?? process.stdout.rows ?? 24,
           getReport: () => report,
-          getError: () => lastError,
+          getErrors: () => errorLines(),
           isRefreshing: () => isRefreshing(),
           refresh: () => {
             void refresh(ctx, true);
@@ -2805,10 +2822,11 @@ export default function quotaPanelExtension(pi: ExtensionAPI, dependencies: Exte
     switch (action) {
       case "refresh":
         await refresh(ctx, true);
+        const failures = errorLines();
         ctx.ui.notify(
           report
             ? `Quota refreshed (${report.providers.filter((provider) => provider.ok).length}/${report.providers.length} providers)`
-            : `Quota refresh failed: ${lastError}`,
+            : `Quota refresh failed: ${failures.length > 1 ? `${failures[0]} (+${failures.length - 1} more)` : failures[0] ?? "unknown error"}`,
           report ? "info" : "error",
         );
         return;

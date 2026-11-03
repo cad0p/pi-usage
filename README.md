@@ -283,7 +283,9 @@ reader that asked for Claude Code is not served it. It never waits for network w
 `/usage` refreshes only families older than their own clock (60 seconds by
 default; Claude's 300-second throttle-safe interval is preserved); `r` forces
 all enabled families. Families run independently and repaint as they finish. A
-failed refresh is a line in the view, never a thrown error. The local session
+failed family is a line in the view — one line per family, kept until that family
+succeeds again, so an out-of-order success cannot hide another one's failure —
+never a thrown error. The local session
 scan runs in a Node worker thread, not on the TUI event loop, and a shutdown or
 `/reload` stops it mid-scan: it releases its history lock and writes nothing.
 Every provider is a section:
@@ -858,7 +860,7 @@ extensions/quota-panel.ts      Pi TUI line and /usage
 ## Tests
 
 ```bash
-node --test tests/*.test.mjs     # 438 tests, fake tokens only, no network
+node --test tests/*.test.mjs     # 440 tests, fake tokens only, no network
 ```
 
 Modules covered: `auth.json` parsing and de-duplication, the Claude Code store
