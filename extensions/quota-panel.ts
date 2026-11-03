@@ -38,6 +38,7 @@ import { startLocalStatsWorker } from "../src/local/worker.js";
 import { publishRecords } from "../src/omarchy/publish.js";
 import { buildRecords } from "../src/omarchy/record.js";
 import { skippedFamilies } from "../src/cli/commands/omarchy.js";
+import { isKeyRelease, matchesKey, matchesPrintable } from "../src/overlay-keys.js";
 import { mergeLastGood } from "../src/sticky.js";
 import { readRefreshState, resolveFamilyTtls, staleFamilies, writeRefreshState } from "../src/refresh.js";
 
@@ -963,27 +964,6 @@ function renderPanel(report: QuotaReport, theme: Theme): string[] {
   return [...sections.flatMap((section) => [section.header, ...section.body]), ...tail];
 }
 
-/**
- * Raw input sequences for the keys the overlay turns into actions. The
- * extension ships as one file with no runtime dependencies, so this mirrors
- * the subset of pi-tui's matchesKey() the overlay needs: arrows, paging and
- * home/end in the encodings terminals and tmux actually send.
- */
-const KEY_SEQUENCES: Record<string, string[]> = {
-  up: ["\u001b[A", "\u001bOA"],
-  down: ["\u001b[B", "\u001bOB"],
-  left: ["\u001b[D", "\u001bOD"],
-  right: ["\u001b[C", "\u001bOC"],
-  pageUp: ["\u001b[5~", "\u001b[[5~"],
-  pageDown: ["\u001b[6~", "\u001b[[6~"],
-  home: ["\u001b[H", "\u001bOH", "\u001b[1~", "\u001b[7~"],
-  end: ["\u001b[F", "\u001bOF", "\u001b[4~", "\u001b[8~"],
-};
-
-function isKey(data: string, name: string): boolean {
-  return (KEY_SEQUENCES[name] ?? []).includes(data);
-}
-
 /** Pi reports the terminal height as a number; fall back to a usable frame. */
 function terminalRows(value: number | undefined): number {
   return Number.isFinite(value) ? Math.max(1, Math.floor(value as number)) : 24;
@@ -1528,21 +1508,32 @@ export class UsageOverlay {
     this.options.requestRender();
   }
 
-  /** Handle one raw key: switch view, fold, move, month, refresh, close. */
+  /**
+   * Handle one raw key: switch view, fold, move, month, refresh, close.
+   *
+   * Keys arrive in the terminal's own encoding — legacy escape sequences or
+   * kitty CSI sequences with an event type — so every test goes through
+   * src/overlay-keys.js. A kitty release is the second half of a press the
+   * terminal already reported: acting on it would move twice per keystroke.
+   * Repeats stay presses, so a held arrow keeps moving as it does in tmux.
+   */
   public handleInput(data: string): void {
     if (this.disposed) return;
-    if (data === "\u001b" || data === "q") {
+    if (isKeyRelease(data)) return;
+    if (matchesKey(data, "escape") || matchesPrintable(data, "q")) {
       this.dispose();
       this.options.done();
       return;
     }
-    if (data === "\t" || data === "1" || data === "2") {
-      const target = data === "1" ? "now" : data === "2" ? "history" : this.view === "now" ? "history" : "now";
+    const nowKey = matchesPrintable(data, "1");
+    const historyKey = matchesPrintable(data, "2");
+    if (matchesKey(data, "tab") || nowKey || historyKey) {
+      const target = nowKey ? "now" : historyKey ? "history" : this.view === "now" ? "history" : "now";
       this.switchView(target);
       this.invalidate();
       return;
     }
-    if (data === "r") {
+    if (matchesPrintable(data, "r")) {
       // History's today row comes from the live report, so a refresh there
       // reloads the month and the report together; one key, one meaning.
       if (this.view === "history") this.reloadMonth();
@@ -1550,17 +1541,17 @@ export class UsageOverlay {
       this.invalidate();
       return;
     }
-    if (isKey(data, "up") || data === "k") this.moveCursor(-1);
-    else if (isKey(data, "down") || data === "j") this.moveCursor(1);
-    else if (data === "\r" || data === "\n" || data === " ") this.toggleSection();
-    else if (isKey(data, "pageUp")) this.page(-1);
-    else if (isKey(data, "pageDown")) this.page(1);
-    else if (isKey(data, "home") || data === "g") this.jumpTo(0);
-    else if (isKey(data, "end") || data === "G") this.jumpTo(-1);
-    else if (this.view === "history" && (isKey(data, "left") || data === "[")) this.moveMonth(-1);
-    else if (this.view === "history" && (isKey(data, "right") || data === "]")) this.moveMonth(1);
-    else if (isKey(data, "left") || data === "h") this.setExpanded(false);
-    else if (isKey(data, "right") || data === "l") this.setExpanded(true);
+    if (matchesKey(data, "up") || matchesPrintable(data, "k")) this.moveCursor(-1);
+    else if (matchesKey(data, "down") || matchesPrintable(data, "j")) this.moveCursor(1);
+    else if (matchesKey(data, "enter") || matchesKey(data, "space")) this.toggleSection();
+    else if (matchesKey(data, "pageUp")) this.page(-1);
+    else if (matchesKey(data, "pageDown")) this.page(1);
+    else if (matchesKey(data, "home") || matchesPrintable(data, "g")) this.jumpTo(0);
+    else if (matchesKey(data, "end") || matchesPrintable(data, "G")) this.jumpTo(-1);
+    else if (this.view === "history" && (matchesKey(data, "left") || matchesPrintable(data, "["))) this.moveMonth(-1);
+    else if (this.view === "history" && (matchesKey(data, "right") || matchesPrintable(data, "]"))) this.moveMonth(1);
+    else if (matchesKey(data, "left") || matchesPrintable(data, "h")) this.setExpanded(false);
+    else if (matchesKey(data, "right") || matchesPrintable(data, "l")) this.setExpanded(true);
     else return;
     // The TUI renders the component again after every key, so the cached frame
     // and the cached row map must be dropped here, not only on report changes.

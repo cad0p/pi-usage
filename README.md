@@ -306,6 +306,13 @@ resumes them, and no file is written.
 | `tab`, `1` / `2` | switch between Now and History |
 | `esc` / `q` | close |
 
+Every key works in a terminal that sends the legacy escape sequences and in one
+that negotiates the kitty keyboard protocol (Ghostty among them): the decoder
+reads both encodings, plus kitty press, repeat and release events, so a press
+moves once and its release never moves again. A repeat is a press — a held arrow
+keeps moving, exactly as it does in tmux, where the OS repeat is the same bytes
+as the first press.
+
 The legend at the bottom lists every key the current view answers, and wraps
 into a second or third row on a narrow pane instead of dropping pairs — as few
 rows as fit, with the pairs balanced across them. The frame
@@ -827,6 +834,7 @@ src/local/history.js           frozen local-day history: month files + all-time 
 src/model.js                   window normalization, percent and reset parsing
 src/render/{theme,panel}.js    colors, thresholds, rings, bars, boxed panel
 src/cache.js                   report cache at ~/.cache/pi-quota/usage.json
+src/overlay-keys.js            raw key decoding for /usage: legacy and kitty keyboard encodings
 src/omarchy/record.js          pure mapping from the report to Omarchy usage records
 src/omarchy/publish.js         atomic writer for pi-*.json, and stale-record cleanup
 src/refresh.js                 per-family refresh clocks, and the merge back into one report
@@ -860,7 +868,7 @@ extensions/quota-panel.ts      Pi TUI line and /usage
 ## Tests
 
 ```bash
-node --test tests/*.test.mjs     # 441 tests, fake tokens only, no network
+node --test tests/*.test.mjs     # 452 tests, fake tokens only, no network
 ```
 
 Modules covered: `auth.json` parsing and de-duplication, the Claude Code store

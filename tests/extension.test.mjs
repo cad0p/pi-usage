@@ -713,6 +713,357 @@ test("the overlay folds the section under the cursor with enter, space, h/l and 
   await pending;
 });
 
+/**
+ * Open a fresh overlay for one key case: a new harness keeps the fold state,
+ * the page and the refresh counters from leaking between cases, so a release
+ * can only fail against its own press. The case gets the overlay plus a frame
+ * reader; the view is closed and its completion awaited afterwards.
+ */
+async function withKeyOverlay(report, body, { rows = 40, harness: harnessOptions } = {}) {
+  const module = await import(EXTENSION);
+  const harness = makeHarness({ report, ...harnessOptions });
+  module.default(harness.pi);
+  // No session_start: a fresh harness and factory already start on a clean
+  // overlay session, and the key path must not depend on the warm-up handler.
+  const overlays = installOverlay(harness, { rows });
+  const usage = harness.commands.find((command) => command.name === "usage");
+  const pending = usage.definition.handler("", harness.ctx);
+  await settle();
+  const overlay = overlays[0];
+  // Pi paints the opening frame before the user can press anything; the legend
+  // row count that frame measures is what paging uses as its page height.
+  frameText(overlay, 100);
+  try {
+    await body({ harness, overlay, frame: (width = 100) => frameText(overlay, width) });
+  } finally {
+    overlay.component.handleInput("\u001b");
+    await pending;
+  }
+}
+
+/** A History month with a Claude and an OpenCode Go section to walk. */
+const HISTORY_KEY_HARNESS = {
+  loadHistory: async (month) => historyPayload(month ?? "2026-10", ["2026-09", "2026-10"], { days: HISTORY_OCTOBER, totals: HISTORY_TOTALS }),
+};
+
+/** The named keys, each with the state its action produces, from empty state. */
+const NAMED_KEY_CASES = [
+  {
+    action: "move down",
+    legacy: "\u001b[B",
+    press: "\u001b[1;1:1B",
+    release: "\u001b[1;1:3B",
+    happened: (frame) => /❯ ▾ OP-Go/.test(frame),
+  },
+  {
+    action: "move up",
+    setup: ["\u001b[B"],
+    legacy: "\u001b[A",
+    press: "\u001b[1;1:1A",
+    release: "\u001b[1;1:3A",
+    happened: (frame) => /❯ ▾ Claude/.test(frame),
+  },
+  {
+    action: "collapse with left",
+    legacy: "\u001b[D",
+    press: "\u001b[1;1:1D",
+    release: "\u001b[1;1:3D",
+    happened: (frame) => /❯ ▸ Claude/.test(frame),
+  },
+  {
+    action: "expand with right",
+    setup: ["\u001b[D"],
+    legacy: "\u001b[C",
+    press: "\u001b[1;1:1C",
+    release: "\u001b[1;1:3C",
+    happened: (frame) => /❯ ▾ Claude/.test(frame),
+  },
+  {
+    action: "fold with enter",
+    legacy: "\r",
+    press: "\u001b[13;1:1u",
+    release: "\u001b[13;1:3u",
+    happened: (frame) => /❯ ▸ Claude/.test(frame),
+  },
+  {
+    action: "unfold with space",
+    setup: ["\u001b[13u"],
+    legacy: " ",
+    press: "\u001b[32;1:1u",
+    release: "\u001b[32;1:3u",
+    happened: (frame) => /❯ ▾ Claude/.test(frame),
+  },
+  {
+    action: "switch to History with tab",
+    legacy: "\t",
+    press: "\u001b[9;1:1u",
+    release: "\u001b[9;1:3u",
+    happened: (frame) => /Quota · History/.test(frame),
+  },
+  {
+    action: "page down",
+    report: () => tallOverlayReport(),
+    rows: 12,
+    legacy: "\u001b[6~",
+    press: "\u001b[6;1:1~",
+    release: "\u001b[6;1:3~",
+    happened: (frame) => /8-14\/\d+/.test(frame),
+  },
+  {
+    action: "page up",
+    report: () => tallOverlayReport(),
+    rows: 12,
+    setup: ["\u001b[6~"],
+    legacy: "\u001b[5~",
+    press: "\u001b[5;1:1~",
+    release: "\u001b[5;1:3~",
+    happened: (frame) => /1-7\/\d+/.test(frame),
+  },
+  {
+    action: "jump home",
+    report: () => tallOverlayReport(),
+    rows: 12,
+    setup: ["\u001b[6~"],
+    legacy: "\u001b[H",
+    press: "\u001b[1;1:1H",
+    release: "\u001b[1;1:3H",
+    happened: (frame) => /1-7\/\d+/.test(frame) && frame.split("\n")[2].includes("❯ ▾ Claude"),
+  },
+  {
+    action: "jump to the end",
+    report: () => tallOverlayReport(),
+    rows: 12,
+    legacy: "\u001b[F",
+    press: "\u001b[1;1:1F",
+    release: "\u001b[1;1:3F",
+    happened: (frame) => /❯ ▾ Codex/.test(frame),
+  },
+  {
+    action: "refresh",
+    countsRefresh: true,
+    legacy: "r",
+    press: "\u001b[114u",
+    release: "\u001b[114;1:3u",
+    happened: (_frame, state) => state.calls.some((call) => call.force),
+  },
+  {
+    action: "close",
+    legacy: "\u001b",
+    press: "\u001b[27;1:1u",
+    release: "\u001b[27;1:3u",
+    happened: (_frame, state) => state.overlay.doneCalls === 1,
+  },
+  {
+    action: "fold History with enter",
+    setup: ["2"],
+    harness: HISTORY_KEY_HARNESS,
+    legacy: "\r",
+    press: "\u001b[13u",
+    release: "\u001b[13;1:3u",
+    happened: (frame) => /❯ ▸ Claude/.test(frame),
+  },
+  {
+    action: "unfold History with space",
+    setup: ["2", "\u001b[13u"],
+    harness: HISTORY_KEY_HARNESS,
+    legacy: " ",
+    press: "\u001b[32u",
+    release: "\u001b[32;1:3u",
+    happened: (frame) => /❯ ▾ Claude/.test(frame),
+  },
+  {
+    action: "leave History with tab",
+    setup: ["2"],
+    harness: HISTORY_KEY_HARNESS,
+    legacy: "\t",
+    press: "\u001b[9u",
+    release: "\u001b[9;1:3u",
+    happened: (frame) => !frame.split("\n")[0].includes("History"),
+  },
+];
+
+/** The printable keys, in both their byte and kitty codepoint encodings. */
+const PRINTABLE_KEY_CASES = [
+  { action: "move down with j", char: "j", press: "\u001b[106u", release: "\u001b[106;1:3u", happened: (frame) => /❯ ▾ OP-Go/.test(frame) },
+  { action: "move up with k", char: "k", setup: ["\u001b[B"], press: "\u001b[107u", release: "\u001b[107;1:3u", happened: (frame) => /❯ ▾ Claude/.test(frame) },
+  { action: "collapse with h", char: "h", press: "\u001b[104u", release: "\u001b[104;1:3u", happened: (frame) => /❯ ▸ Claude/.test(frame) },
+  { action: "expand with l", char: "l", setup: ["\u001b[D"], press: "\u001b[108u", release: "\u001b[108;1:3u", happened: (frame) => /❯ ▾ Claude/.test(frame) },
+  {
+    action: "jump home with g",
+    char: "g",
+    report: () => tallOverlayReport(),
+    rows: 12,
+    setup: ["\u001b[6~"],
+    press: "\u001b[103u",
+    release: "\u001b[103;1:3u",
+    happened: (frame) => /1-7\/\d+/.test(frame) && frame.split("\n")[2].includes("❯ ▾ Claude"),
+  },
+  {
+    action: "jump to the end with G",
+    char: "G",
+    report: () => tallOverlayReport(),
+    rows: 12,
+    press: "\u001b[103:71;2u",
+    release: "\u001b[103:71;2:3u",
+    happened: (frame) => /❯ ▾ Codex/.test(frame),
+  },
+  { action: "refresh with r", char: "r", countsRefresh: true, press: "\u001b[114u", release: "\u001b[114;1:3u", happened: (_frame, state) => state.calls.some((call) => call.force) },
+  { action: "switch to History with 2", char: "2", press: "\u001b[50u", release: "\u001b[50;1:3u", happened: (frame) => /Quota · History/.test(frame) },
+  {
+    action: "switch to Now with 1",
+    char: "1",
+    setup: ["2"],
+    press: "\u001b[49u",
+    release: "\u001b[49;1:3u",
+    happened: (frame) => !frame.split("\n")[0].includes("History"),
+  },
+  {
+    action: "previous month with [",
+    char: "[",
+    setup: ["2"],
+    harness: { loadHistory: async (month) => historyPayload(month ?? "2026-10", ["2026-09", "2026-10"]) },
+    press: "\u001b[91u",
+    release: "\u001b[91;1:3u",
+    happened: (frame) => /Quota · History · 2026-09/.test(frame),
+  },
+  {
+    action: "next month with ]",
+    char: "]",
+    setup: ["2", "["],
+    harness: { loadHistory: async (month) => historyPayload(month ?? "2026-10", ["2026-09", "2026-10"]) },
+    press: "\u001b[93u",
+    release: "\u001b[93;1:3u",
+    happened: (frame) => /Quota · History · 2026-10/.test(frame),
+  },
+  { action: "close with q", char: "q", press: "\u001b[113u", release: "\u001b[113;1:3u", happened: (_frame, state) => state.overlay.doneCalls === 1 },
+  {
+    action: "walk History with j",
+    char: "j",
+    setup: ["2"],
+    harness: HISTORY_KEY_HARNESS,
+    press: "\u001b[106u",
+    release: "\u001b[106;1:3u",
+    happened: (frame) => /❯ .*OP-Go/.test(frame),
+  },
+  {
+    action: "jump to the end of History with G",
+    char: "G",
+    setup: ["2"],
+    harness: HISTORY_KEY_HARNESS,
+    press: "\u001b[103:71;2u",
+    release: "\u001b[103:71;2:3u",
+    happened: (frame) => /❯ .*OP-Go/.test(frame),
+  },
+  {
+    action: "close History with q",
+    char: "q",
+    setup: ["2"],
+    harness: HISTORY_KEY_HARNESS,
+    press: "\u001b[113u",
+    release: "\u001b[113;1:3u",
+    happened: (_frame, state) => state.overlay.doneCalls === 1,
+  },
+];
+
+/**
+ * Run one key case twice: once with the legacy sequence, once with the kitty
+ * press. A kitty release before the press must do nothing; the press must act.
+ */
+async function checkKeyCase(entry, pressSequence) {
+  const calls = [];
+  const report = entry.report ? entry.report() : overlayReport();
+  const harnessOptions = { ...(entry.harness ?? {}) };
+  if (entry.countsRefresh) {
+    const current = () => withFamilies(report);
+    harnessOptions.collectFamily = async (_family, options) => {
+      calls.push({ force: Boolean(options?.force) });
+      const value = current();
+      return { ...value, localStats: value.localStats ?? {}, localStatsMeta: value.localStatsMeta ?? null };
+    };
+  }
+  await withKeyOverlay(
+    report,
+    async ({ overlay, frame }) => {
+      const state = () => ({ frame: frame(), overlay, calls });
+      for (const sequence of entry.setup ?? []) {
+        overlay.component.handleInput(sequence);
+        await settle();
+      }
+      assert.equal(entry.happened(state().frame, state()), false, `${entry.action}: the setup leaves it undone`);
+      overlay.component.handleInput(entry.release);
+      await settle();
+      assert.equal(entry.happened(state().frame, state()), false, `${entry.action}: a kitty release is not a press`);
+      overlay.component.handleInput(pressSequence);
+      await settle();
+      assert.equal(entry.happened(state().frame, state()), true, `${entry.action}: ${JSON.stringify(pressSequence)} acts`);
+      overlay.component.handleInput(entry.release);
+      await settle();
+      assert.equal(entry.happened(state().frame, state()), true, `${entry.action}: its release does not act a second time`);
+    },
+    { rows: entry.rows, harness: harnessOptions },
+  );
+}
+
+test("every named legend key works from a legacy and a kitty terminal, and never on a release", async () => {
+  for (const entry of NAMED_KEY_CASES) {
+    await checkKeyCase(entry, entry.legacy);
+    await checkKeyCase(entry, entry.press);
+  }
+});
+
+test("kitty-encoded printable keys act once, and their release does not act again", async () => {
+  for (const entry of PRINTABLE_KEY_CASES) {
+    const kitty = { ...entry, legacy: entry.char };
+    await checkKeyCase(kitty, entry.char);
+    await checkKeyCase(kitty, entry.press);
+  }
+});
+
+test("Esc closes /usage from Now and from History, in legacy and kitty encodings, never on a release", async () => {
+  const cases = [
+    { view: "Now", setup: [], sequence: "\u001b" },
+    { view: "Now", setup: [], sequence: "\u001b[27u" },
+    { view: "Now", setup: [], sequence: "\u001b[27;1:1u" },
+    { view: "History", setup: ["2"], sequence: "\u001b" },
+    { view: "History", setup: ["2"], sequence: "\u001b[27u" },
+    { view: "History", setup: ["2"], sequence: "\u001b[27;1:1u" },
+  ];
+  for (const entry of cases) {
+    await withKeyOverlay(overlayReport(), async ({ overlay, frame }) => {
+      for (const sequence of entry.setup) {
+        overlay.component.handleInput(sequence);
+        await settle();
+      }
+      if (entry.view === "History") assert.match(frame(), /Quota · History/, "the case starts on History");
+      overlay.component.handleInput("\u001b[27;1:3u");
+      await settle();
+      assert.equal(overlay.doneCalls, 0, `${entry.view}: a kitty Esc release never closes`);
+      overlay.component.handleInput(entry.sequence);
+      await settle();
+      assert.equal(overlay.doneCalls, 1, `${entry.view}: ${JSON.stringify(entry.sequence)} closes`);
+    });
+  }
+});
+
+test("a kitty repeat is a press, so a held key keeps moving as it does in tmux", async () => {
+  await withKeyOverlay(tallOverlayReport(), async ({ overlay, frame }) => {
+    const range = () => frame().match(/\d+-\d+\/\d+/)?.[0];
+    assert.equal(range(), "1-7/18", "the overlay opens on the first page");
+    overlay.component.handleInput("\u001b[6;1:1~");
+    await settle();
+    const pressed = range();
+    assert.equal(pressed, "8-14/18", "the press pages once");
+    overlay.component.handleInput("\u001b[6;1:2~");
+    await settle();
+    const repeated = range();
+    assert.notEqual(repeated, pressed, "the repeat pages again instead of being dropped");
+    assert.equal(repeated, "12-18/18", "…to the last page, exactly as a second press would");
+    overlay.component.handleInput("\u001b[6;1:3~");
+    await settle();
+    assert.equal(range(), repeated, "the release pages nothing");
+  }, { rows: 12 });
+});
+
 test("a host without custom components keeps the pinned panel instead of failing", async () => {
   const module = await import(EXTENSION);
   const harness = makeHarness();
