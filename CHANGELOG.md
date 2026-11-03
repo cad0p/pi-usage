@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [calver-released]
+
+<!-- USER-EDITABLE SECTION START -->
+<!-- Add your curated release notes here. -->
+<!-- USER-EDITABLE SECTION END -->
+
+### ⚡ Performance
+
+- Query a provider's accounts in parallel; send the package User-Agent (closes #23)
+
+
 ## [0.11.4] - 2026-11-03
 
 <!-- USER-EDITABLE SECTION START -->
