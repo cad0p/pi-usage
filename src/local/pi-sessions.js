@@ -115,7 +115,7 @@ const RECENT_DAYS = 7;
  * @property {number} activeDays
  * @property {string[]} activeDates
  * @property {Record<string, { inputTokens: number, outputTokens: number, cacheReadInputTokens: number, cacheCreationInputTokens: number }>} modelUsage
- * @property {Record<string, { todayTokens: number, weekTokens: number, todayPrompts: number, totalPrompts: number, totalTokens: number }>} byAccount
+ * @property {Record<string, { todayTokens: number, weekTokens: number, todayPrompts: number, totalPrompts: number, totalTokens: number, todayTokensByModel: Record<string, number> }>} byAccount
  */
 
 /**
@@ -1025,6 +1025,18 @@ export function buildLocalStats(input = {}) {
         todayModels.set(model, (todayModels.get(model) ?? 0) + bucketTokens(bucket));
       }
     }
+    // The same split per account, so the History page can name the model behind
+    // an account's live (unfrozen) today row instead of leaving it blank.
+    /** @type {Map<string, Map<string, number>>} */
+    const todayAccountModels = new Map();
+    for (const [slot, slotRow] of Object.entries(todayRows?.slots ?? {})) {
+      const label = accountLabel(slot);
+      const models = todayAccountModels.get(label) ?? new Map();
+      for (const [model, bucket] of Object.entries(slotRow.models ?? {})) {
+        models.set(model, (models.get(model) ?? 0) + bucketTokens(bucket));
+      }
+      todayAccountModels.set(label, models);
+    }
 
     /** @type {Map<string, number>} */
     const weekModels = new Map();
@@ -1060,6 +1072,7 @@ export function buildLocalStats(input = {}) {
         todayPrompts: daySlots.get(today)?.get(label)?.prompts ?? 0,
         totalPrompts: (historyAccount?.totalPrompts ?? 0) + (openAccount?.prompts ?? 0),
         totalTokens,
+        todayTokensByModel: Object.fromEntries(todayAccountModels.get(label) ?? []),
       };
     }
 

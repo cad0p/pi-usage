@@ -278,6 +278,15 @@ function legendRows(text) {
   return first === -1 ? [] : lines.slice(first);
 }
 
+/**
+ * The report as the extension holds it *today*. `todayTotalTokens` is the day the
+ * report was generated on, so a test that merges the live day must stamp the
+ * report with the clock it froze — a report generated on another day is skipped.
+ */
+function liveReport(extra = {}) {
+  return { ...overlayReport(), generatedAt: new Date().toISOString(), ...extra };
+}
+
 /** Two families, one of them multi-account, plus the tail lines the panel shows. */
 function overlayReport() {
   const account = (slot, used) => ({
@@ -619,9 +628,9 @@ test("bare /usage opens a fullscreen overlay, refreshes behind it and leaves the
   assert.match(frame.split("\n")[0], /updated \d\d:\d\d/, "the header is the one place the update time appears");
   assert.match(frame, /warn: one family was throttled/);
   assert.match(frame, /↑↓\/jk move/, "the legend lists the move keys");
-  assert.match(frame, /enter\/←→\/hl fold/, "…the fold keys");
+  assert.match(frame, /enter\/space\/←→\/hl fold/, "…the fold keys");
   assert.match(frame, /pgup\/pgdn page/, "…paging");
-  assert.match(frame, /g\/G top\/end/, "…the jumps");
+  assert.match(frame, /g\/G home\/end top\/end/, "…the jumps");
   assert.match(frame, /wheel scroll/, "…the wheel");
   assert.match(frame, /r refresh/, "…refresh");
   assert.match(frame, /esc\/q close/, "…and every close key");
@@ -670,32 +679,6 @@ test("the overlay folds the section under the cursor with enter, space, h/l and 
   assert.match(frame(), /▾ Claude/, "the other section kept its own fold state");
 
   overlay.component.handleInput("\u001b");
-  await pending;
-});
-
-test("a fold survives closing and reopening /usage", async () => {
-  const module = await import(EXTENSION);
-  const harness = makeHarness({ report: overlayReport() });
-  module.default(harness.pi);
-  await startSession(harness, null);
-  const overlays = installOverlay(harness, { rows: 40 });
-  const usage = harness.commands.find((command) => command.name === "usage");
-
-  let pending = usage.definition.handler("", harness.ctx);
-  await settle();
-  assert.match(frameText(overlays[0]), /5h window/);
-  overlays[0].component.handleInput("\r");
-  assert.equal(/5h window/.test(frameText(overlays[0])), false, "Enter folds the section");
-  overlays[0].component.handleInput("\u001b");
-  await pending;
-
-  pending = usage.definition.handler("", harness.ctx);
-  await settle();
-  assert.equal(overlays.length, 2, "a second bare /usage builds a new view");
-  assert.match(frameText(overlays[1]), /❯ ▸ Claude/, "the fold survived the close: the section is still folded");
-  assert.equal(/5h window/.test(frameText(overlays[1])), false);
-
-  overlays[1].component.handleInput("\u001b");
   await pending;
 });
 
@@ -943,6 +926,133 @@ test("NO_COLOR is honoured so a mono terminal stays readable", async () => {
   }
 });
 
+/** One `piquota stats --json` payload, as the CLI emits it. */
+function historyPayload(month, months, { days = {}, totals = null, notes = [], quarantined = [] } = {}) {
+  return {
+    schemaVersion: 1,
+    historyDir: "/tmp/pi-usage",
+    generatedAt: "2030-01-01T00:00:00.000Z",
+    months,
+    quarantined,
+    month,
+    days,
+    totals,
+    notes,
+  };
+}
+
+const HISTORY_TOTALS = {
+  lastFrozenDay: "2026-10-02",
+  families: {
+    claude: {
+      firstDay: "2026-10-01",
+      activeDates: ["2026-10-01", "2026-10-02"],
+      totalPrompts: 6,
+      totalSessions: 2,
+      modelUsage: {
+        "claude-opus-5-5": { input: 1_000, output: 200, cacheRead: 0, cacheWrite: 0 },
+      },
+      accounts: {
+        "": { totalPrompts: 6, totalSessions: 2, modelUsage: { "claude-opus-5-5": { input: 2_000 } } },
+      },
+    },
+    "opencode-go": {
+      firstDay: "2026-10-01",
+      activeDates: ["2026-10-01"],
+      totalPrompts: 6,
+      totalSessions: 1,
+      modelUsage: { "deepseek-v4.1-flash": { input: 3_000 } },
+      accounts: {
+        "": { totalPrompts: 2, totalSessions: 1, modelUsage: { "deepseek-v4.1-flash": { input: 1_000 } } },
+        "#2": { totalPrompts: 4, totalSessions: 1, modelUsage: { "deepseek-v4.1-flash": { input: 2_000 } } },
+      },
+    },
+  },
+};
+
+const HISTORY_OCTOBER = {
+  "2026-10-01": {
+    claude: {
+      sessions: 2,
+      tokens: 1_200,
+      prompts: 4,
+      slots: {
+        "": { sessions: 2, tokens: 1_200, prompts: 4, models: { "claude-opus-5-5": { tokens: 1_000, messages: 4 }, "claude-sonnet-5": { tokens: 200, messages: 0 } } },
+      },
+    },
+    "opencode-go": {
+      sessions: 1,
+      tokens: 3_000,
+      prompts: 6,
+      slots: {
+        "": { sessions: 1, tokens: 1_000, prompts: 2, models: { "deepseek-v4.1-flash": { tokens: 1_000, messages: 2 } } },
+        "2": { sessions: 1, tokens: 2_000, prompts: 4, models: { "deepseek-v4.1-flash": { tokens: 2_000, messages: 4 } } },
+      },
+    },
+  },
+  "2026-10-02": {
+    claude: { sessions: 0, tokens: 800, prompts: 2, slots: { "": { tokens: 800, prompts: 2, models: { "claude-opus-5-5": { tokens: 800, messages: 2 } } } } },
+  },
+};
+
+/** A history payload for the current local month, with one frozen day. */
+function currentMonthHistory(todayKey, month, extraDays = {}) {
+  return historyPayload(month, ["2026-09", month], {
+    days: {
+      ...extraDays,
+      [`${month}-01`]: {
+        claude: { tokens: 400, prompts: 1, slots: { "": { tokens: 400, prompts: 1, models: { "claude-opus-5-5": { tokens: 400, messages: 1 } } } } },
+      },
+    },
+    totals: { lastFrozenDay: `${month}-01`, families: { claude: { totalPrompts: 1, modelUsage: { "claude-opus-5-5": { input: 400 } }, accounts: { "": { modelUsage: { "claude-opus-5-5": { input: 400 } } } } } } },
+  });
+}
+
+/** Route `pi.exec`: `stats --json` answers from the fixtures, the report path stays. */
+function routeHistory(harness, months, byMonth) {
+  const calls = [];
+  const exec = harness.pi.exec;
+  harness.pi.exec = async (runner, argv, options) => {
+    if (argv.includes("stats")) {
+      const index = argv.indexOf("--month");
+      const requested = index === -1 ? null : argv[index + 1];
+      const month = requested ?? months[months.length - 1];
+      calls.push(requested);
+      const payload = byMonth[month] ?? historyPayload(month, months, { notes: [`no frozen days for ${month} in /tmp/pi-usage`] });
+      return { stdout: JSON.stringify(payload), stderr: "", code: 0 };
+    }
+    return exec(runner, argv, options);
+  };
+  return calls;
+}
+
+/**
+ * Route `stats --json` to promises the test settles in whatever order it likes:
+ * overlapping ←/→ presses are the point, and their answers arrive out of order.
+ */
+function routeHistoryDeferred(harness) {
+  const waiting = new Map();
+  const calls = [];
+  const exec = harness.pi.exec;
+  harness.pi.exec = async (runner, argv, options) => {
+    if (!argv.includes("stats")) return exec(runner, argv, options);
+    const index = argv.indexOf("--month");
+    const month = index === -1 ? null : argv[index + 1];
+    calls.push(month);
+    return new Promise((resolve) => waiting.set(month, resolve));
+  };
+  const settle = (month, result) => {
+    const resolve = waiting.get(month);
+    assert.ok(resolve, `no stats request is waiting for ${month}`);
+    waiting.delete(month);
+    resolve(result);
+  };
+  const answer = (month, payload) => settle(month, { stdout: JSON.stringify(payload), stderr: "", code: 0 });
+  const fail = (month, stderr = "stats: another piquota run holds the history lock") =>
+    settle(month, { stdout: "", stderr: `${stderr}\n`, code: 1 });
+  return { calls, answer, fail };
+}
+
 /** A provider with enough windows to be taller than a short overlay viewport. */
 function tallProvider(count = 14) {
   return {
@@ -1061,6 +1171,17 @@ test("r refreshes from inside the overlay and never closes it", async () => {
   assert.equal(forced.length, 1, "r runs another forced refresh");
   assert.equal(overlays[0].doneCalls, 0, "r leaves the view open");
 
+  // On History, r reloads the month AND the report its today row depends on.
+  overlays[0].component.handleInput("2");
+  await settle();
+  const onHistory = calls.length;
+  overlays[0].component.handleInput("r");
+  await settle();
+  const after = calls.slice(onHistory);
+  assert.equal(after.filter(([, argv]) => argv.includes("--force")).length, 1, "r on History forces a report refresh");
+  assert.ok(after.some(([, argv]) => argv.includes("stats")), "r on History reloads the month");
+  assert.match(frameText(overlays[0]).split("\n")[0], /updated \d\d:\d\d/, "History's header shows when the report it merges was updated");
+
   overlays[0].component.handleInput("q");
   await pending;
   assert.equal(overlays[0].doneCalls, 1, "q closes the view too");
@@ -1086,7 +1207,7 @@ test("the overlay fits 64 columns and rebuilds the frame after a resize", async 
   const tiny = overlay.component.render(40);
   assert.ok(tiny.every((line) => plain(line).length <= 40));
   const legend = plain(tiny.slice(-4).join("\n"));
-  for (const keys of ["↑↓/jk", "enter/←→/hl", "pgup/pgdn", "g/G", "wheel", "r refresh", "esc/q"]) {
+  for (const keys of ["↑↓/jk", "enter/space/←→/hl", "pgup/pgdn", "g/G", "wheel", "r refresh", "esc/q"]) {
     assert.ok(legend.includes(keys), `a narrow pane wraps the legend instead of dropping "${keys}"`);
   }
 
@@ -1117,7 +1238,7 @@ test("a row wider than the pane wraps at its separators instead of losing its ta
   assert.match(frame, /session\s+0% \(5h\)/, "…and the session reset on the row above it");
   assert.match(frame, /week\s+0% \(5d\)/, "…and the weekly one");
   assert.equal(/\u2026/.test(frame), false, "nothing is elided: the row wraps, it does not clip");
-  // A warning in the tail has no separators, so it wraps between words.
+  // A warning in the tail has no " · " separators, so it wraps between words.
   const rejoined = frame.split("\n").map((line) => line.trim()).join(" ");
   assert.match(
     rejoined,
@@ -1170,8 +1291,8 @@ test("the legend balances its rows instead of orphaning the close key", async ()
   const pending = usage.definition.handler("", harness.ctx);
   await settle();
 
-  const legend = legendRows(plain(overlays[0].component.render(80).join("\n")));
-  assert.equal(legend.length, 2, `the legend needs two rows at 80 columns: ${JSON.stringify(legend)}`);
+  const legend = legendRows(plain(overlays[0].component.render(120).join("\n")));
+  assert.equal(legend.length, 2, `the legend needs two rows at 120 columns: ${JSON.stringify(legend)}`);
   for (const row of legend) {
     assert.ok((row.match(/ · /g) ?? []).length >= 2, `every row carries a fair share of the pairs: ${JSON.stringify(row)}`);
   }
@@ -1580,6 +1701,820 @@ test("the panel names the Claude store, and the line never does", async () => {
   await usage.definition.handler("panel", harness.ctx);
   const panel = plain(renderWidget(harness.widgets.at(-1)).join("\n"));
   assert.match(panel, /Claude Code CLI/, "the panel says which store was read");
+});
+
+test("tab opens the read-only history for the newest month", async () => {
+  const module = await import(EXTENSION);
+  const harness = makeHarness({ report: overlayReport() });
+  const calls = routeHistory(harness, ["2026-09", "2026-10"], {
+    "2026-09": historyPayload("2026-09", ["2026-09", "2026-10"], { notes: ["no frozen days for 2026-09 in /tmp/pi-usage"] }),
+    "2026-10": historyPayload("2026-10", ["2026-09", "2026-10"], { days: HISTORY_OCTOBER, totals: HISTORY_TOTALS }),
+  });
+  module.default(harness.pi);
+  await startSession(harness, null);
+  const overlays = installOverlay(harness, { rows: 40 });
+  const usage = harness.commands.find((command) => command.name === "usage");
+  const pending = usage.definition.handler("", harness.ctx);
+  await settle();
+
+  overlays[0].component.handleInput("\t");
+  assert.deepEqual(calls, [null], "the first tap asks for the month list and the newest month");
+  await settle();
+
+  const frame = frameText(overlays[0], 100);
+  assert.match(frame.split("\n")[0], /Quota · History · 2026-10/);
+  assert.match(frame, /▾ Claude \(Pi\) · 2\.0k in 2026-10 · 1\.2k all-time · 6 prompts/);
+  assert.match(frame, /days +10-01 1\.2k · 10-02 800/, "a month lists its frozen days");
+  assert.match(frame, /models +claude-opus-5-5 1\.8k · claude-sonnet-5 200/, "…and its token split by model");
+  assert.match(frame, /▾ OP-Go · 3\.0k in 2026-10 · 3\.0k all-time · 6 prompts/);
+  assert.match(frame, /^ +month 1\.0k · all-time 1\.0k · deepseek-v4\.1-flash$/m, "the base account row is blank");
+  assert.match(frame, /#2 +month 2\.0k · all-time 2\.0k · deepseek-v4\.1-flash/);
+  assert.equal(/#1\b/.test(frame), false, "history never invents a base number");
+  assert.match(frame, /frozen through 2026-10-02 · 2026-10 · read-only/);
+  assert.match(frame, /↑↓\/jk move/, "the legend lists movement");
+  assert.match(frame, /enter\/space\/h\/l fold/, "…the fold keys");
+  assert.match(frame, /←\/\[ prev month/);
+  assert.match(frame, /\]\/→ next month/);
+  assert.match(frame, /tab\/1\/2 now/, "the history legend offers the way back");
+  assert.doesNotMatch(frame, /r refresh · tab\/1\/2 now · esc\/q close[\s\S]*enter\/←→/, "the Now-only month keys are gone");
+
+  overlays[0].component.handleInput("\u001b");
+  await pending;
+});
+
+test("month navigation only visits months with a file and fetches each once", async () => {
+  const module = await import(EXTENSION);
+  const harness = makeHarness({ report: overlayReport() });
+  const calls = routeHistory(harness, ["2026-09", "2026-10"], {
+    "2026-09": historyPayload("2026-09", ["2026-09", "2026-10"], {
+      days: { "2026-09-30": { claude: { tokens: 700, prompts: 2, slots: { "": { tokens: 700, models: { "claude-opus-5-5": { tokens: 700 } } } } } } },
+      totals: { lastFrozenDay: "2026-09-30", families: { claude: { totalPrompts: 2, modelUsage: { "claude-opus-5-5": { input: 700 } }, accounts: {} } } },
+    }),
+    "2026-10": historyPayload("2026-10", ["2026-09", "2026-10"], { days: HISTORY_OCTOBER, totals: HISTORY_TOTALS }),
+  });
+  module.default(harness.pi);
+  await startSession(harness, null);
+  const overlays = installOverlay(harness, { rows: 40 });
+  const usage = harness.commands.find((command) => command.name === "usage");
+  const pending = usage.definition.handler("", harness.ctx);
+  await settle();
+  overlays[0].component.handleInput("\t");
+  await settle();
+  assert.match(frameText(overlays[0]), /Quota · History · 2026-10/);
+
+  overlays[0].component.handleInput("\u001b[D");
+  assert.match(frameText(overlays[0]), /loading 2026-09 …/, "the requested month says it is loading");
+  await settle();
+  assert.match(frameText(overlays[0]), /Quota · History · 2026-09/);
+  assert.match(frameText(overlays[0]), /days +09-30 700/);
+  assert.deepEqual(calls, [null, "2026-09"]);
+
+  overlays[0].component.handleInput("\u001b[C");
+  await settle();
+  assert.match(frameText(overlays[0]), /Quota · History · 2026-10/);
+  assert.deepEqual(calls, [null, "2026-09"], "a month already loaded is not fetched again");
+
+  overlays[0].component.handleInput("\u001b[C");
+  assert.match(frameText(overlays[0]), /Quota · History · 2026-10/, "there is no newer month with a file");
+
+  overlays[0].component.handleInput("\u001b");
+  await pending;
+});
+
+test("a month of many days wraps at 64 columns without dropping a day", async () => {
+  const module = await import(EXTENSION);
+  const days = {};
+  for (let day = 1; day <= 20; day += 1) {
+    const key = `2026-10-${String(day).padStart(2, "0")}`;
+    days[key] = {
+      claude: {
+        tokens: day * 1_000,
+        prompts: 1,
+        slots: { "": { tokens: day * 1_000, models: { "claude-opus-5-5": { tokens: day * 1_000 } } } },
+      },
+    };
+  }
+  const harness = makeHarness({ report: overlayReport() });
+  routeHistory(harness, ["2026-10"], {
+    "2026-10": historyPayload("2026-10", ["2026-10"], { days, totals: null }),
+  });
+  module.default(harness.pi);
+  await startSession(harness, null);
+  const overlays = installOverlay(harness, { rows: 40 });
+  const usage = harness.commands.find((command) => command.name === "usage");
+  const pending = usage.definition.handler("", harness.ctx);
+  await settle();
+  overlays[0].component.handleInput("\t");
+  await settle();
+
+  const rendered = overlays[0].component.render(64);
+  assert.equal(rendered.length, 40);
+  assert.ok(rendered.every((line) => plain(line).length <= 64), "no line is wider than the terminal");
+  const frame = plain(rendered.join("\n"));
+  for (let day = 1; day <= 20; day += 1) {
+    const key = `10-${String(day).padStart(2, "0")}`;
+    assert.ok(frame.includes(key), `day ${key} survives the wrap instead of being clipped`);
+  }
+
+  overlays[0].component.handleInput("\u001b");
+  await pending;
+});
+
+test("the current month merges today from the live report and never double counts", async (t) => {
+  const module = await import(EXTENSION);
+  // Freeze the clock mid-month. The fixture's frozen day is the 1st, and on the
+  // 1st of a real month that row *is* today: the merge guard saw "today is
+  // already frozen" and this test failed once a month, on the 1st.
+  t.mock.timers.enable({ apis: ["Date"], now: new Date(2026, 10, 15, 12, 0, 0) });
+  const now = new Date();
+  const month = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}`;
+  const today = `${month}-${String(now.getDate()).padStart(2, "0")}`;
+  const report = liveReport({
+    localStats: {
+      claude: {
+        hasLocalStats: true,
+        todayTotalTokens: 500,
+        todayPrompts: 2,
+        todayTokensByModel: { "claude-opus-5-5": 500 },
+        byAccount: { "": { todayTokens: 500 } },
+      },
+    },
+  });
+
+  const openHistory = async (days) => {
+    const harness = makeHarness({ report });
+    routeHistory(harness, [month], { [month]: currentMonthHistory(today, month, days) });
+    module.default(harness.pi);
+    await startSession(harness, null);
+    const overlays = installOverlay(harness, { rows: 40 });
+    const usage = harness.commands.find((command) => command.name === "usage");
+    const pending = usage.definition.handler("", harness.ctx);
+    await settle();
+    overlays[0].component.handleInput("\t");
+    await settle();
+    return { overlays, pending };
+  };
+
+  const open = await openHistory({});
+  const frame = frameText(open.overlays[0]);
+  assert.match(frame, /~ \d{4}-\d{2}-\d{2} comes from the live report; it is not frozen in history yet/);
+  assert.ok(frame.includes(`${today.slice(5)} 500`), "today's tokens appear in the month's day list");
+  assert.match(frame, /Claude \(Pi\) · 900 in/, "the month total includes today once (400 frozen + 500 live)");
+  open.overlays[0].component.handleInput("\u001b");
+  await open.pending;
+
+  // If the durable month already has today's row (the writer froze it), the
+  // report's open-day aggregate must not be added on top of it.
+  const frozenDay = {
+    [today]: { claude: { tokens: 400, prompts: 1, slots: { "": { tokens: 400, prompts: 1, models: { "claude-opus-5-5": { tokens: 400 } } } } } },
+  };
+  const already = await openHistory(frozenDay);
+  const frozenFrame = frameText(already.overlays[0]);
+  assert.doesNotMatch(frozenFrame, /comes from the live report/, "a frozen today is not merged again");
+  assert.match(frozenFrame, /Claude \(Pi\) · 800 in/, "the frozen day is counted once (400 + 400)");
+  already.overlays[0].component.handleInput("\u001b");
+  await already.pending;
+});
+
+test("a damaged month and a failed history fetch are lines, not throws", async () => {
+  const module = await import(EXTENSION);
+  const harness = makeHarness({ report: overlayReport() });
+  routeHistory(harness, ["2026-10"], {
+    "2026-10": historyPayload("2026-10", ["2026-10"], {
+      days: {},
+      notes: ["2026-09 was quarantined as tokens-2026-09.json.corrupt-1; its frozen days are missing"],
+    }),
+  });
+  module.default(harness.pi);
+  await startSession(harness, null);
+  const overlays = installOverlay(harness, { rows: 40 });
+  const usage = harness.commands.find((command) => command.name === "usage");
+  const pending = usage.definition.handler("", harness.ctx);
+  await settle();
+  overlays[0].component.handleInput("\t");
+  await settle();
+  const frame = frameText(overlays[0]);
+  assert.match(frame, /! 2026-09 was quarantined as tokens-2026-09\.json\.corrupt-1/);
+  assert.match(frame, /no token history for 2026-10/);
+
+  // The next fetch fails: the error is a line and the previous month stays usable.
+  harness.pi.exec = async () => {
+    throw new Error("stats --json exploded");
+  };
+  overlays[0].component.handleInput("r");
+  await settle();
+  assert.match(frameText(overlays[0]), /! stats --json exploded/);
+  assert.match(frameText(overlays[0]), /history failed/);
+
+  // A pathological thrown message still paints one capped line, not a page.
+  harness.pi.exec = async () => {
+    throw new Error(`stats failed: ${"x".repeat(600)}`);
+  };
+  overlays[0].component.handleInput("r");
+  await settle();
+  const cappedFrame = frameText(overlays[0]);
+  assert.match(cappedFrame, /stats failed:/, "the thrown cause is painted");
+  assert.ok((cappedFrame.match(/x/g) ?? []).length <= 160, "the thrown cause is capped at 160 characters like a stderr line");
+  assert.match(cappedFrame, /x…/, "the cap is marked with an ellipsis");
+
+  overlays[0].component.handleInput("\u001b");
+  await pending;
+});
+
+test("a failed fetch of an uncached month is not also a loading line", async () => {
+  const module = await import(EXTENSION);
+  const harness = makeHarness({ report: overlayReport() });
+  const calls = routeHistory(harness, ["2026-09", "2026-10"], {
+    "2026-10": historyPayload("2026-10", ["2026-09", "2026-10"], { days: HISTORY_OCTOBER, totals: HISTORY_TOTALS }),
+  });
+  module.default(harness.pi);
+  await startSession(harness, null);
+  const overlays = installOverlay(harness, { rows: 40 });
+  const usage = harness.commands.find((command) => command.name === "usage");
+  const pending = usage.definition.handler("", harness.ctx);
+  await settle();
+  overlays[0].component.handleInput("\t");
+  await settle();
+  assert.match(frameText(overlays[0]), /Quota · History · 2026-10/);
+
+  // 2026-09 has no payload yet, so the failure lands on a month with no frame to
+  // fall back on. "loading" is not the post-error state any more.
+  harness.pi.exec = async () => {
+    throw new Error("stats --json exploded");
+  };
+  overlays[0].component.handleInput("\u001b[D");
+  assert.match(frameText(overlays[0]), /loading 2026-09 …/, "the request is visible while it runs");
+  await settle();
+  const frame = frameText(overlays[0], 100);
+  assert.match(frame, /! stats --json exploded/);
+  assert.match(frame, /no history for this month; press r to retry/);
+  assert.doesNotMatch(frame, /loading/, "a failed fetch does not also claim to be loading");
+  assert.match(frame, /history failed/, "the header names the state");
+
+  // r retries the month that failed, not the newest one.
+  let retried = null;
+  harness.pi.exec = async (runner, argv) => {
+    // r on History also forces a report refresh; only the stats call is the retry.
+    if (!argv.includes("stats")) return { stdout: "", stderr: "", code: 0 };
+    const index = argv.indexOf("--month");
+    retried = index === -1 ? null : argv[index + 1];
+    return { stdout: JSON.stringify(historyPayload("2026-09", ["2026-09", "2026-10"], { days: {}, totals: null })), stderr: "", code: 0 };
+  };
+  overlays[0].component.handleInput("r");
+  await settle();
+  assert.equal(retried, "2026-09", "the retry asks for the month that failed");
+  assert.doesNotMatch(frameText(overlays[0]), /stats --json exploded/);
+  assert.deepEqual(calls, [null], "the month that failed was requested before the stub replaced the router");
+
+  overlays[0].component.handleInput("\u001b");
+  await pending;
+});
+
+test("a report generated before midnight is not merged into today", async (t) => {
+  const module = await import(EXTENSION);
+  // A pi session that crossed 00:00 still holds 11-02's totals, while the clock
+  // (and the month file's missing row) say 11-03. Merging under today's key put
+  // yesterday's frozen 999 on top of today's empty day: 999 read as 1.9k.
+  t.mock.timers.enable({ apis: ["Date"], now: new Date(2026, 10, 3, 9, 0, 0) });
+  const month = "2026-11";
+  const report = liveReport({
+    generatedAt: new Date(2026, 10, 2, 23, 59, 0).toISOString(),
+    localStats: {
+      claude: {
+        hasLocalStats: true,
+        todayTotalTokens: 999,
+        todayPrompts: 2,
+        todayTokensByModel: { "claude-opus-5-5": 999 },
+        byAccount: { "": { todayTokens: 999, todayPrompts: 2, todayTokensByModel: { "claude-opus-5-5": 999 } } },
+      },
+    },
+  });
+  const frozen = {
+    "2026-11-02": {
+      claude: { tokens: 999, prompts: 3, slots: { "": { tokens: 999, prompts: 3, models: { "claude-opus-5-5": { tokens: 999, messages: 3 } } } } },
+    },
+  };
+
+  const openHistory = async (days) => {
+    const harness = makeHarness({ report });
+    routeHistory(harness, [month], { [month]: historyPayload(month, [month], { days, totals: null }) });
+    module.default(harness.pi);
+    await startSession(harness, null);
+    const overlays = installOverlay(harness, { rows: 40 });
+    const usage = harness.commands.find((command) => command.name === "usage");
+    const pending = usage.definition.handler("", harness.ctx);
+    await settle();
+    overlays[0].component.handleInput("\t");
+    await settle();
+    return { overlays, pending };
+  };
+
+  const open = await openHistory(frozen);
+  const frame = frameText(open.overlays[0], 120);
+  assert.match(frame, /Claude \(Pi\) · 999 in 2026-11 · 3 prompts/, "the frozen 11-02 is counted once, prompts included");
+  assert.match(frame, /days +11-02 999/);
+  assert.doesNotMatch(frame, /days .*11-03/, "yesterday's totals are never painted under today's key");
+  assert.doesNotMatch(frame, /comes from the live report/, "no merge happened, so no merge note");
+  assert.match(frame, /the live report is from 2026-11-02; 2026-11-03 is not merged/);
+  open.overlays[0].component.handleInput("\u001b");
+  await open.pending;
+
+  // With yesterday still unfrozen the merge is skipped whole: a live day that
+  // belongs to another date is not silently re-dated to today.
+  const unfrozen = await openHistory({});
+  const unfrozenFrame = frameText(unfrozen.overlays[0], 120);
+  assert.match(unfrozenFrame, /no token history for 2026-11/, "nothing frozen and nothing merged");
+  assert.doesNotMatch(unfrozenFrame, /11-03 999/);
+  unfrozen.overlays[0].component.handleInput("\u001b");
+  await unfrozen.pending;
+});
+
+test("the cached report's older day is not merged into today either", async (t) => {
+  const module = await import(EXTENSION);
+  // The first frame paints ~/.cache/pi-quota/usage.json, which can be days old.
+  t.mock.timers.enable({ apis: ["Date"], now: new Date(2026, 10, 3, 9, 0, 0) });
+  const month = "2026-11";
+  const report = liveReport({
+    generatedAt: new Date(2026, 10, 1, 18, 30, 0).toISOString(),
+    localStats: {
+      claude: {
+        hasLocalStats: true,
+        todayTotalTokens: 1_500,
+        todayPrompts: 4,
+        todayTokensByModel: { "claude-opus-5-5": 1_500 },
+        byAccount: { "": { todayTokens: 1_500, todayPrompts: 4, todayTokensByModel: { "claude-opus-5-5": 1_500 } } },
+      },
+    },
+  });
+  const days = {
+    "2026-11-01": {
+      claude: { tokens: 1_500, prompts: 4, slots: { "": { tokens: 1_500, prompts: 4, models: { "claude-opus-5-5": { tokens: 1_500, messages: 4 } } } } },
+    },
+  };
+  const harness = makeHarness({ report });
+  routeHistory(harness, [month], { [month]: historyPayload(month, [month], { days, totals: null }) });
+  module.default(harness.pi);
+  await startSession(harness, null);
+  const overlays = installOverlay(harness, { rows: 40 });
+  const usage = harness.commands.find((command) => command.name === "usage");
+  const pending = usage.definition.handler("", harness.ctx);
+  await settle();
+  overlays[0].component.handleInput("\t");
+  await settle();
+
+  const frame = frameText(overlays[0], 120);
+  assert.match(frame, /Claude \(Pi\) · 1\.5k in 2026-11 · 4 prompts/, "a 11-01 cache does not add itself to 11-03");
+  assert.match(frame, /days +11-01 1\.5k/);
+  assert.doesNotMatch(frame, /days .*11-03/);
+  assert.match(frame, /the live report is from 2026-11-01; 2026-11-03 is not merged/);
+
+  overlays[0].component.handleInput("\u001b");
+  await pending;
+});
+
+test("an out-of-order history answer never moves the page off the last keypress", async () => {
+  const module = await import(EXTENSION);
+  const months = ["2026-08", "2026-09", "2026-10"];
+  const days = (key, tokens) => ({
+    [key]: {
+      claude: { tokens, prompts: 1, slots: { "": { tokens, prompts: 1, models: { "claude-opus-5-5": { tokens, messages: 1 } } } } },
+    },
+  });
+  const harness = makeHarness({ report: overlayReport() });
+  const { calls, answer } = routeHistoryDeferred(harness);
+  module.default(harness.pi);
+  await startSession(harness, null);
+  const overlays = installOverlay(harness, { rows: 40 });
+  const usage = harness.commands.find((command) => command.name === "usage");
+  const pending = usage.definition.handler("", harness.ctx);
+  await settle();
+  overlays[0].component.handleInput("\t");
+  answer(null, historyPayload("2026-10", months, { days: HISTORY_OCTOBER, totals: HISTORY_TOTALS }));
+  await settle();
+  assert.match(frameText(overlays[0]), /Quota · History · 2026-10/);
+
+  // Two ← presses, two fetches in flight. The header names the newest request,
+  // not the first one: it is the one the page is waiting for.
+  overlays[0].component.handleInput("\u001b[D");
+  assert.match(frameText(overlays[0]), /loading 2026-09 …/);
+  overlays[0].component.handleInput("\u001b[D");
+  assert.match(frameText(overlays[0]), /loading 2026-08 …/);
+  assert.deepEqual(calls, [null, "2026-09", "2026-08"]);
+
+  // The newer request answers first, then the older one lands late. The page
+  // stays on the month the last keypress asked for and never skips a month.
+  answer("2026-08", historyPayload("2026-08", months, { days: days("2026-08-31", 800), totals: null }));
+  await settle();
+  assert.match(frameText(overlays[0]), /Quota · History · 2026-08/);
+  assert.match(frameText(overlays[0]), /days +08-31 800/);
+  answer("2026-09", historyPayload("2026-09", months, { days: days("2026-09-30", 900), totals: null }));
+  await settle();
+  const frame = frameText(overlays[0], 120);
+  assert.match(frame, /Quota · History · 2026-08/, "a late answer for 09 does not snap the page back to it");
+  assert.match(frame, /days +08-31 800/);
+  assert.doesNotMatch(frame, /loading/, "nothing is loading once both answers landed");
+
+  // The late answer is cached all the same: ← costs no second fetch.
+  overlays[0].component.handleInput("\u001b[C");
+  await settle();
+  assert.match(frameText(overlays[0]), /Quota · History · 2026-09/);
+  assert.match(frameText(overlays[0]), /days +09-30 900/);
+  assert.deepEqual(calls, [null, "2026-09", "2026-08"], "a month that already answered is not fetched again");
+
+  overlays[0].component.handleInput("\u001b");
+  await pending;
+});
+
+test("a fetch for a month the user already left does not claim the header", async () => {
+  const module = await import(EXTENSION);
+  const months = ["2026-08", "2026-09", "2026-10"];
+  const harness = makeHarness({ report: overlayReport() });
+  const { answer, fail } = routeHistoryDeferred(harness);
+  module.default(harness.pi);
+  await startSession(harness, null);
+  const overlays = installOverlay(harness, { rows: 40 });
+  const usage = harness.commands.find((command) => command.name === "usage");
+  const pending = usage.definition.handler("", harness.ctx);
+  await settle();
+  overlays[0].component.handleInput("\t");
+  answer(null, historyPayload("2026-10", months, { days: HISTORY_OCTOBER, totals: HISTORY_TOTALS }));
+  await settle();
+
+  overlays[0].component.handleInput("\u001b[D");
+  assert.match(frameText(overlays[0]), /loading 2026-09 …/);
+  // Back to the cached month while 09 is still in flight: its page is served, so
+  // the header must not keep saying that a month nobody is looking at loads.
+  overlays[0].component.handleInput("\u001b[C");
+  await settle();
+  const frame = frameText(overlays[0], 120);
+  assert.match(frame, /Quota · History · 2026-10/);
+  assert.doesNotMatch(frame, /loading 2026-09/);
+  answer("2026-09", historyPayload("2026-09", months, { days: {}, totals: null }));
+  await settle();
+  assert.match(frameText(overlays[0]), /Quota · History · 2026-10/, "the late answer leaves the page alone");
+
+  // A failure for a month the user has left is not painted over the page either:
+  // its "press r to retry" would retry 10, not the fetch that failed.
+  overlays[0].component.handleInput("\u001b[D");
+  assert.match(frameText(overlays[0]), /Quota · History · 2026-09/, "09 is cached now");
+  overlays[0].component.handleInput("\u001b[D");
+  assert.match(frameText(overlays[0]), /loading 2026-08 …/);
+  overlays[0].component.handleInput("\u001b[C");
+  fail("2026-08");
+  await settle();
+  const afterFailure = frameText(overlays[0], 140);
+  assert.match(afterFailure, /Quota · History · 2026-09/);
+  assert.doesNotMatch(afterFailure, /history lock|history failed/, "a failure for 08 does not claim the 09 page");
+  assert.match(afterFailure, /no token history for 2026-09/, "the cached 09 page is still served");
+
+  // Going back to 08 asks again, and only then does its failure belong on screen.
+  overlays[0].component.handleInput("\u001b[D");
+  assert.match(frameText(overlays[0]), /loading 2026-08 …/);
+  fail("2026-08");
+  await settle();
+  const back = frameText(overlays[0], 140);
+  assert.match(back, /! stats: another piquota run holds the history lock/);
+  assert.match(back, /history failed/);
+  assert.match(back, /no history for this month; press r to retry/);
+
+  overlays[0].component.handleInput("\u001b");
+  await pending;
+});
+
+test("a failed stats run reports the CLI's cause, not the JSON parser's", async () => {
+  const module = await import(EXTENSION);
+  const month = "2026-10";
+  const harness = makeHarness({ report: overlayReport() });
+  routeHistory(harness, [month], { [month]: historyPayload(month, [month], { days: HISTORY_OCTOBER, totals: HISTORY_TOTALS }) });
+  module.default(harness.pi);
+  await startSession(harness, null);
+  const overlays = installOverlay(harness, { rows: 40 });
+  const usage = harness.commands.find((command) => command.name === "usage");
+  const pending = usage.definition.handler("", harness.ctx);
+  await settle();
+  overlays[0].component.handleInput("\t");
+  await settle();
+  assert.match(frameText(overlays[0]), /Quota · History · 2026-10/);
+
+  const failWith = (result) => {
+    harness.pi.exec = async () => result;
+    overlays[0].component.handleInput("r");
+  };
+
+  // An empty stdout used to surface as "Unexpected end of JSON input", which
+  // names the parser instead of the cause: the CLI's own first stderr line.
+  failWith({ stdout: "", stderr: "stats: another piquota run holds the history lock (/tmp/x/cache/local-sessions.json.lock); try again in a moment\nsecond line\n", code: 1 });
+  await settle();
+  let frame = frameText(overlays[0], 140);
+  assert.match(frame, /! stats: another piquota run holds the history lock/);
+  assert.doesNotMatch(frame, /Unexpected end of JSON input/);
+  assert.doesNotMatch(frame, /second line/, "one stderr line, not the whole transcript");
+  assert.match(frame, /press r to retry/, "the failure keeps its retry hint even with a month on screen");
+  const narrow = overlays[0].component.render(64);
+  assert.ok(narrow.every((line) => plain(line).length <= 64), "a long stderr cause wraps instead of clipping the pane");
+  assert.match(plain(narrow.join("\n")), /press r to retry/, "the hint survives the wrap, not just the wide pane");
+
+  // No stderr at all: the exit status is the cause.
+  failWith({ stdout: "", stderr: "", code: 2 });
+  await settle();
+  frame = frameText(overlays[0], 140);
+  assert.match(frame, /! piquota stats exited 2/);
+
+  // Half-written JSON with a reason on stderr: the reason wins.
+  failWith({ stdout: '{"schemaVersion":1,"months":[', stderr: "stats: no frozen token history at /tmp/pi-usage\n", code: 0 });
+  await settle();
+  assert.match(frameText(overlays[0], 140), /! stats: no frozen token history at \/tmp\/pi-usage/);
+
+  // Whatever the CLI prints, a credential or an identity never reaches the frame.
+  failWith({ stdout: "", stderr: "probe failed for dev@example.com with sk-ant-abcdefghijklmnop\n", code: 1 });
+  await settle();
+  frame = frameText(overlays[0], 140);
+  assert.match(frame, /! probe failed for <email> with sk-ant-ab<redacted>/);
+  assert.doesNotMatch(frame, /dev@example\.com|abcdefghijklmnop/);
+
+  overlays[0].component.handleInput("\u001b");
+  await pending;
+});
+
+test("History says a report refresh is running, because its today row waits on it", async () => {
+  const module = await import(EXTENSION);
+  const month = "2026-10";
+  const report = overlayReport();
+  const harness = makeHarness({ report });
+  routeHistory(harness, [month], { [month]: historyPayload(month, [month], { days: HISTORY_OCTOBER, totals: HISTORY_TOTALS }) });
+  const routed = harness.pi.exec;
+  let releaseReport = null;
+  // Hold the report run open: the overlay is painted while it is still running.
+  harness.pi.exec = async (runner, argv, options) => {
+    if (argv.includes("stats")) return routed(runner, argv, options);
+    if (argv.includes("omarchy")) return { stdout: "", stderr: "", code: 0 };
+    return new Promise((resolve) => {
+      releaseReport = () => resolve({ stdout: JSON.stringify(withFamilies(report)), stderr: "", code: 0 });
+    });
+  };
+  module.default(harness.pi);
+  await startSession(harness, null);
+  const overlays = installOverlay(harness, { rows: 40 });
+  const usage = harness.commands.find((command) => command.name === "usage");
+  const pending = usage.definition.handler("", harness.ctx);
+  await settle();
+  assert.ok(releaseReport, "the background report refresh is in flight");
+
+  overlays[0].component.handleInput("\t");
+  await settle();
+  const frame = frameText(overlays[0], 120);
+  assert.match(frame, /Quota · History · 2026-10/);
+  assert.match(frame, /refreshing …/, "History's live today row depends on the running report refresh");
+
+  releaseReport();
+  await settle();
+  assert.doesNotMatch(frameText(overlays[0], 120), /refreshing …/, "the indicator clears when the refresh lands");
+
+  overlays[0].component.handleInput("\u001b");
+  await pending;
+});
+
+test("a multi-account family keeps every account row when the month only used one", async () => {
+  const module = await import(EXTENSION);
+  const month = "2026-10";
+  const days = {
+    "2026-10-01": {
+      "opencode-go": {
+        tokens: 2_000,
+        prompts: 4,
+        slots: { "2": { tokens: 2_000, prompts: 4, models: { "deepseek-v4.1-flash": { tokens: 2_000, messages: 4 } } } },
+      },
+    },
+  };
+  const totals = {
+    lastFrozenDay: "2026-10-01",
+    families: {
+      "opencode-go": {
+        totalPrompts: 6,
+        modelUsage: { "deepseek-v4.1-flash": { input: 3_000 } },
+        accounts: {
+          "": { modelUsage: { "deepseek-v4.1-flash": { input: 1_000 } } },
+          "#2": { modelUsage: { "deepseek-v4.1-flash": { input: 2_000 } } },
+        },
+      },
+    },
+  };
+  const harness = makeHarness({ report: overlayReport() });
+  routeHistory(harness, [month], { [month]: historyPayload(month, [month], { days, totals }) });
+  module.default(harness.pi);
+  await startSession(harness, null);
+  const overlays = installOverlay(harness, { rows: 40 });
+  const usage = harness.commands.find((command) => command.name === "usage");
+  const pending = usage.definition.handler("", harness.ctx);
+  await settle();
+  overlays[0].component.handleInput("\t");
+  await settle();
+
+  const frame = frameText(overlays[0], 100);
+  assert.match(frame, /▾ OP-Go · 2\.0k in 2026-10/, "a family with more than one account uses the Now short name");
+  assert.match(frame, /^ +month 0 · all-time 1\.0k$/m, "the idle account keeps its all-time row");
+  assert.match(frame, /#2 +month 2\.0k · all-time 2\.0k · deepseek-v4\.1-flash/);
+
+  overlays[0].component.handleInput("\u001b");
+  await pending;
+});
+
+test("History opens on the live month even before its first freeze", async (t) => {
+  const module = await import(EXTENSION);
+  t.mock.timers.enable({ apis: ["Date"], now: new Date(2026, 10, 2, 9, 0, 0) });
+  const live = "2026-11";
+  const months = ["2026-09", "2026-10", live];
+  const report = liveReport({
+    localStats: {
+      claude: {
+        hasLocalStats: true,
+        todayTotalTokens: 500,
+        todayPrompts: 2,
+        todayTokensByModel: { "claude-opus-5-5": 500 },
+        byAccount: { "": { todayTokens: 500 } },
+      },
+    },
+  });
+  const harness = makeHarness({ report });
+  const calls = routeHistory(harness, months, {
+    "2026-09": historyPayload("2026-09", months, { days: { "2026-09-30": { claude: { tokens: 700, prompts: 2, slots: {} } } }, totals: null }),
+    "2026-10": historyPayload("2026-10", months, { days: HISTORY_OCTOBER, totals: HISTORY_TOTALS }),
+    [live]: historyPayload(live, months, { days: {}, totals: HISTORY_TOTALS }),
+  });
+  module.default(harness.pi);
+  await startSession(harness, null);
+  const overlays = installOverlay(harness, { rows: 40 });
+  const usage = harness.commands.find((command) => command.name === "usage");
+  const pending = usage.definition.handler("", harness.ctx);
+  await settle();
+
+  overlays[0].component.handleInput("\t");
+  await settle();
+  assert.deepEqual(calls, [null], "the first tap asks for the default month");
+  const frame = frameText(overlays[0], 100);
+  assert.match(frame.split("\n")[0], /Quota · History · 2026-11/, "History opens on the live month, not on the newest file");
+  assert.match(frame, /~ 2026-11-02 comes from the live report/, "the live day is merged on the 2nd, with no month file at all");
+  assert.match(frame, /days +11-02 500/);
+  assert.match(frame, /Claude \(Pi\) · 500 in 2026-11/);
+
+  overlays[0].component.handleInput("\u001b[D");
+  await settle();
+  assert.match(frameText(overlays[0]), /Quota · History · 2026-10/, "← reaches the previous month with a file");
+  overlays[0].component.handleInput("\u001b[C");
+  await settle();
+  assert.match(frameText(overlays[0]), /Quota · History · 2026-11/, "→ comes back to the live month");
+  assert.deepEqual(calls, [null, "2026-10"], "the live month stays cached");
+
+  overlays[0].component.handleInput("\u001b");
+  await pending;
+});
+
+test("one family frozen today does not drop another family's live day", async (t) => {
+  const module = await import(EXTENSION);
+  t.mock.timers.enable({ apis: ["Date"], now: new Date(2026, 10, 15, 12, 0, 0) });
+  const month = "2026-11";
+  const report = liveReport({
+    localStats: {
+      claude: {
+        hasLocalStats: true,
+        todayTotalTokens: 500,
+        todayPrompts: 2,
+        todayTokensByModel: { "claude-opus-5-5": 500 },
+        byAccount: { "": { todayTokens: 500 } },
+      },
+      "opencode-go": {
+        hasLocalStats: true,
+        todayTotalTokens: 300,
+        todayPrompts: 1,
+        todayTokensByModel: { "deepseek-v4.1-flash": 300 },
+        byAccount: { "": { todayTokens: 300, todayPrompts: 1, todayTokensByModel: { "deepseek-v4.1-flash": 300 } } },
+      },
+    },
+  });
+  const days = {
+    "2026-11-15": {
+      claude: { tokens: 400, prompts: 1, slots: { "": { tokens: 400, prompts: 1, models: { "claude-opus-5-5": { tokens: 400, messages: 1 } } } } },
+    },
+  };
+  const harness = makeHarness({ report });
+  routeHistory(harness, [month], { [month]: historyPayload(month, [month], { days, totals: null }) });
+  module.default(harness.pi);
+  await startSession(harness, null);
+  const overlays = installOverlay(harness, { rows: 40 });
+  const usage = harness.commands.find((command) => command.name === "usage");
+  const pending = usage.definition.handler("", harness.ctx);
+  await settle();
+  overlays[0].component.handleInput("\t");
+  await settle();
+
+  const frame = frameText(overlays[0], 100);
+  assert.match(frame, /Claude \(Pi\) · 400 in 2026-11/, "a family the writer already froze today is not merged again");
+  assert.match(frame, /OpenCode Go \(Pi\) · 300 in 2026-11/, "the other family's live day is still merged");
+  assert.match(frame, /~ 2026-11-15 comes from the live report/);
+
+  overlays[0].component.handleInput("\u001b");
+  await pending;
+});
+
+test("the merged live day carries each account's own models", async (t) => {
+  const module = await import(EXTENSION);
+  t.mock.timers.enable({ apis: ["Date"], now: new Date(2026, 10, 15, 12, 0, 0) });
+  const month = "2026-11";
+  const report = liveReport({
+    localStats: {
+      "opencode-go": {
+        hasLocalStats: true,
+        todayTotalTokens: 500,
+        todayPrompts: 2,
+        todayTokensByModel: { "deepseek-v4.1-flash": 500 },
+        byAccount: {
+          "": { todayTokens: 500, todayPrompts: 2, todayTokensByModel: { "deepseek-v4.1-flash": 500 } },
+          "#2": { todayTokens: 0, todayPrompts: 0, todayTokensByModel: {} },
+        },
+      },
+    },
+  });
+  const days = {
+    "2026-11-01": {
+      "opencode-go": {
+        tokens: 2_000,
+        prompts: 4,
+        slots: { "2": { tokens: 2_000, prompts: 4, models: { "deepseek-v4.1-flash": { tokens: 2_000, messages: 4 } } } },
+      },
+    },
+  };
+  const totals = {
+    lastFrozenDay: "2026-11-01",
+    families: {
+      "opencode-go": {
+        totalPrompts: 6,
+        modelUsage: { "deepseek-v4.1-flash": { input: 2_500 } },
+        accounts: {
+          "": { modelUsage: { "deepseek-v4.1-flash": { input: 500 } } },
+          "#2": { modelUsage: { "deepseek-v4.1-flash": { input: 2_000 } } },
+        },
+      },
+    },
+  };
+  const harness = makeHarness({ report });
+  routeHistory(harness, [month], { [month]: historyPayload(month, [month], { days, totals }) });
+  module.default(harness.pi);
+  await startSession(harness, null);
+  const overlays = installOverlay(harness, { rows: 40 });
+  const usage = harness.commands.find((command) => command.name === "usage");
+  const pending = usage.definition.handler("", harness.ctx);
+  await settle();
+  overlays[0].component.handleInput("\t");
+  await settle();
+
+  const frame = frameText(overlays[0], 100);
+  assert.match(frame, /^ +month 500 · all-time 500 · deepseek-v4\.1-flash$/m, "the merged day names the model that burned it");
+  assert.match(frame, /#2 +month 2\.0k · all-time 2\.0k · deepseek-v4\.1-flash/);
+
+  overlays[0].component.handleInput("\u001b");
+  await pending;
+});
+
+test("folds and the page survive closing and reopening /usage", async () => {
+  const module = await import(EXTENSION);
+  const harness = makeHarness({ report: overlayReport() });
+  routeHistory(harness, ["2026-10"], { "2026-10": historyPayload("2026-10", ["2026-10"], { days: HISTORY_OCTOBER, totals: HISTORY_TOTALS }) });
+  module.default(harness.pi);
+  await startSession(harness, null);
+  const overlays = installOverlay(harness, { rows: 40 });
+  const usage = harness.commands.find((command) => command.name === "usage");
+
+  let pending = usage.definition.handler("", harness.ctx);
+  await settle();
+  assert.match(frameText(overlays[0]), /5h window/);
+  overlays[0].component.handleInput("\r");
+  assert.equal(/5h window/.test(frameText(overlays[0])), false, "Enter folds the section");
+  overlays[0].component.handleInput("\u001b");
+  await pending;
+
+  pending = usage.definition.handler("", harness.ctx);
+  await settle();
+  assert.equal(overlays.length, 2, "a second bare /usage builds a new view");
+  assert.match(frameText(overlays[1]), /❯ ▸ Claude/, "the fold survived the close: the section is still folded");
+  assert.equal(/5h window/.test(frameText(overlays[1])), false);
+
+  overlays[1].component.handleInput("\t");
+  await settle();
+  assert.match(frameText(overlays[1]), /Quota · History · 2026-10/);
+  overlays[1].component.handleInput("\u001b");
+  await pending;
+
+  pending = usage.definition.handler("", harness.ctx);
+  await settle();
+  assert.equal(overlays.length, 3);
+  assert.match(frameText(overlays[2]), /Quota · History · 2026-10/, "the page survived too");
+  assert.match(frameText(overlays[2]), /days +10-01 1\.2k/, "and its month is fetched again for the new view");
+  overlays[2].component.handleInput("1");
+  assert.match(frameText(overlays[2]), /❯ ▸ Claude/, "…while the Now page's fold still holds");
+  assert.equal(/5h window/.test(frameText(overlays[2])), false);
+
+  overlays[2].component.handleInput("\u001b");
+  await pending;
 });
 
 test("agent_end is a no-op while no surface is on", async () => {

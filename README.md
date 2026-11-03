@@ -223,6 +223,9 @@ piquota auth opencode --wait 300
 
 piquota omarchy                 # write pi-*.json records for Omarchy's Agents panel
 piquota stats                   # durable token history: last frozen day, families, totals
+piquota stats --json --month 2026-11
+                                # read-only history feed: months, one month's days
+                                # per family/slot/model, all-time totals, notes
 piquota stats --rebuild-totals  # recompute totals.json from the frozen month files
 ```
 
@@ -242,7 +245,7 @@ Inside Pi:
 
 | Command | Effect |
 | --- | --- |
-| `/usage` | open the fullscreen quota overlay: every provider, window, account and token row, folded by section, refreshed in the background; `esc` closes it |
+| `/usage` | open the fullscreen quota overlay: every provider, window, account and token row, folded by section, refreshed in the background; `tab` opens the month history; `esc` closes it |
 | `/usage box` | pin the five-row box above the editor |
 | `/usage line` | pin the compact line above the editor, in its own row |
 | `/usage panel` | full panel above the editor, pinned across prompts |
@@ -271,8 +274,8 @@ failed refresh is a line in the view, never a thrown error. Every provider is a 
 the header is the brand-coloured name line, the body lists every window with its
 used-fraction bar, reset countdown and the token rows for today, the last seven
 days, the prompts and the heaviest models. All sections start expanded; the fold
-state lives for the pi session, so reopening `/usage` resumes it, and no file is
-written.
+state and the page you left live for the pi session, so reopening `/usage`
+resumes them, and no file is written.
 
 | Key | Action |
 | --- | --- |
@@ -281,18 +284,44 @@ written.
 | `→`/`l`, `←`/`h` | expand, collapse |
 | `PgUp`/`PgDn`, `g`/`Home`, `G`/`End` | page, first section, last section |
 | mouse wheel | scroll |
-| `r` | refresh in place |
+| `r` | refresh in place (on History: the month and the live report) |
+| `tab`, `1` / `2` | switch between Now and History |
 | `esc` / `q` | close |
 
 The legend at the bottom lists every key the current view answers, and wraps
 into a second or third row on a narrow pane instead of dropping pairs — as few
-rows as fit, with the pairs balanced across them. The frame fits from about 60
-columns up: a line wider than the terminal wraps at its separators with a
-hanging indent instead of being cut, so a row never loses the datum it ends
-with, and a resize rebuilds it. The wheel is handled by the component itself, like
+rows as fit, with the pairs balanced across them. The frame
+fits from about 60 columns up: a line wider than the terminal wraps at its
+` · ` separators with a hanging indent instead of being cut, so a row never
+loses the datum it ends with, and a resize rebuilds it. The wheel is handled by the component itself, like
 pi-context-view: pi routes fullscreen wheel events to the focused component but
 has no scrolling API for a custom screen, and this extension has no runtime
 dependencies to wrap the body in a `ScrollView`.
+
+`tab` (or `2`) opens **History**, the second page: the durable token history for
+one month, with the same foldable sections. A provider section lists the month's
+days, the token split by model, and — for a multi-account provider — one row per
+account with its month and all-time totals (every account the family has in the
+month *or* all-time, so one busy key does not hide the others). `←`/`→` (or
+`[`/`]`) walk the browsable months — those with a file, plus the live month,
+which is where History opens even before its first freeze — and `tab` (or `1`)
+comes back to Now. The all-time
+figure is `totals.json` (frozen through its watermark). A family's open day
+(today) is merged from the live report only when the report was *generated* today
+and the frozen month has no row for that family's day — per family, so one family
+frozen early never hides another's live row — and a day is counted exactly once.
+A report generated before midnight, or the older report cache painted on the first
+frame, is skipped: its `todayTotalTokens` belong to another day, and merging them
+under today would count a frozen yesterday twice. The tail then names the report's
+day and says today is not merged. A missing or quarantined month is a note instead
+of rows, a failed `stats` run shows the CLI's own stderr line (redacted) or its
+exit status with a retry hint, and a slow fetch never moves the page off the month
+the last keypress asked for.
+
+History reads `piquota stats --json [--month YYYY-MM]`: the month list, one
+month's days per family/slot/model, the all-time rollup and notes. That command
+never takes the writer lock and never writes, so it is safe to run while a scan
+is freezing a day.
 
 A provider with several accounts is shown as one header (`OP-Go · 7 of 14 accounts
 ok`) plus one line per account with every window and its reset, e.g.
@@ -622,6 +651,8 @@ shows them next to the quota:
 | `/usage` panel | a `tokens` row per provider: today, 7 days, prompts, then the top 3 models of the week |
 | `piquota omarchy` | the optional fields Omarchy's Agents panel draws as "Tokens by day" and "Tokens by model" |
 | `piquota stats` | the durable history: last frozen day, families, prompts, session-days |
+| `/usage` → `tab` | History: per provider, the month's days and models, account totals for a multi-account family, and the all-time rollup |
+| `piquota stats --json` | the same history as a read-only JSON feed (`--month YYYY-MM` selects a month) |
 
 What counts: one assistant message with a non-zero token count is one prompt,
 and its tokens are `input + output + cacheRead + cacheWrite` — the same sum the
@@ -795,7 +826,7 @@ extensions/quota-panel.ts      Pi TUI line and /usage
 ## Tests
 
 ```bash
-node --test tests/*.test.mjs     # 376 tests, fake tokens only, no network
+node --test tests/*.test.mjs     # 401 tests, fake tokens only, no network
 ```
 
 Modules covered: `auth.json` parsing and de-duplication, the Claude Code store

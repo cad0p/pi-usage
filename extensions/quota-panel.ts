@@ -84,6 +84,8 @@ type LocalAccountStats = {
   todayPrompts?: number;
   totalPrompts?: number;
   totalTokens?: number;
+  /** The account's own model split for today; absent from an older report. */
+  todayTokensByModel?: Record<string, number>;
 };
 
 /**
@@ -593,9 +595,9 @@ function styledChars(line: string): { chars: StyledChar[]; trailing: string } {
  * that matters most: "(18d)" is when the month resets, and "token exp" is the
  * state of the credential. So a row that does not fit wraps instead — the first
  * row keeps the line's own indent, every continuation is indented by the line's
- * leading spaces (or `hanging`), and no cell is ever dropped. A cell with no
- * separator in it wraps between words; a single word wider than the terminal is
- * the only case left to cut.
+ * leading spaces (or `hanging`), and no cell is ever dropped. A single cell
+ * wider than the terminal is the one case that still clips: there is nowhere to
+ * break it.
  */
 function wrapLine(line: string, width: number, hanging?: string): string[] {
   const limit = Math.max(1, Math.floor(width));
@@ -604,7 +606,7 @@ function wrapLine(line: string, width: number, hanging?: string): string[] {
   if (chars.length === 0) return [line];
   const visible = chars.map((item) => item.char).join("");
   // A break sits on the space in front of " · ", so neither row starts with a
-  // dangling middle dot; a word boundary is the fallback for a long sentence.
+  // dangling middle dot.
   const breaks: number[] = [];
   const spaces: number[] = [];
   for (let index = 0; index + 2 < visible.length; index += 1) {
@@ -627,6 +629,9 @@ function wrapLine(line: string, width: number, hanging?: string): string[] {
       lines.push(row(start, chars.length, prefix, trailing));
       break;
     }
+    // A " · " boundary is the natural break; a word boundary is the fallback, so
+    // a long warning wraps between words instead of mid-token; a single word
+    // wider than the pane is the only case left to hard-cut.
     const breakAt = breaks.filter((index) => index > start && index <= fits).pop();
     const spaceAt = breakAt === undefined ? spaces.filter((index) => index > start && index <= fits).pop() : undefined;
     const cut = breakAt ?? spaceAt ?? fits;
@@ -977,17 +982,94 @@ function spreadLine(left: string, right: string, width: number): string {
 /** One content row of the overlay, with the section it belongs to. */
 type OverlayRow = { text: string; section: number; header: boolean };
 
+/** One month of the durable history, as `piquota stats --json` returns it. */
+type HistoryPayload = {
+  generatedAt?: string;
+  months?: string[];
+  quarantined?: string[];
+  month?: string;
+  days?: Record<string, Record<string, HistoryFamilyDay>>;
+  totals?: HistoryTotals | null;
+  notes?: string[];
+};
+
+type HistoryFamilyDay = {
+  sessions?: number;
+  tokens?: number;
+  prompts?: number;
+  slots?: Record<string, HistorySlotDay>;
+};
+
+type HistorySlotDay = {
+  sessions?: number;
+  tokens?: number;
+  prompts?: number;
+  models?: Record<string, { tokens?: number; messages?: number }>;
+};
+
+type HistoryTotals = {
+  lastFrozenDay?: string;
+  families?: Record<string, HistoryTotalsFamily>;
+};
+
+type HistoryTotalsModel = {
+  input?: number;
+  output?: number;
+  cacheRead?: number;
+  cacheWrite?: number;
+};
+
+type HistoryTotalsFamily = {
+  firstDay?: string;
+  activeDates?: string[];
+  totalPrompts?: number;
+  totalSessions?: number;
+  modelUsage?: Record<string, HistoryTotalsModel>;
+  accounts?: Record<string, { totalPrompts?: number; totalSessions?: number; modelUsage?: Record<string, HistoryTotalsModel> }>;
+};
+
+/** One family's month, aggregated from the payload and the live report. */
+type HistoryFamily = {
+  tokens: number;
+  prompts: number;
+  days: Map<string, number>;
+  models: Map<string, number>;
+  accounts: Map<string, { tokens: number; prompts: number; models: Map<string, number> }>;
+  allTime: number;
+  allTimeAccounts: Map<string, number>;
+};
+
 /**
  * What outlives one overlay instance. Every bare `/usage` builds a fresh view,
- * so the folds live in the extension — for the pi session only, never on disk.
+ * so the folds and the page it was closed on live in the extension — for the pi
+ * session only, and never on disk.
  */
 type OverlaySession = {
   expanded: Map<string, boolean>;
+  view: "now" | "history";
+  month: string | null;
 };
 
 function newOverlaySession(): OverlaySession {
-  return { expanded: new Map() };
+  return { expanded: new Map(), view: "now", month: null };
 }
+
+/**
+ * The History page's fetch state. "Not asked yet", "in flight" and "the last
+ * fetch failed" are three different frames: the failed one must not also claim
+ * to be loading.
+ */
+type HistoryStatus =
+  | { kind: "idle" }
+  | { kind: "loading"; month: string | null }
+  | { kind: "failed"; month: string | null; message: string };
+
+/**
+ * One id per `stats --json` request, for the whole pi process: a reopened overlay
+ * issues the next id, so an answer to a closed view's request can never be taken
+ * for an answer to its own.
+ */
+let historyRequestSeq = 0;
 
 type UsageOverlayOptions = {
   /** Close the overlay through the component's completion callback. */
@@ -1003,21 +1085,50 @@ type UsageOverlayOptions = {
   isRefreshing: () => boolean;
   /** Run the same forced refresh `/usage` always ran, in the background. */
   refresh: () => void;
+  /**
+   * Ask the extension to run `piquota stats --json` for one month (null: newest).
+   * The request id comes back with the answer, so a slow fetch cannot apply a
+   * month the last keypress did not ask for.
+   */
+  loadHistory: (month: string | null, request: number) => void;
+};
+
+/** Display names for a family the current report does not mention. */
+const FAMILY_LABEL: Record<string, string> = {
+  claude: "Claude (Pi)",
+  codex: "Codex (Pi)",
+  antigravity: "Antigravity (Pi)",
+  "opencode-go": "OpenCode Go (Pi)",
+  "github-actions": "GitHub Actions",
 };
 
 /**
- * The key legend. Every key the current view answers appears here, and pairs a
- * view does not answer (month navigation outside History) are added by that
- * view. The legend wraps instead of dropping pairs, so a 60-column terminal
- * still shows every key; the close key stays last.
+ * The key legend. Every key the current view answers appears here; a pair a
+ * view does not answer (month navigation outside History) is not listed. The
+ * legend wraps instead of dropping pairs, so a 60-column terminal still shows
+ * every key; the close key stays last.
  */
 const NOW_HINTS: ReadonlyArray<readonly [string, string]> = [
   ["↑↓/jk", "move"],
-  ["enter/←→/hl", "fold"],
+  ["enter/space/←→/hl", "fold"],
   ["pgup/pgdn", "page"],
-  ["g/G", "top/end"],
+  ["g/G home/end", "top/end"],
   ["wheel", "scroll"],
   ["r", "refresh"],
+  ["tab/1/2", "history"],
+  ["esc/q", "close"],
+];
+
+const HISTORY_HINTS: ReadonlyArray<readonly [string, string]> = [
+  ["↑↓/jk", "move"],
+  ["enter/space/h/l", "fold"],
+  ["←/[", "prev month"],
+  ["]/→", "next month"],
+  ["pgup/pgdn", "page"],
+  ["g/G home/end", "top/end"],
+  ["wheel", "scroll"],
+  ["r", "refresh"],
+  ["tab/1/2", "now"],
   ["esc/q", "close"],
 ];
 
@@ -1057,6 +1168,101 @@ function updatedAtLabel(report: QuotaReport): string {
   const at = new Date(report.generatedAt);
   if (Number.isNaN(at.getTime())) return "updated";
   return `updated ${String(at.getHours()).padStart(2, "0")}:${String(at.getMinutes()).padStart(2, "0")}`;
+}
+
+/**
+ * Mask what must never reach a TUI frame or a scrollback. Mirrors
+ * `src/http.js:redact` (this extension is one dependency-free file), and adds the
+ * ANSI strip: a CLI's stderr can carry its own colour codes.
+ */
+function redactCause(value: string): string {
+  return value
+    .replace(/\u001b\[[0-9;]*m/g, "")
+    .replace(/[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}/g, "<email>")
+    .replace(/\beyJ[\w-]{8,}\.[\w-]{8,}\.[\w-]{4,}\b/g, "<jwt>")
+    .replace(/\b(sk-[A-Za-z0-9_-]{6})[A-Za-z0-9_-]+/g, "$1<redacted>")
+    .replace(/\b(ya29\.)[A-Za-z0-9_-]+/g, "$1<redacted>")
+    .replace(/\b(1\/\/)[A-Za-z0-9_-]+/g, "$1<redacted>")
+    .replace(/\b(rt\.[\w.]{4})[A-Za-z0-9_-]+/g, "$1<redacted>")
+    .replace(/\b(Bearer\s+)[A-Za-z0-9._~+/-]+=*/gi, "$1<redacted>")
+    .replace(/\b((?:__Host-console_session|auth)=)[^;\s]+/gi, "$1<redacted>");
+}
+
+/**
+ * One short, redacted line for a failed `stats --json` run: the CLI's own first
+ * stderr line when it printed one, otherwise its exit status. The raw parse
+ * error ("Unexpected end of JSON input") says nothing about why the read failed.
+ */
+function cliFailureLine(result: { stdout?: string; stderr?: string; code?: number; killed?: boolean } | null | undefined): string {
+  const first = String(result?.stderr ?? "")
+    .split("\n")
+    .map((line) => line.trim())
+    .find((line) => line !== "");
+  const code = Number(result?.code);
+  const cause = first
+    ? redactCause(first)
+    : result?.killed
+      ? "piquota stats was stopped (timeout)"
+      : Number.isFinite(code) && code !== 0
+        ? `piquota stats exited ${code}`
+        : "piquota stats --json printed no history payload";
+  return capCause(cause);
+}
+
+/** A stderr line or a thrown message can quote a whole path list; the frame gets one line. */
+function capCause(cause: string): string {
+  return cause.length > 160 ? `${cause.slice(0, 157)}…` : cause;
+}
+
+/** Local YYYY-MM-DD, the history's day key. */
+function localDayKey(now = new Date()): string {
+  return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
+}
+
+/** Local YYYY-MM, the history's month key. */
+function localMonthKey(now = new Date()): string {
+  return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}`;
+}
+
+/** Tokens in one compact history model bucket. */
+function historyModelTokens(bucket: { tokens?: number } | undefined): number {
+  return Math.max(0, Math.round(Number(bucket?.tokens) || 0));
+}
+
+/** Tokens in one totals.json model bucket (the rollup's short keys). */
+function totalsModelTokens(bucket: HistoryTotalsModel | undefined): number {
+  const values = [bucket?.input, bucket?.output, bucket?.cacheRead, bucket?.cacheWrite];
+  return values.reduce((sum, value) => sum + Math.max(0, Math.round(Number(value) || 0)), 0);
+}
+
+/** Slot labels sort "" (the unnumbered base) first, then #2, #3 … #10 numerically. */
+function slotOrder(label: string): number {
+  if (label === "") return -1;
+  const numeric = Number.parseInt(label.replace(/^#/, ""), 10);
+  return Number.isFinite(numeric) ? numeric : Number.MAX_SAFE_INTEGER;
+}
+
+/**
+ * Greedy wrap of " · "-joined cells: the first line carries the label, the
+ * continuation lines are indented under it, and no cell is dropped.
+ */
+function wrapCells(cells: string[], first: string, rest: string, width: number): string[] {
+  const lines: string[] = [];
+  let current = first;
+  let count = 0;
+  for (const cell of cells) {
+    const separator = count === 0 ? "" : " · ";
+    if (count > 0 && visibleLength(current) + separator.length + visibleLength(cell) > width) {
+      lines.push(current);
+      current = rest + cell;
+      count = 1;
+      continue;
+    }
+    current += separator + cell;
+    count += 1;
+  }
+  lines.push(count > 0 ? current : first.trimEnd());
+  return lines;
 }
 
 /**
@@ -1119,22 +1325,38 @@ function balanceRows(lengths: number[], width: number, separator: number): numbe
 }
 
 /**
- * The focused `/usage` view: the whole panel, one collapsible section per
- * provider, a header cursor, scrolling and a one-line key hint. It reads the
- * report and the error through callbacks, so a background refresh only has to
- * call redraw(); the view holds no timer and no disk state.
+ * The focused `/usage` view: two fullscreen pages the keyboard owns.
+ *
+ * Now is the panel, one collapsible section per provider, with a header cursor,
+ * scrolling and a key legend. History is the durable token history for one
+ * month, the same sections folded the same way, with ←/→ walking the months
+ * that have a file. It reads the report, the error and the loaded month through
+ * callbacks, so a background refresh only has to call redraw(); the view holds
+ * no timer and no disk state.
  */
 export class UsageOverlay {
   private readonly theme: Theme;
   private readonly options: UsageOverlayOptions;
-  /** Fold state, shared with the next view for this pi session. */
+  /** Fold state and the page, shared with the next view for this pi session. */
   private readonly session: OverlaySession;
   private cursor = 0;
   private scroll = 0;
   private disposed = false;
-  /** Width of the last frame; rows are wrapped for it. */
+  /** Months the CLI says are browsable, newest last. */
+  private historyMonths: string[] = [];
+  /** One loaded month per month key, kept for the lifetime of this overlay. */
+  private readonly historyCache = new Map<string, HistoryPayload>();
+  /** Whether History is idle, loading a month, or showing a failed fetch. */
+  private historyStatus: HistoryStatus = { kind: "idle" };
+  /**
+   * Id of the newest `stats --json` request this view issued. ←/→ fire
+   * overlapping fetches; only the newest answer may move the page.
+   */
+  private historyWanted = 0;
+  /** Width of the last frame; history rows are wrapped for it. */
   private measureWidth = 80;
   private cachedLayout: { sections: PanelSection[]; tail: string[] } | null | undefined;
+  private cachedLayoutWidth: number | undefined;
   private cachedMetrics: { rows: OverlayRow[]; headerRows: number[]; sectionEnds: number[] } | undefined;
   private cachedMetricsWidth: number | undefined;
   private cachedWidth: number | undefined;
@@ -1154,9 +1376,37 @@ export class UsageOverlay {
     return this.session.expanded;
   }
 
+  private get view(): "now" | "history" {
+    return this.session.view;
+  }
+
+  private set view(value: "now" | "history") {
+    this.session.view = value;
+  }
+
+  /** The month shown in History; null until a payload names one. */
+  private get selectedMonth(): string | null {
+    return this.session.month;
+  }
+
+  private set selectedMonth(value: string | null) {
+    this.session.month = value;
+  }
+
+  /**
+   * Load what a reopened view needs: a page that was closed on History has no
+   * payload in its fresh cache, and its month must not render as empty.
+   */
+  public begin(): void {
+    if (this.disposed || this.view !== "history") return;
+    if (this.selectedMonth !== null && this.historyCache.has(this.selectedMonth)) return;
+    this.requestMonth(this.selectedMonth);
+  }
+
   /** Drop cached rows and frames; the next render rebuilds from live state. */
   public invalidate(): void {
     this.cachedLayout = undefined;
+    this.cachedLayoutWidth = undefined;
     this.cachedMetrics = undefined;
     this.cachedMetricsWidth = undefined;
     this.cachedWidth = undefined;
@@ -1177,7 +1427,61 @@ export class UsageOverlay {
     this.invalidate();
   }
 
-  /** Handle one raw key: fold, move, refresh, scroll, close. */
+  /**
+   * Ask for one month (null: the newest with a file) and remember the request
+   * id, so the answer can be matched against the last keypress rather than the
+   * order the CLI happened to finish in.
+   */
+  private requestMonth(month: string | null): void {
+    // The counter lives in the module, not on the view: a reopened overlay must
+    // not reuse an id, or an answer to the closed view's request would pass for
+    // an answer to its own.
+    historyRequestSeq += 1;
+    this.historyWanted = historyRequestSeq;
+    this.historyStatus = { kind: "loading", month };
+    this.options.loadHistory(month, this.historyWanted);
+  }
+
+  /**
+   * A month (or the first payload, with the month list) arrived from the CLI.
+   * Every answer is cached — a later ← must not refetch what already arrived —
+   * but only the answer to the newest request may move the page: ←/→ overlap,
+   * and a late answer for a month the last keypress did not ask for used to snap
+   * the page back and skip a month.
+   */
+  public setHistory(payload: HistoryPayload, request?: number): void {
+    if (this.disposed) return;
+    if (Array.isArray(payload.months)) {
+      this.historyMonths = payload.months.filter((month) => /^\d{4}-\d{2}$/.test(month));
+    }
+    const month = typeof payload.month === "string" && /^\d{4}-\d{2}$/.test(payload.month) ? payload.month : null;
+    if (month !== null) this.historyCache.set(month, payload);
+    // The newest request answered, so nothing is loading any more. It moves the
+    // page only if the page still asks for that month: a newer keypress may have
+    // left it, and the late answer then only fills the cache.
+    if (request === undefined || request === this.historyWanted) {
+      if (month !== null && (this.selectedMonth === null || month === this.selectedMonth)) this.selectedMonth = month;
+      this.historyStatus = { kind: "idle" };
+    }
+    this.invalidate();
+    this.options.requestRender();
+  }
+
+  /** The history fetch failed: a line in the view, never a thrown error. */
+  public setHistoryError(message: string, request?: number): void {
+    if (this.disposed) return;
+    // A failure that answers an older request must not paint over the month the
+    // user is on now: its own request (or its cached payload) owns the frame.
+    if (request !== undefined && request !== this.historyWanted) return;
+    // Keep the month the failed fetch was for: a retry must ask for that month,
+    // and the frame must say "failed" rather than "loading".
+    const month = this.historyStatus.kind === "loading" ? this.historyStatus.month : this.selectedMonth;
+    this.historyStatus = { kind: "failed", month, message };
+    this.invalidate();
+    this.options.requestRender();
+  }
+
+  /** Handle one raw key: switch view, fold, move, month, refresh, close. */
   public handleInput(data: string): void {
     if (this.disposed) return;
     if (data === "\u001b" || data === "q") {
@@ -1185,20 +1489,31 @@ export class UsageOverlay {
       this.options.done();
       return;
     }
-    if (data === "r") {
+    if (data === "\t" || data === "1" || data === "2") {
+      const target = data === "1" ? "now" : data === "2" ? "history" : this.view === "now" ? "history" : "now";
+      this.switchView(target);
       this.invalidate();
+      return;
+    }
+    if (data === "r") {
+      // History's today row comes from the live report, so a refresh there
+      // reloads the month and the report together; one key, one meaning.
+      if (this.view === "history") this.reloadMonth();
       this.options.refresh();
+      this.invalidate();
       return;
     }
     if (isKey(data, "up") || data === "k") this.moveCursor(-1);
     else if (isKey(data, "down") || data === "j") this.moveCursor(1);
     else if (data === "\r" || data === "\n" || data === " ") this.toggleSection();
-    else if (isKey(data, "left") || data === "h") this.setExpanded(false);
-    else if (isKey(data, "right") || data === "l") this.setExpanded(true);
     else if (isKey(data, "pageUp")) this.page(-1);
     else if (isKey(data, "pageDown")) this.page(1);
     else if (isKey(data, "home") || data === "g") this.jumpTo(0);
     else if (isKey(data, "end") || data === "G") this.jumpTo(-1);
+    else if (this.view === "history" && (isKey(data, "left") || data === "[")) this.moveMonth(-1);
+    else if (this.view === "history" && (isKey(data, "right") || data === "]")) this.moveMonth(1);
+    else if (isKey(data, "left") || data === "h") this.setExpanded(false);
+    else if (isKey(data, "right") || data === "l") this.setExpanded(true);
     else return;
     // The TUI renders the component again after every key, so the cached frame
     // and the cached row map must be dropped here, not only on report changes.
@@ -1245,7 +1560,7 @@ export class UsageOverlay {
     }
     while (viewport.length < height) viewport.push("");
 
-    const title = this.theme.fg("accent", this.theme.bold("Quota"));
+    const title = this.titleLine();
     const frame = [spreadLine(title, this.statusText(content.length, height), width), "", ...viewport, "", ...legend];
     while (frame.length < rows) frame.push("");
     this.cachedWidth = width;
@@ -1274,11 +1589,16 @@ export class UsageOverlay {
 
   /** The report split into its foldable sections; null while the first load runs. */
   private layout(): { sections: PanelSection[]; tail: string[] } | null {
-    if (this.cachedLayout === undefined) {
-      const report = this.options.getReport();
-      this.cachedLayout = report ? renderPanelLayout(report, this.theme) : null;
-    }
+    if (this.cachedLayout !== undefined && this.cachedLayoutWidth === this.measureWidth) return this.cachedLayout;
+    this.cachedLayoutWidth = this.measureWidth;
+    this.cachedLayout = this.view === "history" ? this.historyLayout(this.measureWidth) : this.nowLayout();
     return this.cachedLayout;
+  }
+
+  /** The Now page: the exactly same sections the pinned panel renders flat. */
+  private nowLayout(): { sections: PanelSection[]; tail: string[] } | null {
+    const report = this.options.getReport();
+    return report ? renderPanelLayout(report, this.theme) : null;
   }
 
   /** Flattened rows, plus where every section's header starts and ends. */
@@ -1288,11 +1608,35 @@ export class UsageOverlay {
     const rows: OverlayRow[] = [];
     const headerRows: number[] = [];
     const sectionEnds: number[] = [];
-    const error = this.options.getError();
-    if (error) rows.push({ text: `  ${this.theme.fg("error", `! ${error}`)}`, section: -1, header: false });
     const layout = this.layout();
+    if (this.view === "history") {
+      const failure = this.historyFailure();
+      if (failure !== null) {
+        // With a month on screen the error is a line above it, so it carries the
+        // retry hint itself; the no-payload state says it on the line below.
+        const hint = layout ? ` ${this.theme.fg("dim", "· press r to retry")}` : "";
+        // A CLI's stderr line is longer than a pane: wrapped, so neither the
+        // cause nor the hint is lost to the right edge.
+        this.pushRow(rows, `  ${this.theme.fg("error", `! ${failure}`)}${hint}`, -1, false);
+      }
+    } else {
+      const error = this.options.getError();
+      if (error) rows.push({ text: `  ${this.theme.fg("error", `! ${error}`)}`, section: -1, header: false });
+    }
     if (!layout) {
-      rows.push({ text: `  ${this.theme.fg("dim", "loading quota …")}`, section: -1, header: false });
+      // Distinct states, distinct lines: a failed fetch used to say "loading
+      // history …" under its own error, which reads as a spinner that never ends.
+      const status = this.historyStatus;
+      const label = this.view !== "history"
+        ? "loading quota …"
+        : status.kind === "loading"
+          ? status.month === null
+            ? "loading history …"
+            : `loading ${status.month} …`
+          : status.kind === "failed"
+            ? "no history for this month; press r to retry"
+            : "loading history …";
+      rows.push({ text: `  ${this.theme.fg("dim", label)}`, section: -1, header: false });
     } else {
       layout.sections.forEach((section, index) => {
         const open = this.isExpanded(section.key);
@@ -1413,19 +1757,270 @@ export class UsageOverlay {
     this.reveal();
   }
 
+  private switchView(view: "now" | "history"): void {
+    if (this.view === view) return;
+    this.view = view;
+    this.cursor = 0;
+    this.scroll = 0;
+    if (view === "history" && this.historyStatus.kind === "idle" && this.historyCache.size === 0) {
+      this.requestMonth(this.selectedMonth);
+    }
+  }
+
+  /** ←/→ (or [ and ]) walk only the months that actually have a file. */
+  private moveMonth(delta: -1 | 1): void {
+    const months = this.historyMonths;
+    if (months.length === 0) return;
+    const current = this.selectedMonth;
+    let target: string | null;
+    if (current === null) {
+      target = delta > 0 ? months[0] : months[months.length - 1];
+    } else if (delta < 0) {
+      target = [...months].reverse().find((month) => month < current) ?? null;
+    } else {
+      target = months.find((month) => month > current) ?? null;
+    }
+    if (target === null) return;
+    this.selectMonth(target);
+  }
+
+  private selectMonth(month: string): void {
+    this.selectedMonth = month;
+    this.cursor = 0;
+    this.scroll = 0;
+    if (!this.historyCache.has(month)) this.requestMonth(month);
+  }
+
+  private reloadMonth(): void {
+    this.requestMonth(this.selectedMonth);
+  }
+
+  /**
+   * The failure line for the month on screen, or null. A fetch that failed for a
+   * month the user has since left must not paint over the page they are on, and
+   * its "press r to retry" would retry the wrong month.
+   */
+  private historyFailure(): string | null {
+    const status = this.historyStatus;
+    if (status.kind !== "failed") return null;
+    if (this.selectedMonth === null || status.month === null || status.month === this.selectedMonth) return status.message;
+    return null;
+  }
+
+  /** The History page: one section per family, days, models, accounts, totals. */
+  private historyLayout(width: number): { sections: PanelSection[]; tail: string[] } | null {
+    const month = this.selectedMonth;
+    if (month === null) return null;
+    const payload = this.historyCache.get(month);
+    if (!payload) return null;
+
+    /** @type {Map<string, HistoryFamily>} */
+    const families = new Map<string, HistoryFamily>();
+    const ensure = (family: string): HistoryFamily => {
+      let entry = families.get(family);
+      if (!entry) {
+        entry = { tokens: 0, prompts: 0, days: new Map(), models: new Map(), accounts: new Map(), allTime: 0, allTimeAccounts: new Map() };
+        families.set(family, entry);
+      }
+      return entry;
+    };
+
+    for (const [date, dayFamilies] of Object.entries(payload.days ?? {})) {
+      for (const [family, day] of Object.entries(dayFamilies ?? {})) {
+        const entry = ensure(family);
+        const tokens = Math.max(0, Math.round(Number(day?.tokens) || 0));
+        entry.tokens += tokens;
+        entry.prompts += Math.max(0, Math.round(Number(day?.prompts) || 0));
+        entry.days.set(date, (entry.days.get(date) ?? 0) + tokens);
+        for (const [slot, slotRow] of Object.entries(day?.slots ?? {})) {
+          const label = slot === "" ? "" : `#${slot}`;
+          const account = entry.accounts.get(label) ?? { tokens: 0, prompts: 0, models: new Map<string, number>() };
+          account.tokens += Math.max(0, Math.round(Number(slotRow?.tokens) || 0));
+          account.prompts += Math.max(0, Math.round(Number(slotRow?.prompts) || 0));
+          for (const [model, bucket] of Object.entries(slotRow?.models ?? {})) {
+            const modelTokens = historyModelTokens(bucket);
+            account.models.set(model, (account.models.get(model) ?? 0) + modelTokens);
+            entry.models.set(model, (entry.models.get(model) ?? 0) + modelTokens);
+          }
+          entry.accounts.set(label, account);
+        }
+      }
+    }
+
+    // The current month's open day is not frozen yet, so the month file has no
+    // row for it. Merge today from the live report's localStats, by day key and
+    // never by adding to an existing day: that is what makes double counting
+    // impossible. The guard is per family, because one family the writer froze
+    // today must not hide every other family's live row.
+    //
+    // The *report's* day decides, not the clock: `todayTotalTokens` is the day the
+    // report was generated on. A pi session that crossed midnight still holds
+    // yesterday's totals, and the first frame paints ~/.cache/pi-quota/usage.json,
+    // which can be days old; merging either into today would add a frozen
+    // yesterday to today. A stale report is skipped, and the tail says so.
+    const now = new Date();
+    const today = localDayKey(now);
+    const report = this.options.getReport();
+    const generatedAt = report?.generatedAt ? new Date(report.generatedAt) : null;
+    // An unparseable generatedAt is no evidence of today: it is skipped, silently.
+    const reportDay = generatedAt && !Number.isNaN(generatedAt.getTime()) ? localDayKey(generatedAt) : null;
+    const frozenToday = payload.days?.[today] ?? {};
+    let mergedToday = false;
+    let skippedReportDay: string | null = null;
+    if (month === localMonthKey(now)) {
+      const stats = report?.localStats ?? {};
+      for (const [family, familyStats] of Object.entries(stats)) {
+        if (!familyStats || familyStats.hasLocalStats === false || frozenToday[family]) continue;
+        const tokens = Math.max(0, Math.round(Number(familyStats.todayTotalTokens) || 0));
+        const prompts = Math.max(0, Math.round(Number(familyStats.todayPrompts) || 0));
+        if (tokens === 0 && prompts === 0) continue;
+        // A day the report does not belong to is not today's row, however fresh
+        // it looks: it is skipped whole, and never merged under today's key.
+        if (reportDay !== today) {
+          if (reportDay !== null) skippedReportDay = reportDay;
+          break;
+        }
+        mergedToday = true;
+        const entry = ensure(family);
+        entry.tokens += tokens;
+        entry.prompts += prompts;
+        entry.days.set(today, (entry.days.get(today) ?? 0) + tokens);
+        for (const [model, modelTokens] of Object.entries(familyStats.todayTokensByModel ?? {})) {
+          entry.models.set(model, (entry.models.get(model) ?? 0) + Math.max(0, Math.round(Number(modelTokens) || 0)));
+        }
+        for (const [rawLabel, account] of Object.entries(familyStats.byAccount ?? {})) {
+          const label = rawLabel === "#1" ? "" : rawLabel;
+          const target = entry.accounts.get(label) ?? { tokens: 0, prompts: 0, models: new Map<string, number>() };
+          target.tokens += Math.max(0, Math.round(Number(account?.todayTokens) || 0));
+          target.prompts += Math.max(0, Math.round(Number(account?.todayPrompts) || 0));
+          // The account's own models for today: without them the merged row
+          // shows a month total and no model, which reads as "no usage".
+          for (const [model, modelTokens] of Object.entries(account?.todayTokensByModel ?? {})) {
+            target.models.set(model, (target.models.get(model) ?? 0) + Math.max(0, Math.round(Number(modelTokens) || 0)));
+          }
+          entry.accounts.set(label, target);
+        }
+      }
+    }
+
+    for (const [family, totals] of Object.entries(payload.totals?.families ?? {})) {
+      const entry = ensure(family);
+      entry.allTime = Object.values(totals?.modelUsage ?? {}).reduce((sum, bucket) => sum + totalsModelTokens(bucket), 0);
+      for (const [rawLabel, account] of Object.entries(totals?.accounts ?? {})) {
+        const label = rawLabel === "#1" ? "" : rawLabel;
+        const tokens = Object.values(account?.modelUsage ?? {}).reduce((sum, bucket) => sum + totalsModelTokens(bucket), 0);
+        entry.allTimeAccounts.set(label, (entry.allTimeAccounts.get(label) ?? 0) + tokens);
+      }
+    }
+
+    const sectionOf = (family: string): number => {
+      const providers = this.options.getReport()?.providers ?? [];
+      const index = providers.findIndex((provider) => provider.family === family);
+      return index === -1 ? Number.MAX_SAFE_INTEGER : index;
+    };
+    const ordered = Array.from(families.entries()).sort(
+      (a, b) => sectionOf(a[0]) - sectionOf(b[0]) || a[0].localeCompare(b[0]),
+    );
+
+    // Section bodies are indented by four columns in metrics(); the wrap budget
+    // must leave room for that or a long day list is clipped at the right edge.
+    const bodyWidth = Math.max(24, width - 4);
+    const sections: PanelSection[] = [];
+    for (const [family, entry] of ordered) {
+      // Every account the family has in the month *or* all-time: a month in which
+      // one account carried the usage must still show the family's other keys,
+      // or the page hides the very rows that answer "which key burned what".
+      const accountLabels = Array.from(new Set([...entry.accounts.keys(), ...entry.allTimeAccounts.keys()])).sort(
+        (a, b) => slotOrder(a) - slotOrder(b),
+      );
+      // Multi-account families use the same short name as the Now panel header.
+      const display = accountLabels.length > 1 ? SHORT_NAME[family] ?? FAMILY_LABEL[family] ?? family : FAMILY_LABEL[family] ?? family;
+      const name = paint(BRAND[family] ?? "#8B949E", display);
+      const meta = [`${formatTokens(entry.tokens)} in ${month}`];
+      if (entry.allTime > 0) meta.push(`${formatTokens(entry.allTime)} all-time`);
+      if (entry.prompts > 0) meta.push(`${entry.prompts} prompt${entry.prompts === 1 ? "" : "s"}`);
+      const body: string[] = [];
+      const label = (text: string) => `  ${this.theme.fg("dim", text.padEnd(6))}  `;
+      const rest = `  ${" ".repeat(8)}`;
+      const dayCells = Array.from(entry.days.entries())
+        .sort((a, b) => a[0].localeCompare(b[0]))
+        .map(([date, tokens]) => `${date.slice(5)} ${formatTokens(tokens)}`);
+      body.push(...wrapCells(
+        dayCells.length > 0 ? dayCells : [this.theme.fg("dim", "no frozen days in this month")],
+        label("days"),
+        rest,
+        bodyWidth,
+      ));
+      if (entry.models.size > 0) {
+        const top = Array.from(entry.models.entries()).sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
+        const shown = top.slice(0, 5).map(([model, tokens]) => `${shortModelName(model)} ${formatTokens(tokens)}`);
+        if (top.length > shown.length) shown.push(this.theme.fg("dim", `+${top.length - shown.length} more`));
+        body.push(...wrapCells(shown, label("models"), rest, bodyWidth));
+      }
+      if (accountLabels.length > 1) {
+        const labelWidth = Math.max(...accountLabels.map((text) => text.length));
+        for (const accountLabel of accountLabels) {
+          const account = entry.accounts.get(accountLabel) ?? { tokens: 0, prompts: 0, models: new Map<string, number>() };
+          const parts = [`${this.theme.fg("dim", "month")} ${formatTokens(account.tokens)}`];
+          const allTime = entry.allTimeAccounts.get(accountLabel) ?? 0;
+          if (allTime > 0) parts.push(`${this.theme.fg("dim", "all-time")} ${formatTokens(allTime)}`);
+          const best = Array.from(account.models.entries()).sort((a, b) => b[1] - a[1])[0];
+          if (best) parts.push(this.theme.fg("dim", shortModelName(best[0])));
+          body.push(`  ${this.theme.fg("dim", accountLabel.padEnd(labelWidth))}  ${parts.join(this.theme.fg("dim", " · "))}`);
+        }
+      }
+      sections.push({ key: `history:${family}`, header: `${name} ${this.theme.fg("dim", `· ${meta.join(" · ")}`)}`, body });
+    }
+
+    const tail: string[] = [];
+    if (ordered.length === 0) tail.push(this.theme.fg("dim", `no token history for ${month}`));
+    for (const note of payload.notes ?? []) tail.push(this.theme.fg("warning", `! ${note}`));
+    if (mergedToday) {
+      tail.push(this.theme.fg("warning", `~ ${today} comes from the live report; it is not frozen in history yet`));
+    } else if (skippedReportDay !== null) {
+      // The report on screen is older than today, so its open-day totals belong
+      // to another day: say so, or a missing today row reads as a lost day.
+      tail.push(this.theme.fg("dim", `the live report is from ${skippedReportDay}; ${today} is not merged`));
+    }
+    const lastFrozen = payload.totals?.lastFrozenDay || "none";
+    tail.push(this.theme.fg("dim", `frozen through ${lastFrozen} · ${month} · read-only`));
+    return { sections, tail };
+  }
+
+  private titleLine(): string {
+    const title = this.theme.fg("accent", this.theme.bold("Quota"));
+    if (this.view !== "history") return title;
+    const month = this.selectedMonth === null ? "…" : this.selectedMonth;
+    return `${title} ${this.theme.fg("dim", `· History · ${month}`)}`;
+  }
+
   /**
    * The header's right side: a visible refresh indicator while the CLI runs,
-   * the update time it landed at afterwards, the view's position, and the
-   * scroll range when the content is taller than the viewport.
+   * the time the update landed afterwards, the view's position, and the scroll
+   * range when the content is taller than the viewport.
    */
   private statusText(total: number, height: number): string {
     const parts: string[] = [];
+    // History's today row is merged from the live report, so the report's state
+    // (refreshing, its update time, a failed refresh) heads both views.
     if (this.options.isRefreshing()) {
       parts.push(this.theme.fg("accent", "refreshing …"));
     } else {
       const report = this.options.getReport();
       if (report) parts.push(this.theme.fg("dim", updatedAtLabel(report)));
       if (this.options.getError()) parts.push(this.theme.fg("error", "refresh failed"));
+    }
+    if (this.view === "history") {
+      const status = this.historyStatus;
+      // Only the month on screen reports its own fetch: a fetch for a month the
+      // user already left must not claim the header.
+      const shown = this.selectedMonth;
+      const waitsForShown = shown === null || status.month === null || status.month === shown || !this.historyCache.has(shown);
+      if (status.kind === "loading" && waitsForShown) {
+        parts.push(this.theme.fg("accent", status.month === null ? "loading …" : `loading ${status.month} …`));
+      } else if (this.historyFailure() !== null) {
+        parts.push(this.theme.fg("error", "history failed"));
+      }
     }
     if (total > height) {
       const last = Math.min(total, this.scroll + height);
@@ -1436,7 +2031,7 @@ export class UsageOverlay {
 
   /** Hint pairs for the active view; History adds its month navigation. */
   private legendHints(): ReadonlyArray<readonly [string, string]> {
-    return NOW_HINTS;
+    return this.view === "history" ? HISTORY_HINTS : NOW_HINTS;
   }
 
   /**
@@ -1473,7 +2068,7 @@ export default function quotaPanelExtension(pi: ExtensionAPI): void {
   let overlayView: UsageOverlay | null = null;
   /**
    * What a reopened overlay keeps: every bare `/usage` builds a fresh view, so
-   * the folds live here, for the pi session and never on disk.
+   * the folds and the page live here, for the pi session and never on disk.
    */
   let overlaySession = newOverlaySession();
   /**
@@ -1722,7 +2317,7 @@ export default function quotaPanelExtension(pi: ExtensionAPI): void {
     const ui = ctx as unknown as UiContext;
     if (!ui.hasUI) return;
     disposed = false;
-    // A new session starts with every section open.
+    // A new session starts with every section open, on the Now page.
     overlaySession = newOverlaySession();
     // Resolve the native rail mode before the first paint.
     await syncRailPatch();
@@ -1776,6 +2371,43 @@ export default function quotaPanelExtension(pi: ExtensionAPI): void {
   });
 
   /**
+   * Run `piquota stats --json` for one month (null: the newest with a file) and
+   * hand the payload to the overlay. Read-only, no lock: the CLI only reads.
+   *
+   * A failure is reported the way the report path reports one: the CLI's own
+   * stderr line or its exit status, redacted and on one line. The JSON parser's
+   * "Unexpected end of JSON input" says nothing about the cause.
+   */
+  async function loadHistory(month: string | null, request: number): Promise<void> {
+    const cli = resolveCliPath();
+    if (!cli) {
+      overlayView?.setHistoryError("piquota not installed: run install.sh from the pi-quota repo", request);
+      return;
+    }
+    try {
+      const runner = /node(\.exe)?$/i.test(process.execPath) ? process.execPath : "node";
+      const argv = [cli, "stats", "--json", ...(month ? ["--month", month] : [])];
+      const result = await pi.exec(runner, argv, { timeout: EXEC_TIMEOUT_MS });
+      const stdout = typeof result?.stdout === "string" ? result.stdout : "";
+      let parsed: HistoryPayload | null = null;
+      try {
+        parsed = stdout.trim() === "" ? null : (JSON.parse(stdout) as HistoryPayload);
+      } catch {
+        // A truncated or non-JSON stdout: report the run, not the parser.
+        parsed = null;
+      }
+      if (!parsed || !Array.isArray(parsed.months)) {
+        overlayView?.setHistoryError(cliFailureLine(result), request);
+        return;
+      }
+      overlayView?.setHistory(parsed, request);
+    } catch (error) {
+      const message = (error as { message?: string })?.message ?? String(error);
+      overlayView?.setHistoryError(capCause(redactCause(message).split("\n")[0]), request);
+    }
+  }
+
+  /**
    * Bare /usage: a fullscreen overlay that owns the keyboard and closes on Esc,
    * so no panel is left above the editor. It opens with the cached report and
    * refreshes in the background; a failure becomes a line in the view.
@@ -1810,8 +2442,13 @@ export default function quotaPanelExtension(pi: ExtensionAPI): void {
           refresh: () => {
             void refresh(ctx, true);
           },
+          loadHistory: (month, request) => {
+            void loadHistory(month, request);
+          },
         }, overlaySession);
         overlayView = view;
+        // A view reopened on History holds no payload: ask for its month.
+        view.begin();
         return {
           render: (width: number) => view.render(width),
           invalidate: () => view.invalidate(),

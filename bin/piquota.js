@@ -57,7 +57,7 @@ Usage:
   piquota auth <opencode|status> [flags]
   piquota gentle-pi <status|apply|revert>
   piquota omarchy
-  piquota stats [--rebuild-totals]
+  piquota stats [--json] [--month YYYY-MM] [--rebuild-totals]
 
 Quota:
   --json             Emit the normalized report as JSON (for rp-host and automations)
@@ -73,6 +73,7 @@ Quota:
   --explain          Show which stores/fields are read (names only)
   --clear-cache      Delete the local cache and exit
   --rebuild-totals   With \`stats\`: rebuild the token-history totals from its month files
+  --month YYYY-MM    With \`stats\`: read one month (default: the current local month)
   --version          Print the version and exit
 
 Auth (OpenCode Go session, the only credential Pi does not store):
@@ -86,6 +87,9 @@ Auth (OpenCode Go session, the only credential Pi does not store):
 Stats:
   piquota stats                    summarise the durable token history
                                    (dir: \${PI_CODING_AGENT_DIR:-~/.pi/agent}/pi-usage)
+  piquota stats --json [--month]   read-only JSON: months (the live month always),
+                                   one month's days per family/slot/model, all-time
+                                   totals, notes
   piquota stats --rebuild-totals   recompute totals.json from the frozen month files
 
 Omarchy:
@@ -162,8 +166,14 @@ async function main() {
     return 2;
   }
 
+  if (args.month && command !== "stats") {
+    err("--month only works with \`piquota stats\`\n");
+    process.stdout.write(HELP);
+    return 2;
+  }
+
   if (command === "stats") {
-    return runStatsCommand({ rebuild: args.rebuildTotals, env: process.env });
+    return runStatsCommand({ rebuild: args.rebuildTotals, json: args.json, month: args.month, env: process.env });
   }
 
   if (command === "omarchy") {

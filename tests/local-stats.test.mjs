@@ -206,6 +206,10 @@ test("assistant messages map to families and siblings, and unknown providers are
   assert.deepEqual(result.byFamily.claude.todayTokensByModel, { "claude-opus-5-5": 14_172 });
   assert.deepEqual(Object.keys(result.byFamily["opencode-go"].byAccount), ["#7"]);
   assert.equal(result.byFamily["opencode-go"].byAccount["#7"].todayTokens, 110);
+  // The per-account model split is what the History page names on an account's
+  // live (unfrozen) row; without it the merged row shows a number and no model.
+  assert.deepEqual(result.byFamily.claude.byAccount[""].todayTokensByModel, { "claude-opus-5-5": 14_172 });
+  assert.deepEqual(result.byFamily["opencode-go"].byAccount["#7"].todayTokensByModel, { "deepseek-v4.1-flash": 110 });
   assert.equal(result.byFamily.claude.recentDays.at(-1).date, TODAY);
   assert.equal(result.byFamily.claude.recentDays.length, 7);
 });
@@ -281,6 +285,8 @@ test("the base account is unnumbered and siblings sort numerically", async () =>
   assert.equal(stats.byAccount["#7"].weekTokens, 70);
   assert.equal(stats.byAccount["#10"].todayTokens, 110);
   assert.equal(stats.byAccount["#10"].todayPrompts, 1);
+  assert.deepEqual(stats.byAccount["#7"].todayTokensByModel, {}, "an account that did not run today has no today models");
+  assert.equal(stats.byAccount["#2"].todayTokensByModel["claude-opus-5-5"], 22, "today's models are per account, not the 20-day-old day");
   assert.equal(stats.todayTotalTokens, 143);
   assert.equal(stats.totalPrompts, 5);
   assert.equal(stats.weekTokensByModel["claude-opus-5-5"], 213);
