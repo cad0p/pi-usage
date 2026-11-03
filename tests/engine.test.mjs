@@ -70,6 +70,42 @@ test("collectQuota reports all five registered families when GitHub Actions is e
   assert.equal(byFamily["github-actions"].ok, true);
 });
 
+test("collectQuota emits one-family fragments before slower families finish", async () => {
+  const routes = fullRoutes().fetchFn;
+  let releaseCodex;
+  const codexGate = new Promise((resolve) => { releaseCodex = resolve; });
+  const fetchFn = async (input, init) => {
+    if (String(input).includes("chatgpt.com")) await codexGate;
+    return routes(input, init);
+  };
+  let resolveFirst;
+  const firstFamily = new Promise((resolve) => { resolveFirst = resolve; });
+  const emitted = [];
+  const pending = collectQuota({
+    paths: [FIXTURE],
+    claudeCodePaths: [],
+    now: NOW,
+    fetchFn,
+    families: ["claude", "codex"],
+    env: {},
+    stores: [],
+    allowBrowser: false,
+    localStats: false,
+    onFamily: async (family, fragment) => {
+      emitted.push(family);
+      assert.deepEqual(new Set(fragment.providers.map((provider) => provider.family)), new Set([family]));
+      if (family === "claude") resolveFirst(family);
+    },
+  });
+
+  assert.equal(await Promise.race([firstFamily, new Promise((resolve) => setTimeout(() => resolve("timeout"), 250))]), "claude");
+  assert.deepEqual(emitted, ["claude"], "the Claude fragment arrives while Codex is still blocked");
+  releaseCodex();
+  const final = await pending;
+  assert.deepEqual(emitted, ["claude", "codex"]);
+  assert.equal(final.providers.length, 2);
+});
+
 test("collectQuota marks a family with no credential as degraded, not missing", async () => {
   const { fetchFn } = fullRoutes();
   const report = await collectQuota({ paths: [FIXTURE], claudeCodePaths: [], now: NOW, fetchFn, families: ["claude", "grok"], env: {}, stores: [], allowBrowser: false });
