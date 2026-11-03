@@ -415,3 +415,65 @@ test("warnings from parallel provider fetches are deterministically ordered by f
   assert.ok(throttledWarnings[0].startsWith("claude:"));
   assert.ok(throttledWarnings[1].startsWith("codex:"));
 });
+
+
+test("accounts of one family are fetched in parallel, bounded, in credential order", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "pi-quota-parallel-"));
+  const authPath = join(directory, "auth.json");
+  const store = { "opencode-go": { type: "api_key", key: "oc-base" } };
+  for (let slot = 2; slot <= 12; slot += 1) store[`opencode-go-${slot}`] = { type: "api_key", key: `oc-${slot}` };
+  writeFileSync(authPath, JSON.stringify(store));
+
+  const run = async (env) => {
+    let inFlight = 0;
+    let maxInFlight = 0;
+    const fetchFn = async (url, init) => {
+      inFlight += 1;
+      maxInFlight = Math.max(maxInFlight, inFlight);
+      // Later keys answer first, so a sequential or order-dependent merge would show.
+      const key = String(init?.headers?.Authorization ?? "").replace("Bearer oc-", "");
+      await new Promise((resolve) => setTimeout(resolve, key === "base" ? 30 : 30 - Number(key)));
+      inFlight -= 1;
+      if (!String(url).includes("zen/go/v1/usage")) return jsonResponse({ error: "no route" }, { status: 404 });
+      const percent = key === "base" ? 1 : Number(key);
+      const window = { status: "ok", percent, resetsAt: "2027-01-01T00:00:00.000Z" };
+      return jsonResponse({ usage: { rolling: window, weekly: window, monthly: window } });
+    };
+    const report = await collectQuota({ paths: [authPath], claudeCodePaths: [], now: NOW, fetchFn, families: ["opencode-go"], env, home: directory, stores: [], allowBrowser: false });
+    return { report, maxInFlight };
+  };
+
+  const parallel = await run({});
+  assert.equal(parallel.maxInFlight, 8, "default concurrency is 8 accounts at a time");
+  const results = parallel.report.byFamily["opencode-go"];
+  assert.equal(results.length, 12);
+  assert.deepEqual(results.map((result) => result.slot ?? null), [null, "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12"]);
+  assert.ok(results.every((result) => result.ok));
+
+  const sequential = await run({ PI_QUOTA_ACCOUNT_CONCURRENCY: "1" });
+  assert.equal(sequential.maxInFlight, 1);
+  assert.deepEqual(
+    sequential.report.byFamily["opencode-go"].map((result) => result.windows.map((window) => window.usedPercent)),
+    results.map((result) => result.windows.map((window) => window.usedPercent)),
+  );
+});
+
+test("mapBounded keeps input order and never exceeds its limit", async () => {
+  const { mapBounded, accountConcurrency } = await import("../src/engine.js");
+  let inFlight = 0;
+  let max = 0;
+  const out = await mapBounded([5, 1, 4, 2, 3], 2, async (value, index) => {
+    inFlight += 1;
+    max = Math.max(max, inFlight);
+    await new Promise((resolve) => setTimeout(resolve, value));
+    inFlight -= 1;
+    return `${index}:${value}`;
+  });
+  assert.deepEqual(out, ["0:5", "1:1", "2:4", "3:2", "4:3"]);
+  assert.equal(max, 2);
+  assert.deepEqual(await mapBounded([], 4, async () => 1), []);
+  assert.equal(accountConcurrency({}), 8);
+  assert.equal(accountConcurrency({ PI_QUOTA_ACCOUNT_CONCURRENCY: "0" }), 8);
+  assert.equal(accountConcurrency({ PI_QUOTA_ACCOUNT_CONCURRENCY: "3" }), 3);
+  assert.equal(accountConcurrency({ PI_QUOTA_ACCOUNT_CONCURRENCY: "99" }), 32);
+});

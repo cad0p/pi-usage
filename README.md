@@ -6,7 +6,7 @@ One source of truth for quota: **the credentials Pi already owns**.
 > `@cad0p/pi-usage` is a fork of [J3pf/piQuota](https://github.com/J3pf/piQuota) (`@j3pf/piquota`). It adds:
 >
 > * **OpenCode Go from the API key**: `GET https://opencode.ai/zen/go/v1/usage` returns the rolling (5h), weekly and monthly windows for the key Pi already stores, so no browser session is needed.
-> * **Numbered accounts**: `auth.json` entries such as `opencode-go-2` … `opencode-go-14` (the [pi-fallback-provider](https://github.com/cad0p/pi-fallback-provider) sibling convention) are read as extra accounts of their base provider.
+> * **Numbered accounts**: `auth.json` entries such as `opencode-go-2` … `opencode-go-14` (the [pi-fallback-provider](https://github.com/cad0p/pi-fallback-provider) sibling convention) are read as extra accounts of their base provider. The accounts of one provider are queried in parallel (8 at a time, `PI_QUOTA_ACCOUNT_CONCURRENCY` from 1 to 32), so 14 OpenCode Go keys cost about one round trip instead of fourteen.
 > * **One Omarchy tab per provider**: a multi-account provider shows each account's binding window (`#2 · Monthly`) in a single tab, and summarises failed accounts.
 > * **Tokens by day and by model**: the tokens Pi's own session files recorded are folded per provider and shown in `/usage`, in `--json` (`localStats`) and in the Omarchy records, at a bounded scan cost.
 > * **`/usage` on demand**: the Pi command is `/usage` only, and nothing is pinned above the editor or in the footer unless you ask for it. A multi-account provider gets one line per account in the panel.
@@ -755,7 +755,7 @@ extensions/quota-panel.ts      Pi TUI line and /usage
 ## Tests
 
 ```bash
-node --test tests/*.test.mjs     # 354 tests, fake tokens only, no network
+node --test tests/*.test.mjs     # 356 tests, fake tokens only, no network
 ```
 
 Modules covered: `auth.json` parsing and de-duplication, the Claude Code store
