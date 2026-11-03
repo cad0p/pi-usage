@@ -1529,6 +1529,39 @@ test("the extension resolves Claude and Codex auth through Pi without caching to
   assert.equal(cache.includes(codexToken), false);
 });
 
+test("Pi's api_key credential is never used as a quota OAuth token", async () => {
+  const module = await import(EXTENSION);
+  const previous = process.env.PI_QUOTA_CLAUDE_SOURCE;
+  delete process.env.PI_QUOTA_CLAUDE_SOURCE;
+  try {
+    const harness = makeHarness({ report: overlayReport() });
+    // Pi resolves api_key credentials through the same method it resolves OAuth.
+    harness.dependencies.getProviderAuth = async () => ({ auth: { apiKey: "sk-ant-api03-fixture-key" }, source: "api_key" });
+    const seen = new Map();
+    harness.dependencies.collectFamily = async (family, options) => {
+      seen.set(family, options);
+      const current = withFamilies(overlayReport());
+      return { ...current, providers: current.providers.filter((provider) => provider.family === family) };
+    };
+    module.default(harness.pi);
+    await harness.commands.find((command) => command.name === "usage").definition.handler("refresh", harness.ctx);
+
+    assert.equal(
+      seen.get("claude").authOverrides,
+      undefined,
+      "these quota endpoints want the subscription OAuth token; an API key is not one",
+    );
+    assert.equal(
+      seen.get("claude").env.PI_QUOTA_CLAUDE_SOURCE,
+      undefined,
+      "an API key does not switch Claude to Pi's OAuth source either",
+    );
+  } finally {
+    if (previous === undefined) delete process.env.PI_QUOTA_CLAUDE_SOURCE;
+    else process.env.PI_QUOTA_CLAUDE_SOURCE = previous;
+  }
+});
+
 test("the cache is keyed by the Claude source the extension actually used", async () => {
   const module = await import(EXTENSION);
   const previous = process.env.PI_QUOTA_CLAUDE_SOURCE;
