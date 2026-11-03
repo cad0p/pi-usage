@@ -16,6 +16,9 @@ coverage/
 *.local
 .shuvquota.env
 
+# Marks an older piquota's asset sync copies into the symlinked Omarchy plugin
+omarchy/cad0p.pi-usage/assets/pi-*.svg
+
 # OS specific
 .DS_Store
 Thumbs.db

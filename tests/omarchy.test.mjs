@@ -5,7 +5,7 @@ import { join } from "node:path";
 import test from "node:test";
 
 import { runOmarchyCommand, skippedFamilies } from "../src/cli/commands/omarchy.js";
-import { publishRecords, resolveOmarchyDir, syncOmarchyAssets } from "../src/omarchy/publish.js";
+import { publishRecords, resolveOmarchyDir } from "../src/omarchy/publish.js";
 import { buildRecord, buildRecords } from "../src/omarchy/record.js";
 
 const NOW = Date.parse("2026-10-04T05:00:00.000Z");
@@ -111,21 +111,42 @@ test("buildRecords keeps one record per family and never throws on garbage", () 
   assert.deepEqual(buildRecords(/** @type {any} */ (null)), []);
 });
 
-test("records never carry tokens, accounts or e-mail addresses", () => {
+test("records never carry tokens, account identifiers, or e-mail addresses", () => {
   const secret = "sk-abcdefSECRETSECRET";
   const records = buildRecords(
     /** @type {any} */ ({
       providers: [
         provider({ plan: "pro", account: "someone@example.com", accessToken: secret }),
         provider({ family: "codex", label: "Codex (Pi)", ok: false, windows: [], error: `Bearer ${secret} rejected for someone@example.com` }),
+        provider({
+          family: "opencode-go",
+          label: "OpenCode Go (Pi)",
+          account: "someone@example.com",
+          slot: null,
+          plan: "Go plan",
+          windows: [{ id: "weekly", label: "Weekly window", usedPercent: 20, remainingPercent: 80, resetsAt: null }],
+          accessToken: secret,
+        }),
+        provider({
+          family: "opencode-go",
+          label: "OpenCode Go (Pi)",
+          account: "second@example.com",
+          slot: "2",
+          plan: "Go plan",
+          ok: false,
+          windows: [],
+          error: `Bearer ${secret} rejected for second@example.com`,
+        }),
       ],
     }),
     { now: NOW },
   );
   const text = JSON.stringify(records);
   assert.ok(!text.includes("someone@example.com"));
+  assert.ok(!text.includes("second@example.com"));
   assert.ok(!text.includes("SECRETSECRET"));
-  assert.ok(!text.includes("account"));
+  assert.ok(text.includes('"accounts":['), "multi-account records keep their public accounts[] shape");
+  assert.ok(!text.includes('"account":'), "provider account identifiers are not serialized");
   assert.ok(!text.includes("/home/u"), "credential source paths stay out of the record");
 });
 
@@ -220,6 +241,67 @@ test("a multi-account family where every account fails keeps the single-failure 
   assert.equal(record.authHelpText, "#1–#2 credential rejected");
   assert.equal(record.limits.length, 1);
   assert.ok(record.limits[0].percent < 0, "the panel filters percent < 0, so nothing is drawn");
+});
+
+test("a multi-account record lists every window of every account, failed ones with a short status", () => {
+  const providers = [
+    provider({
+      family: "opencode-go",
+      label: "OpenCode Go (Pi)",
+      account: "#1",
+      slot: null,
+      windows: [
+        { id: "5h", label: "5h window", usedPercent: 2, remainingPercent: 98, resetsAt: "2026-10-04T05:10:00.000Z" },
+        { id: "weekly", label: "Weekly window", usedPercent: 10, remainingPercent: 90, resetsAt: "2026-10-10T00:00:00.000Z" },
+        { id: "monthly", label: "Monthly window", usedPercent: 90, remainingPercent: 10, resetsAt: null },
+      ],
+    }),
+    provider({
+      family: "opencode-go",
+      label: "OpenCode Go (Pi)",
+      account: "#2",
+      slot: "2",
+      ok: false,
+      windows: [],
+      error: "OpenCode Go key rejected (401); reconnect that account in Pi",
+    }),
+    provider({
+      family: "opencode-go",
+      label: "OpenCode Go (Pi)",
+      account: "#3",
+      slot: "3",
+      ok: false,
+      windows: [],
+      error: "Go plan not active for this key's workspace (403 Workspace access denied)",
+    }),
+  ];
+
+  const { record } = buildRecords(/** @type {any} */ ({ providers }), { now: NOW })[0];
+  assert.deepEqual(record.accounts, [
+    {
+      id: "#1",
+      ok: true,
+      status: "",
+      limits: [
+        { label: "5h window", title: "Session", percent: 0.02, resetsAt: "2026-10-04T05:10:00.000Z" },
+        { label: "Weekly window", title: "Weekly", percent: 0.1, resetsAt: "2026-10-10T00:00:00.000Z" },
+        { label: "Monthly window", title: "Monthly", percent: 0.9, resetsAt: "" },
+      ],
+    },
+    { id: "#2", ok: false, status: "Key rejected", limits: [] },
+    { id: "#3", ok: false, status: "No Go plan", limits: [] },
+  ]);
+  // The flattened limits Omarchy's built-in panel reads are unchanged.
+  assert.deepEqual(record.limits, [
+    { label: "#1 · Monthly window", title: "#1 · Monthly", percent: 0.9, resetsAt: "" },
+  ]);
+});
+
+test("a single-account record carries no accounts list", () => {
+  const { record } = buildRecord(provider(), { now: NOW });
+  assert.equal("accounts" in record, false);
+  const [built] = buildRecords(/** @type {any} */ ({ providers: [provider({ family: "codex", label: "Codex (Pi)" })] }), { now: NOW });
+  assert.equal("accounts" in built.record, false);
 });
 
 test("publishRecords writes valid JSON atomically and leaves no temp files", () => {
@@ -397,23 +479,15 @@ test("github-actions record formats multiple organization windows distinctly in 
   assert.equal(built.record.limits[1].title, "J3pf (0 / 2000 min)");
 });
 
-test("syncOmarchyAssets copies SVG marks into Omarchy plugin asset directories idempotently", () => {
+test("publishRecords never writes into Omarchy plugin directories", () => {
   const home = tempDir();
   try {
-    const pluginDir = join(home, ".config", "omarchy", "plugins", "my.agents");
+    const pluginDir = join(home, ".config", "omarchy", "plugins", "someone.else");
     mkdirSync(pluginDir, { recursive: true });
-    writeFileSync(join(pluginDir, "manifest.json"), "{}");
-
-    const copied = syncOmarchyAssets({ home });
-    assert.ok(copied.length > 0);
-    assert.ok(existsSync(join(pluginDir, "assets", "antigravity.svg")));
-    assert.ok(existsSync(join(pluginDir, "assets", "pi-antigravity.svg")));
-    assert.ok(existsSync(join(pluginDir, "assets", "opencode-go.svg")));
-    assert.ok(existsSync(join(pluginDir, "assets", "github-actions.svg")));
-
-    // Idempotent: identical files must not be touched to prevent triggering Omarchy shell reload watches
-    const secondPass = syncOmarchyAssets({ home });
-    assert.equal(secondPass.length, 0);
+    writeFileSync(join(pluginDir, "manifest.json"), JSON.stringify({ id: "someone.else" }));
+    const dir = join(home, "usage");
+    publishRecords([], { dir, home, env: {} });
+    assert.deepEqual(readdirSync(pluginDir), ["manifest.json"], "another plugin's directory must stay untouched");
   } finally {
     rmSync(home, { recursive: true, force: true });
   }

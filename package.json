@@ -16,6 +16,7 @@
     "bin",
     "src",
     "extensions",
+    "omarchy",
     "README.md",
     "CHANGELOG.md",
     "LICENSE"

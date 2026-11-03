@@ -14,6 +14,8 @@
 #   6. cleans up obsolete shims if upgrading from previous versions
 #   7. with --omarchy-timer, installs a systemd user timer that runs
 #      `piquota omarchy` every 5 minutes (opt-in)
+#   8. with --omarchy-plugin, symlinks the "AI Usage" bar plugin into
+#      ~/.config/omarchy/plugins/cad0p.pi-usage (opt-in, idempotent)
 
 set -euo pipefail
 
@@ -37,7 +39,10 @@ BIN_DIR="${PI_QUOTA_BIN_DIR:-$HOME/.local/bin}"
 EXT_DIR="${PI_QUOTA_EXT_DIR:-$HOME/.pi/agent/extensions}"
 MODE="copy"
 OMARCHY_TIMER=false
+OMARCHY_PLUGIN=false
 INSTALL_EXTENSION=true
+PLUGIN_ID="cad0p.pi-usage"
+PLUGIN_LINK="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/plugins/$PLUGIN_ID"
 UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
 
 for arg in "$@"; do
@@ -46,10 +51,11 @@ for arg in "$@"; do
     --copy) MODE="copy" ;;
     --uninstall) MODE="uninstall" ;;
     --omarchy-timer) OMARCHY_TIMER=true ;;
+    --omarchy-plugin) OMARCHY_PLUGIN=true ;;
     --no-extension) INSTALL_EXTENSION=false ;;
     -h|--help)
       cat <<'USAGE'
-Usage: ./install.sh [--copy|--link|--uninstall] [--omarchy-timer] [--no-extension]
+Usage: ./install.sh [--copy|--link|--uninstall] [--omarchy-timer] [--omarchy-plugin] [--no-extension]
 
   --copy       Copy the project into ~/.local/share/pi-quota (default)
   --link       Symlink the project instead, for development
@@ -62,8 +68,15 @@ Usage: ./install.sh [--copy|--link|--uninstall] [--omarchy-timer] [--no-extensio
   --omarchy-timer
                Also install and enable a systemd user timer that runs `piquota omarchy`
                every 5 minutes, so Omarchy's Agents panel shows every piQuota provider
+  --omarchy-plugin
+               Also symlink the "AI Usage" Omarchy bar plugin into
+               ~/.config/omarchy/plugins/cad0p.pi-usage. It links the pi package's copy
+               when `pi install npm:@cad0p/pi-usage` put one there (so `pi update` updates
+               the plugin), else this install. Re-running is safe. Put it on the bar with
+               `omarchy plugin enable cad0p.pi-usage` (printed at the end)
 
-Environment overrides: PI_QUOTA_PREFIX, PI_QUOTA_BIN_DIR, PI_QUOTA_EXT_DIR
+Environment overrides: PI_QUOTA_PREFIX, PI_QUOTA_BIN_DIR, PI_QUOTA_EXT_DIR,
+PI_USAGE_PLUGIN_SOURCE (the plugin directory --omarchy-plugin links to)
 USAGE
       exit 0
       ;;
@@ -90,6 +103,13 @@ if [[ "$MODE" == "uninstall" ]]; then
   # Only the pi-*.json records piQuota wrote; Omarchy's own records stay.
   OMARCHY_DIR="${PI_QUOTA_OMARCHY_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/agents/usage}"
   rm -f "$OMARCHY_DIR"/pi-*.json
+  # The plugin link only, and only when it is ours: a symlink. A real directory
+  # there is someone's own checkout or clone.
+  if [[ -L "$PLUGIN_LINK" ]]; then
+    rm -f "$PLUGIN_LINK"
+    log "removed the Omarchy plugin link $PLUGIN_LINK"
+    log "  take it off the bar with: omarchy plugin disable $PLUGIN_ID"
+  fi
   rm -f "$BIN_DIR/piquota" "$BIN_DIR/shuvquota"
   rm -f "$EXT_DIR/quota-panel.ts"
   # The rail slot only exists for the extension that reads it, so leaving it behind
@@ -196,7 +216,7 @@ if [[ "$MODE" == "link" ]]; then
 else
   rm -rf "$PREFIX"
   mkdir -p "$PREFIX"
-  cp -R "$HERE/src" "$HERE/bin" "$PREFIX/"
+  cp -R "$HERE/src" "$HERE/bin" "$HERE/omarchy" "$PREFIX/"
   cp "$HERE/package.json" "$HERE/LICENSE" "$PREFIX/"
   log "copied project to $PREFIX"
 fi
@@ -272,6 +292,44 @@ if [[ "$OMARCHY_TIMER" == "true" ]]; then
     else
       warn "could not enable piquota-omarchy.timer; run: systemctl --user enable --now piquota-omarchy.timer"
     fi
+  fi
+fi
+
+# --- Omarchy "AI Usage" bar plugin (opt-in) ---
+if [[ "$OMARCHY_PLUGIN" == "true" ]]; then
+  # The pi package's copy wins: `pi update` then updates the plugin with the CLI
+  # and the extension. node_modules/@cad0p/pi-usage is the stable name pi keeps
+  # pointing at the current version, so the link is not resolved any further.
+  PI_PACKAGE_PLUGIN="$HOME/.pi/agent/npm/node_modules/@cad0p/pi-usage/omarchy/$PLUGIN_ID"
+  if [[ -n "${PI_USAGE_PLUGIN_SOURCE:-}" ]]; then
+    PLUGIN_SOURCE="$PI_USAGE_PLUGIN_SOURCE"
+  elif [[ -f "$PI_PACKAGE_PLUGIN/manifest.json" ]]; then
+    PLUGIN_SOURCE="$PI_PACKAGE_PLUGIN"
+  else
+    PLUGIN_SOURCE="$PREFIX/omarchy/$PLUGIN_ID"
+  fi
+
+  if [[ ! -f "$PLUGIN_SOURCE/manifest.json" ]]; then
+    warn "no Omarchy plugin at $PLUGIN_SOURCE; skipping --omarchy-plugin"
+  elif [[ -e "$PLUGIN_LINK" && ! -L "$PLUGIN_LINK" ]]; then
+    warn "$PLUGIN_LINK exists and is not a symlink; leaving it alone"
+  else
+    mkdir -p "$(dirname "$PLUGIN_LINK")"
+    if [[ -L "$PLUGIN_LINK" && "$(readlink "$PLUGIN_LINK")" == "$PLUGIN_SOURCE" ]]; then
+      ok "Omarchy plugin already linked: $PLUGIN_LINK -> $PLUGIN_SOURCE"
+    else
+      ln -sfn "$PLUGIN_SOURCE" "$PLUGIN_LINK"
+      ok "Omarchy plugin linked: $PLUGIN_LINK -> $PLUGIN_SOURCE"
+    fi
+    # The shell discovers new plugin directories on a rescan; quiet and
+    # best-effort, since no shell may be running (a TTY, a fresh install).
+    if command -v omarchy-shell >/dev/null 2>&1; then
+      omarchy-shell -q shell rescanPlugins >/dev/null 2>&1 || true
+    fi
+    log "Put it on the bar (next to or instead of the built-in Agents widget):"
+    log "  omarchy plugin enable $PLUGIN_ID                   # its default spot, the right section"
+    log "  omarchy bar put $PLUGIN_ID --after omarchy.agents  # or right next to Agents"
+    log "  omarchy plugin disable omarchy.agents              # optional: drop the built-in widget"
   fi
 fi
 

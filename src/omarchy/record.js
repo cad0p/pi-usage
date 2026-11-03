@@ -15,6 +15,11 @@
  *   stats fields are merged in (today's tokens and prompts, the last seven
  *   days, all-time per-model buckets) and `hasLocalStats` says they are there.
  *
+ * A family with several accounts also carries `accounts[{id, ok, status,
+ * limits}]`: every window of every account, for panels that can draw them
+ * (this package's own Omarchy plugin). Omarchy's built-in panel ignores the
+ * key and keeps reading the flattened `limits`.
+ *
  * `percent` is a FRACTION in 0..1 (the panel multiplies it by 100), so 40.3% used
  * is written as 0.403.
  */
@@ -298,6 +303,18 @@ function compactLabels(labels) {
 }
 
 /**
+ * The per-account status line: the same reason as the compact summary, as a
+ * sentence-case label ("Key rejected", "No Go plan").
+ *
+ * @param {string | null | undefined} error
+ * @returns {string}
+ */
+function accountStatus(error) {
+  const reason = failureReason(error);
+  return reason.charAt(0).toUpperCase() + reason.slice(1);
+}
+
+/**
  * Explain failures compactly, grouped by reason in slot order, e.g.
  * "#8–#10 key rejected · #11–#14 no Go plan".
  *
@@ -331,6 +348,9 @@ function compactFailureList(failures) {
  * summarised in the status and the compact help text, which is what makes a
  * revoked key distinguishable from a workspace without a plan.
  *
+ * `accounts` repeats the family per account with every window, untitled by
+ * slot (the account id already says which one), for panels that show them all.
+ *
  * @param {string} family
  * @param {import("../model.js").QuotaResult[]} providers
  * @param {{ now?: number }} [options]
@@ -346,6 +366,8 @@ function buildFamilyRecord(family, providers, options = {}) {
   const limits = [];
   /** @type {Array<{ label: string, reason: string }>} */
   const failures = [];
+  /** @type {Array<{ id: string, ok: boolean, status: string, limits: Array<{ label: string, title: string, percent: number, resetsAt: string }> }>} */
+  const accounts = [];
   let okCount = 0;
 
   providers.forEach((provider, index) => {
@@ -355,9 +377,11 @@ function buildFamilyRecord(family, providers, options = {}) {
       const window = bindingWindow(provider.windows);
       const mapped = window ? mapLimits([window], provider, `${label} · `)[0] : null;
       if (mapped) limits.push(mapped);
+      accounts.push({ id: redact(label), ok: true, status: "", limits: mapLimits(provider.windows, provider) });
       return;
     }
     failures.push({ label, reason: failureReason(provider.error) });
+    accounts.push({ id: redact(label), ok: false, status: accountStatus(provider.error), limits: [] });
   });
 
   const failedCount = providers.length - okCount;
@@ -379,6 +403,7 @@ function buildFamilyRecord(family, providers, options = {}) {
       ready: okCount > 0,
       tierLabel: `${okCount} of ${providers.length} accounts`,
       limits: limits.length > 0 ? limits : [{ ...PLACEHOLDER_LIMIT }],
+      accounts,
       usageStatusText: status.usageStatusText,
       authHelpText: failures.length > 0 ? compactFailureList(failures) : status.authHelpText,
       hasLocalStats: false,

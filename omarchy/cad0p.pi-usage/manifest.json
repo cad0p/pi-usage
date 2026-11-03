@@ -1,0 +1,56 @@
+{
+  "schemaVersion": 1,
+  "id": "cad0p.pi-usage",
+  "name": "AI Usage",
+  "version": "1.0.0",
+  "author": "cad0p",
+  "license": "MIT",
+  "description": "Every AI subscription's limits, accounts and token use in one scrolling bar panel, one collapsible section per provider. Derived from Omarchy's Agents plugin.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "activation": "on-demand",
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "AI Usage",
+    "description": "One bar icon and one panel: every provider a collapsible section with its limits, every account of a multi-account provider, tokens by day and tokens by model.",
+    "category": "AI",
+    "defaultSection": "right",
+    "aliases": [
+      "ai-usage",
+      "pi-usage",
+      "quota"
+    ],
+    "allowMultiple": false,
+    "defaults": {
+      "providers": {},
+      "omarchyCollectors": "Auto",
+      "refreshIntervalSec": 900
+    },
+    "schema": [
+      {
+        "key": "omarchyCollectors",
+        "type": "enum",
+        "label": "Run Omarchy's collectors",
+        "options": [
+          "Auto",
+          "On",
+          "Off"
+        ],
+        "defaultValue": "Auto",
+        "description": "Auto runs omarchy-agent-usage-update only while the built-in Agents widget is not on the bar."
+      },
+      {
+        "key": "refreshIntervalSec",
+        "type": "integer",
+        "label": "Collector interval (seconds)",
+        "min": 30,
+        "max": 3600,
+        "step": 30,
+        "defaultValue": 900
+      }
+    ]
+  }
+}
