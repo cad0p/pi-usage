@@ -1,10 +1,11 @@
 /**
  * Pi quota line — read-only quota for the providers Pi already owns.
  *
- * Surface: nothing at session start. Bare /usage shows the panel until the next
- * prompt or a second /usage. /usage box, /usage line or /usage panel pins
- * a surface above the editor, /usage status enables the footer, and /usage hide
- * removes it. No timer or post-turn refresh runs until a surface is on.
+ * Surface: nothing at session start. Bare /usage opens a fullscreen overlay that
+ * takes the keyboard, scrolls, folds a section per provider and closes on Esc or
+ * q; nothing stays on screen behind it. /usage box, /usage line or /usage panel
+ * pins a surface above the editor, /usage status enables the footer, and
+ * /usage hide removes it. No timer or post-turn refresh runs until a surface is on.
  *
  * Design rules:
  *   - the numbers are **used**, not remaining, so the line answers "how much have
@@ -23,7 +24,7 @@
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -124,11 +125,17 @@ type Theme = {
 /** Only the UI surface this extension uses. */
 type UiContext = {
   hasUI: boolean;
+  /** Pi's run mode; `custom` components only exist in the TUI. */
+  mode?: string;
   ui: {
     theme: Theme;
     setStatus: (key: string, value: string | undefined) => void;
     setWidget: (key: string, value: any, options?: { placement?: string }) => void;
     notify: (message: string, type?: string) => void;
+    custom?: (
+      factory: (tui: any, theme: Theme, keybindings: any, done: (result?: unknown) => void) => any,
+      options?: { overlay?: boolean; overlayOptions?: Record<string, unknown> },
+    ) => Promise<unknown>;
   };
 };
 
@@ -550,42 +557,98 @@ function clipToWidth(line: string, width: number): string {
   return out;
 }
 
+/** One visible character with the SGR runs in front of it and the style it inherits. */
+type StyledChar = { raw: string; char: string; style: string };
+
 /**
- * The panel as a component rather than a string array: Pi caps string-array
- * widgets at ten lines, and a multi-account family alone can exceed that.
+ * Split a themed line into visible characters, folding each SGR run into the
+ * character that follows it and remembering the style open at that point.
+ * Wrapping needs both: a continuation row must re-open the style it inherits,
+ * and every produced row must close whatever it left open.
  */
-function panelComponent(lines: string[]) {
-  return () => ({
-    render: (width: number) => lines.map((line) => ` ${clipToWidth(line, Math.max(0, width - 1))}`),
-    invalidate() {},
-  });
+function styledChars(line: string): { chars: StyledChar[]; trailing: string } {
+  const chars: StyledChar[] = [];
+  let pending = "";
+  let style = "";
+  for (let index = 0; index < line.length; ) {
+    const sgr = /^\u001b\[[0-9;]*m/.exec(line.slice(index));
+    if (sgr) {
+      pending += sgr[0];
+      style = sgr[0] === "\u001b[0m" ? "" : `${style}${sgr[0]}`;
+      index += sgr[0].length;
+      continue;
+    }
+    const char = String.fromCodePoint(line.codePointAt(index) as number);
+    chars.push({ raw: `${pending}${char}`, char, style });
+    pending = "";
+    index += char.length;
+  }
+  return { chars, trailing: pending };
 }
 
 /**
- * The one-line notify summary. A multi-account family reports how many accounts
- * answer and the account with the most room, not whichever key happens to be #1.
+ * Wrap one themed line to `width` columns, breaking at its " · " separators.
+ *
+ * A hard clip used to cut a row mid-token at 64 columns, which loses the datum
+ * that matters most: "(18d)" is when the month resets, and "token exp" is the
+ * state of the credential. So a row that does not fit wraps instead — the first
+ * row keeps the line's own indent, every continuation is indented by the line's
+ * leading spaces (or `hanging`), and no cell is ever dropped. A cell with no
+ * separator in it wraps between words; a single word wider than the terminal is
+ * the only case left to cut.
  */
-function summarize(report: QuotaReport): string {
-  const active = report.providers.filter((provider) => provider.notConfigured !== true);
-  return firstPerFamily(active)
-    .map((provider) => {
-      const name = SHORT_NAME[provider.family] ?? provider.family;
-      if (isMultiAccount(active, provider)) {
-        const accounts = active.filter((other) => other.family === provider.family);
-        const scored = accounts
-          .filter((account) => account.ok)
-          .map((account) => ({ account, used: usedOf(bindingWindow(account)) }))
-          .filter((entry): entry is { account: QuotaProvider; used: number } => entry.used !== null);
-        const counted = `${accounts.filter((account) => account.ok).length}/${accounts.length} ok`;
-        if (scored.length === 0) return `${name}: ${counted}`;
-        const lowest = scored.reduce((best, entry) => (entry.used < best.used ? entry : best));
-        return `${name}: ${counted} · lowest ${Math.round(lowest.used)}% (${lowest.account.account})`;
-      }
-      if (!provider.ok) return `${name}: ${errorCaption(provider.error)}`;
-      const used = usedOf(headline(provider));
-      return `${name}: ${used === null ? "n/a" : `${Math.round(used)}% used`}`;
-    })
-    .join(" · ");
+function wrapLine(line: string, width: number, hanging?: string): string[] {
+  const limit = Math.max(1, Math.floor(width));
+  if (visibleLength(line) <= limit) return [line];
+  const { chars, trailing } = styledChars(line);
+  if (chars.length === 0) return [line];
+  const visible = chars.map((item) => item.char).join("");
+  // A break sits on the space in front of " · ", so neither row starts with a
+  // dangling middle dot; a word boundary is the fallback for a long sentence.
+  const breaks: number[] = [];
+  const spaces: number[] = [];
+  for (let index = 0; index + 2 < visible.length; index += 1) {
+    if (visible[index] === " " && visible[index + 1] === "·" && visible[index + 2] === " ") breaks.push(index);
+  }
+  for (let index = 0; index < visible.length; index += 1) if (visible[index] === " ") spaces.push(index);
+  const indent = hanging ?? /^ */.exec(visible)?.[0] ?? "";
+  const row = (from: number, to: number, prefix: string, extra = ""): string => {
+    // A wrapped row must not end in the padding the break was taken on.
+    const text = `${prefix}${chars.slice(from, to).map((item) => item.raw).join("")}${extra}`.replace(/ +(?=(\u001b\[[0-9;]*m)*$)/, "");
+    return /\u001b\[/.test(text) ? `${text}\u001b[0m` : text;
+  };
+
+  const lines: string[] = [];
+  let start = 0;
+  while (start < chars.length) {
+    const prefix = start === 0 ? "" : chars[start].style === "" ? indent : `${indent}${chars[start].style}`;
+    const fits = start + Math.max(1, limit - visibleLength(prefix));
+    if (fits >= chars.length) {
+      lines.push(row(start, chars.length, prefix, trailing));
+      break;
+    }
+    const breakAt = breaks.filter((index) => index > start && index <= fits).pop();
+    const spaceAt = breakAt === undefined ? spaces.filter((index) => index > start && index <= fits).pop() : undefined;
+    const cut = breakAt ?? spaceAt ?? fits;
+    lines.push(row(start, cut, prefix));
+    start = breakAt === undefined ? (spaceAt === undefined ? cut : cut + 1) : cut + 3;
+  }
+  return lines.length > 0 ? lines : [line];
+}
+
+/**
+ * The panel as a component rather than a string array: Pi caps string-array
+ * widgets at ten lines, and a multi-account family alone can exceed that.
+ *
+ * A line that does not fit wraps at its separators instead of being cut: at 64
+ * columns a hard clip used to lose the half of a row that says when the month
+ * resets, which is exactly the datum the row exists for.
+ */
+function panelComponent(lines: string[]) {
+  return () => ({
+    render: (width: number) => lines.flatMap((line) => wrapLine(line, Math.max(0, width - 1))).map((line) => ` ${line}`),
+    invalidate() {},
+  });
 }
 
 /** Window names for the one-line account rows (same words as the Omarchy panel). */
@@ -740,78 +803,639 @@ function renderAccountRows(accounts: QuotaProvider[], theme: Theme, stats?: Loca
   return lines;
 }
 
-function renderPanel(report: QuotaReport, theme: Theme): string[] {
+/**
+ * One provider block of the panel: the header painted with the provider name
+ * and every window, account and token row that belongs to it. The overlay
+ * folds on these blocks; the pinned widget renders them flat, unchanged.
+ */
+type PanelSection = { key: string; header: string; body: string[] };
+
+/** The provider block of a single-account provider: its header plus its detail. */
+function renderProviderLines(provider: QuotaProvider, theme: Theme, localStats: LocalFamilyStats | undefined, partialScan: boolean): string[] {
   const lines: string[] = [];
+  const labelWidth = Math.max(6, ...provider.windows.map((window) => String(window.label ?? "").length));
+  const name = paint(BRAND[provider.family] ?? "#8B949E", provider.label);
+  const meta: string[] = [provider.account];
+  if (provider.plan) meta.push(`plan ${provider.plan}`);
+  // Two stores can back Claude, and this is the one place that says which.
+  if (provider.sourceKind === "claude-code") meta.push("Claude Code CLI");
+  if (provider.expiresInMin !== null && provider.expiresInMin <= 120) {
+    meta.push(
+      provider.expiresInMin < 0
+        ? theme.fg("error", "token expired")
+        : theme.fg("dim", `token ${provider.expiresInMin}m`),
+    );
+  }
+  lines.push(meta.length > 0 ? `${name} ${theme.fg("dim", `· ${meta.join(" · ")}`)}` : name);
+
+  if (!provider.ok) {
+    const kind = errorKind(provider.error);
+    const glyph = errorGlyph(provider.error);
+    const color = kind === "transient" || kind === "throttle" ? "warning" : kind === "expired" || kind === "auth" ? "error" : "dim";
+    lines.push(`  ${theme.fg(color, glyph)} ${theme.fg("warning", provider.note ?? errorCaption(provider.error))}`);
+    if (isRecoverableError(provider.error) && provider.note) lines.push(`  ${theme.fg("warning", provider.note)}`);
+  } else if (provider.windows.length === 0) {
+    if (provider.note) lines.push(`  ${theme.fg("warning", `~ ${provider.note}`)}`);
+    lines.push(`  ${theme.fg("dim", "no rate-limit windows reported")}`);
+  } else {
+    if (provider.note) lines.push(`  ${theme.fg("warning", `~ ${provider.note}`)}`);
+    for (const window of provider.windows) {
+      const used = usedOf(window);
+      const label = theme.fg("dim", window.label.padEnd(labelWidth));
+      if (used === null) {
+        lines.push(`  ${label}  ${theme.fg("dim", window.note ?? "no percentage reported")}`);
+        continue;
+      }
+      const band = bandFor(used);
+      const reset = window.resetsInSec === null ? "" : theme.fg("dim", ` · reset in ${humanDuration(window.resetsInSec)}`);
+      lines.push(
+        `  ${label}  ${paint(band.color, band.glyph)} ${paint(band.color, bar(used))} ` +
+          `${paint(band.color, `${used.toFixed(used < 10 ? 1 : 0)}%`.padStart(5))} ` +
+          `${theme.fg("dim", "used")}${reset}`,
+      );
+    }
+  }
+
+  // Local token stats survive a failed quota probe: the credential may be
+  // rejected while the tokens already burned are still a fact on disk.
+  lines.push(...renderTokenRows(localStats, labelWidth, theme, partialScan));
+  return lines;
+}
+
+/**
+ * Split the panel into its foldable provider sections and the lines below them
+ * (byline, unconfigured providers, warnings). Bare `/usage` folds these; the
+ * pinned `/usage panel` flattens them back into the same list as before.
+ */
+function renderPanelLayout(report: QuotaReport, theme: Theme): { sections: PanelSection[]; tail: string[] } {
+  const sections: PanelSection[] = [];
   const active = report.providers.filter((provider) => provider.notConfigured !== true);
   const unconfigured = report.providers.filter((provider) => provider.notConfigured === true);
   const renderedFamilies = new Set<string>();
-
   const partialScan = report.localStatsMeta?.partial === true;
+
   for (const provider of active) {
     const localStats = report.localStats?.[provider.family];
     const labelWidth = Math.max(6, ...provider.windows.map((window) => String(window.label ?? "").length));
     if (isMultiAccount(active, provider)) {
       if (renderedFamilies.has(provider.family)) continue;
       renderedFamilies.add(provider.family);
-      lines.push(...renderAccountRows(active.filter((other) => other.family === provider.family), theme, localStats));
-      lines.push(...renderTokenRows(localStats, labelWidth, theme, partialScan));
+      const rows = renderAccountRows(active.filter((other) => other.family === provider.family), theme, localStats);
+      sections.push({
+        key: `${provider.family}`,
+        header: rows[0] ?? paint(BRAND[provider.family] ?? "#8B949E", provider.label),
+        body: [...rows.slice(1), ...renderTokenRows(localStats, labelWidth, theme, partialScan)],
+      });
       continue;
     }
-    const name = paint(BRAND[provider.family] ?? "#8B949E", provider.label);
-    const meta: string[] = [provider.account];
-    if (provider.plan) meta.push(`plan ${provider.plan}`);
-    // Two stores can back Claude, and this is the one place that says which.
-    if (provider.sourceKind === "claude-code") meta.push("Claude Code CLI");
-    if (provider.expiresInMin !== null && provider.expiresInMin <= 120) {
-      meta.push(
-        provider.expiresInMin < 0
-          ? theme.fg("error", "token expired")
-          : theme.fg("dim", `token ${provider.expiresInMin}m`),
-      );
-    }
-    lines.push(meta.length > 0 ? `${name} ${theme.fg("dim", `· ${meta.join(" · ")}`)}` : name);
-
-    if (!provider.ok) {
-      const kind = errorKind(provider.error);
-      const glyph = errorGlyph(provider.error);
-      const color = kind === "transient" || kind === "throttle" ? "warning" : kind === "expired" || kind === "auth" ? "error" : "dim";
-      lines.push(`  ${theme.fg(color, glyph)} ${theme.fg("warning", provider.note ?? errorCaption(provider.error))}`);
-      if (isRecoverableError(provider.error) && provider.note) lines.push(`  ${theme.fg("warning", provider.note)}`);
-    } else if (provider.windows.length === 0) {
-      if (provider.note) lines.push(`  ${theme.fg("warning", `~ ${provider.note}`)}`);
-      lines.push(`  ${theme.fg("dim", "no rate-limit windows reported")}`);
-    } else {
-      if (provider.note) lines.push(`  ${theme.fg("warning", `~ ${provider.note}`)}`);
-      for (const window of provider.windows) {
-        const used = usedOf(window);
-        const label = theme.fg("dim", window.label.padEnd(labelWidth));
-        if (used === null) {
-          lines.push(`  ${label}  ${theme.fg("dim", window.note ?? "no percentage reported")}`);
-          continue;
-        }
-        const band = bandFor(used);
-        const reset = window.resetsInSec === null ? "" : theme.fg("dim", ` · reset in ${humanDuration(window.resetsInSec)}`);
-        lines.push(
-          `  ${label}  ${paint(band.color, band.glyph)} ${paint(band.color, bar(used))} ` +
-            `${paint(band.color, `${used.toFixed(used < 10 ? 1 : 0)}%`.padStart(5))} ` +
-            `${theme.fg("dim", "used")}${reset}`,
-        );
-      }
-    }
-
-    // Local token stats survive a failed quota probe: the credential may be
-    // rejected while the tokens already burned are still a fact on disk.
-    lines.push(...renderTokenRows(localStats, labelWidth, theme, partialScan));
+    const lines = renderProviderLines(provider, theme, localStats, partialScan);
+    sections.push({ key: `${provider.family}:${provider.account}`, header: lines[0] ?? "", body: lines.slice(1) });
   }
-  lines.push(theme.fg("dim", `used % · read-only · ${report.generatedAt}`));
+
+  const tail: string[] = [];
+  // No timestamp here: the overlay header already says when the report landed
+  // ("updated HH:MM"), and a second format for the same fact reads as a
+  // different number to check. The pinned panel prints this line alone.
+  tail.push(theme.fg("dim", "used % · read-only"));
   if (unconfigured.length > 0) {
     const names = unconfigured.map((p) => SHORT_NAME[p.family] ?? p.family).join(", ");
-    lines.push(theme.fg("dim", `not configured in Pi: ${names}`));
+    tail.push(theme.fg("dim", `not configured in Pi: ${names}`));
   }
   for (const warning of report.warnings.slice(0, 3)) {
-    lines.push(theme.fg("warning", `warn: ${warning}`));
+    tail.push(theme.fg("warning", `warn: ${warning}`));
   }
-  return lines;
+  return { sections, tail };
+}
+
+/** The flat panel: every section, then the footer, unconfigured names, warnings. */
+function renderPanel(report: QuotaReport, theme: Theme): string[] {
+  const { sections, tail } = renderPanelLayout(report, theme);
+  return [...sections.flatMap((section) => [section.header, ...section.body]), ...tail];
+}
+
+/**
+ * Raw input sequences for the keys the overlay turns into actions. The
+ * extension ships as one file with no runtime dependencies, so this mirrors
+ * the subset of pi-tui's matchesKey() the overlay needs: arrows, paging and
+ * home/end in the encodings terminals and tmux actually send.
+ */
+const KEY_SEQUENCES: Record<string, string[]> = {
+  up: ["\u001b[A", "\u001bOA"],
+  down: ["\u001b[B", "\u001bOB"],
+  left: ["\u001b[D", "\u001bOD"],
+  right: ["\u001b[C", "\u001bOC"],
+  pageUp: ["\u001b[5~", "\u001b[[5~"],
+  pageDown: ["\u001b[6~", "\u001b[[6~"],
+  home: ["\u001b[H", "\u001bOH", "\u001b[1~", "\u001b[7~"],
+  end: ["\u001b[F", "\u001bOF", "\u001b[4~", "\u001b[8~"],
+};
+
+function isKey(data: string, name: string): boolean {
+  return (KEY_SEQUENCES[name] ?? []).includes(data);
+}
+
+/** Pi reports the terminal height as a number; fall back to a usable frame. */
+function terminalRows(value: number | undefined): number {
+  return Number.isFinite(value) ? Math.max(1, Math.floor(value as number)) : 24;
+}
+
+function clampScroll(value: number, max: number): number {
+  return Math.max(0, Math.min(value, max));
+}
+
+/** One line with its label left and its status right, clipped to the width. */
+function spreadLine(left: string, right: string, width: number): string {
+  if (right === "") return clipToWidth(left, width);
+  const rightText = clipToWidth(right, width);
+  const leftText = clipToWidth(left, Math.max(0, width - visibleLength(rightText) - 1));
+  const gap = Math.max(0, width - visibleLength(leftText) - visibleLength(rightText));
+  return `${leftText}${" ".repeat(gap)}${rightText}`;
+}
+
+/** One content row of the overlay, with the section it belongs to. */
+type OverlayRow = { text: string; section: number; header: boolean };
+
+/**
+ * What outlives one overlay instance. Every bare `/usage` builds a fresh view,
+ * so the folds live in the extension — for the pi session only, never on disk.
+ */
+type OverlaySession = {
+  expanded: Map<string, boolean>;
+};
+
+function newOverlaySession(): OverlaySession {
+  return { expanded: new Map() };
+}
+
+type UsageOverlayOptions = {
+  /** Close the overlay through the component's completion callback. */
+  done: () => void;
+  /** Ask the TUI for a frame after state changed. */
+  requestRender: () => void;
+  /** Current terminal height. */
+  getRows: () => number;
+  /** The newest report the extension holds, or null before the first one. */
+  getReport: () => QuotaReport | null;
+  /** The last refresh failure, shown as a line instead of thrown. */
+  getError: () => string | null;
+  isRefreshing: () => boolean;
+  /** Run the same forced refresh `/usage` always ran, in the background. */
+  refresh: () => void;
+};
+
+/**
+ * The key legend. Every key the current view answers appears here, and pairs a
+ * view does not answer (month navigation outside History) are added by that
+ * view. The legend wraps instead of dropping pairs, so a 60-column terminal
+ * still shows every key; the close key stays last.
+ */
+const NOW_HINTS: ReadonlyArray<readonly [string, string]> = [
+  ["↑↓/jk", "move"],
+  ["enter/←→/hl", "fold"],
+  ["pgup/pgdn", "page"],
+  ["g/G", "top/end"],
+  ["wheel", "scroll"],
+  ["r", "refresh"],
+  ["esc/q", "close"],
+];
+
+/** The report cache the CLI writes after every successful run. */
+function reportCachePath(): string {
+  const cacheHome = process.env.XDG_CACHE_HOME || join(homedir(), ".cache");
+  return join(cacheHome, "pi-quota", "usage.json");
+}
+
+/**
+ * The last report the CLI cached, read synchronously so the overlay can paint
+ * on the same keystroke as /usage. Read-only, age is irrelevant for a first
+ * frame, and a missing or malformed cache is simply "no cached report".
+ */
+function readCachedReport(): QuotaReport | null {
+  try {
+    const parsed = JSON.parse(readFileSync(reportCachePath(), "utf-8"));
+    const report = parsed?.report;
+    if (!report || !Array.isArray(report.providers)) return null;
+    // The cache stores absolute reset instants; the surfaces paint countdowns.
+    const now = Date.now();
+    for (const provider of report.providers) {
+      for (const window of provider.windows ?? []) {
+        if (!window.resetsAt) continue;
+        const resetsAtMs = Date.parse(window.resetsAt);
+        if (!Number.isNaN(resetsAtMs)) window.resetsInSec = Math.max(0, Math.round((resetsAtMs - now) / 1000));
+      }
+    }
+    return report as QuotaReport;
+  } catch {
+    return null;
+  }
+}
+
+/** The update time shown once a refresh lands, as the clock time it happened. */
+function updatedAtLabel(report: QuotaReport): string {
+  const at = new Date(report.generatedAt);
+  if (Number.isNaN(at.getTime())) return "updated";
+  return `updated ${String(at.getHours()).padStart(2, "0")}:${String(at.getMinutes()).padStart(2, "0")}`;
+}
+
+/**
+ * Split `count` cells into the fewest rows that fit `width`, then even them out.
+ *
+ * Greedy filling is the row count; a second pass picks, among all splits into
+ * that many rows, the one whose widest row is the narrowest. That is what turns
+ * a 7+1 legend into 4+4 without ever adding a row or dropping a pair.
+ *
+ * @returns the number of cells on each row.
+ */
+function balanceRows(lengths: number[], width: number, separator: number): number[] {
+  const count = lengths.length;
+  if (count === 0) return [];
+  const prefix: number[] = [0];
+  for (const length of lengths) prefix.push(prefix[prefix.length - 1] + length);
+  const cost = (from: number, to: number) => prefix[to] - prefix[from] + separator * (to - from - 1);
+
+  let rows = 1;
+  let used = lengths[0];
+  for (let index = 1; index < count; index += 1) {
+    if (used + separator + lengths[index] <= width) used += separator + lengths[index];
+    else {
+      rows += 1;
+      used = lengths[index];
+    }
+  }
+  if (rows <= 1) return [count];
+
+  // best[i][r]: the narrowest possible widest row for cells[i..] in exactly r rows.
+  const best: number[][] = Array.from({ length: count + 1 }, () => Array(rows + 1).fill(Number.POSITIVE_INFINITY));
+  best[count][0] = 0;
+  for (let remaining = 1; remaining <= rows; remaining += 1) {
+    for (let from = count - 1; from >= 0; from -= 1) {
+      for (let take = 1; take <= count - from - (remaining - 1); take += 1) {
+        const rest = best[from + take][remaining - 1];
+        if (rest === Number.POSITIVE_INFINITY) continue;
+        const widest = Math.max(cost(from, from + take), rest);
+        if (widest < best[from][remaining]) best[from][remaining] = widest;
+      }
+    }
+  }
+
+  const counts: number[] = [];
+  let from = 0;
+  for (let remaining = rows; remaining > 0; remaining -= 1) {
+    let chosen = 1;
+    for (let take = 1; take <= count - from - (remaining - 1); take += 1) {
+      const rest = best[from + take][remaining - 1];
+      if (rest === Number.POSITIVE_INFINITY) continue;
+      if (Math.max(cost(from, from + take), rest) === best[from][remaining]) {
+        chosen = take;
+        break;
+      }
+    }
+    counts.push(chosen);
+    from += chosen;
+  }
+  return counts;
+}
+
+/**
+ * The focused `/usage` view: the whole panel, one collapsible section per
+ * provider, a header cursor, scrolling and a one-line key hint. It reads the
+ * report and the error through callbacks, so a background refresh only has to
+ * call redraw(); the view holds no timer and no disk state.
+ */
+export class UsageOverlay {
+  private readonly theme: Theme;
+  private readonly options: UsageOverlayOptions;
+  /** Fold state, shared with the next view for this pi session. */
+  private readonly session: OverlaySession;
+  private cursor = 0;
+  private scroll = 0;
+  private disposed = false;
+  /** Width of the last frame; rows are wrapped for it. */
+  private measureWidth = 80;
+  private cachedLayout: { sections: PanelSection[]; tail: string[] } | null | undefined;
+  private cachedMetrics: { rows: OverlayRow[]; headerRows: number[]; sectionEnds: number[] } | undefined;
+  private cachedMetricsWidth: number | undefined;
+  private cachedWidth: number | undefined;
+  private cachedRows: number | undefined;
+  private cachedLines: string[] | undefined;
+  /** Legend rows the last frame needed; the viewport height depends on it. */
+  private legendRows = 1;
+
+  constructor(theme: Theme, options: UsageOverlayOptions, session: OverlaySession = newOverlaySession()) {
+    this.theme = theme;
+    this.options = options;
+    this.session = session;
+  }
+
+  /** The fold map shared with the next view, so a reopen keeps every fold. */
+  private get expanded(): Map<string, boolean> {
+    return this.session.expanded;
+  }
+
+  /** Drop cached rows and frames; the next render rebuilds from live state. */
+  public invalidate(): void {
+    this.cachedLayout = undefined;
+    this.cachedMetrics = undefined;
+    this.cachedMetricsWidth = undefined;
+    this.cachedWidth = undefined;
+    this.cachedRows = undefined;
+    this.cachedLines = undefined;
+  }
+
+  /** Re-render after the extension's background refresh landed. */
+  public redraw(): void {
+    if (this.disposed) return;
+    this.invalidate();
+    this.options.requestRender();
+  }
+
+  /** Stop drawing once the overlay closed, however it closed. */
+  public dispose(): void {
+    this.disposed = true;
+    this.invalidate();
+  }
+
+  /** Handle one raw key: fold, move, refresh, scroll, close. */
+  public handleInput(data: string): void {
+    if (this.disposed) return;
+    if (data === "\u001b" || data === "q") {
+      this.dispose();
+      this.options.done();
+      return;
+    }
+    if (data === "r") {
+      this.invalidate();
+      this.options.refresh();
+      return;
+    }
+    if (isKey(data, "up") || data === "k") this.moveCursor(-1);
+    else if (isKey(data, "down") || data === "j") this.moveCursor(1);
+    else if (data === "\r" || data === "\n" || data === " ") this.toggleSection();
+    else if (isKey(data, "left") || data === "h") this.setExpanded(false);
+    else if (isKey(data, "right") || data === "l") this.setExpanded(true);
+    else if (isKey(data, "pageUp")) this.page(-1);
+    else if (isKey(data, "pageDown")) this.page(1);
+    else if (isKey(data, "home") || data === "g") this.jumpTo(0);
+    else if (isKey(data, "end") || data === "G") this.jumpTo(-1);
+    else return;
+    // The TUI renders the component again after every key, so the cached frame
+    // and the cached row map must be dropped here, not only on report changes.
+    this.invalidate();
+  }
+
+  /**
+   * Wheel notches scroll the body; every other mouse event stays with pi.
+   *
+   * pi's TUI routes fullscreen wheel events to the focused component but offers
+   * no scrolling API for a custom screen: unhandled notches only move a
+   * ScrollView, and this extension ships as one dependency-free file that
+   * cannot import one. So the wheel is handled here, exactly as pi-context-view
+   * does (one notch = wheelDelta lines, undefined for every other event).
+   */
+  public handleMouse(event: { type?: string; wheelDelta?: number }): { handled: true; render: boolean } | undefined {
+    if (this.disposed || event?.type !== "wheel" || !event.wheelDelta) return undefined;
+    const before = this.scroll;
+    this.scroll = clampScroll(this.scroll + event.wheelDelta, this.maxScroll());
+    if (this.scroll === before) return { handled: true, render: false };
+    this.invalidate();
+    this.syncCursor();
+    return { handled: true, render: true };
+  }
+
+  /** Render one fullscreen frame for the given width and terminal height. */
+  public render(width: number): string[] {
+    const rows = terminalRows(this.options.getRows());
+    if (this.cachedLines && this.cachedWidth === width && this.cachedRows === rows) return this.cachedLines;
+
+    this.measureWidth = width;
+    // The legend wraps, so its row count depends on the width: it is measured
+    // before the viewport is cut, and the frame reserves exactly those rows.
+    const legend = this.legendLines(width);
+    this.legendRows = legend.length;
+    const { rows: content } = this.metrics();
+    const height = Math.max(1, rows - this.frameRows());
+    this.scroll = clampScroll(this.scroll, Math.max(0, content.length - height));
+
+    const viewport: string[] = [];
+    for (const row of content.slice(this.scroll, this.scroll + height)) {
+      const text = row.header ? `${row.section === this.cursor ? "❯" : " "} ${row.text}` : row.text;
+      viewport.push(clipToWidth(text, width));
+    }
+    while (viewport.length < height) viewport.push("");
+
+    const title = this.theme.fg("accent", this.theme.bold("Quota"));
+    const frame = [spreadLine(title, this.statusText(content.length, height), width), "", ...viewport, "", ...legend];
+    while (frame.length < rows) frame.push("");
+    this.cachedWidth = width;
+    this.cachedRows = rows;
+    this.cachedLines = frame.slice(0, rows);
+    return this.cachedLines;
+  }
+
+  /** Rows the frame spends around the scrolling content: title, two blanks, legend. */
+  private frameRows(): number {
+    return 3 + Math.max(1, this.legendRows);
+  }
+
+  /** Visible content height, excluding the fixed frame rows. */
+  private viewportHeight(): number {
+    return Math.max(1, terminalRows(this.options.getRows()) - this.frameRows());
+  }
+
+  private maxScroll(): number {
+    return Math.max(0, this.metrics().rows.length - this.viewportHeight());
+  }
+
+  private isExpanded(key: string): boolean {
+    return this.expanded.get(key) ?? true;
+  }
+
+  /** The report split into its foldable sections; null while the first load runs. */
+  private layout(): { sections: PanelSection[]; tail: string[] } | null {
+    if (this.cachedLayout === undefined) {
+      const report = this.options.getReport();
+      this.cachedLayout = report ? renderPanelLayout(report, this.theme) : null;
+    }
+    return this.cachedLayout;
+  }
+
+  /** Flattened rows, plus where every section's header starts and ends. */
+  private metrics(): { rows: OverlayRow[]; headerRows: number[]; sectionEnds: number[] } {
+    if (this.cachedMetrics && this.cachedMetricsWidth === this.measureWidth) return this.cachedMetrics;
+    this.cachedMetricsWidth = this.measureWidth;
+    const rows: OverlayRow[] = [];
+    const headerRows: number[] = [];
+    const sectionEnds: number[] = [];
+    const error = this.options.getError();
+    if (error) rows.push({ text: `  ${this.theme.fg("error", `! ${error}`)}`, section: -1, header: false });
+    const layout = this.layout();
+    if (!layout) {
+      rows.push({ text: `  ${this.theme.fg("dim", "loading quota …")}`, section: -1, header: false });
+    } else {
+      layout.sections.forEach((section, index) => {
+        const open = this.isExpanded(section.key);
+        headerRows.push(rows.length);
+        this.pushRow(rows, `${open ? "▾" : "▸"} ${section.header}`, index, true);
+        if (open) for (const line of section.body) this.pushRow(rows, `    ${line}`, index, false);
+        sectionEnds.push(rows.length - 1);
+      });
+      for (const line of layout.tail) this.pushRow(rows, `  ${line}`, -1, false);
+    }
+    this.cursor = Math.max(0, Math.min(this.cursor, Math.max(0, headerRows.length - 1)));
+    this.cachedMetrics = { rows, headerRows, sectionEnds };
+    return this.cachedMetrics;
+  }
+
+  /**
+   * Append one content row, wrapped to the measured width. The cursor marker and
+   * the body indent are two columns the wrap budget must leave room for, and a
+   * wrapped header's continuation rows are body rows of the same section, so the
+   * header indexes the cursor walks do not shift.
+   */
+  private pushRow(rows: OverlayRow[], text: string, section: number, header: boolean): void {
+    const width = Math.max(8, this.measureWidth - (header ? 2 : 0));
+    const parts = wrapLine(text, width);
+    rows.push({ text: parts[0], section, header });
+    for (const part of parts.slice(1)) rows.push({ text: header ? `  ${part}` : part, section, header: false });
+  }
+
+  /** Walk the headers; a section taller than the viewport scrolls first. */
+  private moveCursor(delta: -1 | 1): void {
+    const { headerRows, sectionEnds } = this.metrics();
+    if (headerRows.length === 0) return;
+    const height = this.viewportHeight();
+    const section = this.layout()?.sections[this.cursor];
+    const open = section !== undefined && this.isExpanded(section.key);
+    const end = sectionEnds[this.cursor] ?? 0;
+    if (delta > 0 && open && end > this.scroll + height - 1) {
+      this.scroll = clampScroll(this.scroll + 1, this.maxScroll());
+      return;
+    }
+    if (delta < 0 && open && headerRows[this.cursor] < this.scroll) {
+      this.scroll = clampScroll(this.scroll - 1, this.maxScroll());
+      return;
+    }
+    const next = this.cursor + delta;
+    if (next < 0 || next >= headerRows.length) {
+      this.scroll = clampScroll(this.scroll + delta, this.maxScroll());
+      return;
+    }
+    this.cursor = next;
+    this.reveal();
+  }
+
+  /** Scroll the cursor's header into view; a tall section starts at its header. */
+  private reveal(): void {
+    const { headerRows, sectionEnds } = this.metrics();
+    const height = this.viewportHeight();
+    const top = headerRows[this.cursor] ?? 0;
+    const bottom = sectionEnds[this.cursor] ?? top;
+    if (top < this.scroll || bottom > this.scroll + height - 1) this.scroll = top;
+    this.scroll = clampScroll(this.scroll, this.maxScroll());
+  }
+
+  /**
+   * Page the body. When nothing can scroll the keystroke does nothing: paging
+   * used to re-snap the cursor to the last on-screen header, so PgUp on a short
+   * page moved the selection *down*.
+   */
+  private page(delta: -1 | 1): void {
+    const before = this.scroll;
+    this.scroll = clampScroll(this.scroll + delta * this.viewportHeight(), this.maxScroll());
+    this.invalidate();
+    if (this.scroll !== before) this.syncCursor();
+  }
+
+  private jumpTo(index: 0 | -1): void {
+    const { headerRows } = this.metrics();
+    if (headerRows.length === 0) {
+      this.scroll = index === 0 ? 0 : this.maxScroll();
+      return;
+    }
+    this.cursor = index === 0 ? 0 : headerRows.length - 1;
+    this.scroll = index === 0 ? 0 : this.maxScroll();
+    const top = headerRows[this.cursor] ?? 0;
+    if (top < this.scroll) this.scroll = top;
+  }
+
+  /**
+   * Keep the cursor on the header nearest the one it was on that is still on
+   * screen. The last visible header is the wrong pick: scrolling a little used
+   * to throw the selection to the bottom of the page. When no header is on
+   * screen the cursor stays put, so scrolling back returns to it.
+   */
+  private syncCursor(): void {
+    const { headerRows } = this.metrics();
+    if (headerRows.length === 0) return;
+    const bottom = this.scroll + this.viewportHeight() - 1;
+    let best: number | null = null;
+    for (let index = 0; index < headerRows.length; index += 1) {
+      const row = headerRows[index];
+      if (row < this.scroll || row > bottom) continue;
+      if (best === null || Math.abs(index - this.cursor) < Math.abs(best - this.cursor)) best = index;
+    }
+    if (best !== null) this.cursor = best;
+  }
+
+  private toggleSection(): void {
+    const section = this.layout()?.sections[this.cursor];
+    if (!section) return;
+    this.setExpanded(!this.isExpanded(section.key));
+  }
+
+  private setExpanded(open: boolean): void {
+    const section = this.layout()?.sections[this.cursor];
+    if (!section || this.isExpanded(section.key) === open) return;
+    this.expanded.set(section.key, open);
+    this.invalidate();
+    this.reveal();
+  }
+
+  /**
+   * The header's right side: a visible refresh indicator while the CLI runs,
+   * the update time it landed at afterwards, the view's position, and the
+   * scroll range when the content is taller than the viewport.
+   */
+  private statusText(total: number, height: number): string {
+    const parts: string[] = [];
+    if (this.options.isRefreshing()) {
+      parts.push(this.theme.fg("accent", "refreshing …"));
+    } else {
+      const report = this.options.getReport();
+      if (report) parts.push(this.theme.fg("dim", updatedAtLabel(report)));
+      if (this.options.getError()) parts.push(this.theme.fg("error", "refresh failed"));
+    }
+    if (total > height) {
+      const last = Math.min(total, this.scroll + height);
+      parts.push(this.theme.fg("dim", `${this.scroll + 1}-${last}/${total}`));
+    }
+    return parts.join(this.theme.fg("dim", " · "));
+  }
+
+  /** Hint pairs for the active view; History adds its month navigation. */
+  private legendHints(): ReadonlyArray<readonly [string, string]> {
+    return NOW_HINTS;
+  }
+
+  /**
+   * Wrap the legend pairs across as many rows as the width needs, balanced:
+   * greedy filling leaves the last pair alone on a row of its own ("esc/q
+   * close" under seven pairs), which reads as a lost key. The row count is the
+   * minimum greedy needs, so widening the pane never adds a row.
+   */
+  private legendLines(width: number): string[] {
+    const separator = this.theme.fg("dim", " · ");
+    const pairs = this.legendHints().map(([keys, label]) => `${this.theme.fg("dim", keys)} ${label}`);
+    if (pairs.length === 0) return [""];
+    const rows = balanceRows(pairs.map((pair) => visibleLength(pair)), width, 3);
+    const lines: string[] = [];
+    let index = 0;
+    for (const count of rows) {
+      lines.push(pairs.slice(index, index + count).join(separator));
+      index += count;
+    }
+    return lines;
+  }
 }
 
 export default function quotaPanelExtension(pi: ExtensionAPI): void {
@@ -821,10 +1445,15 @@ export default function quotaPanelExtension(pi: ExtensionAPI): void {
   let agentEndTimer: ReturnType<typeof setTimeout> | null = null;
   let panelVisible = false;
   /**
-   * The panel bare `/usage` opens is a glance, not a pin: it goes away when the
-   * next prompt starts or when `/usage` is run again. `/usage panel` pins it.
+   * The open fullscreen overlay, while there is one. Bare `/usage` opens it and
+   * a background refresh redraws it; closing it leaves nothing behind.
    */
-  let transientPanel = false;
+  let overlayView: UsageOverlay | null = null;
+  /**
+   * What a reopened overlay keeps: every bare `/usage` builds a fresh view, so
+   * the folds live here, for the pi session and never on disk.
+   */
+  let overlaySession = newOverlaySession();
   /**
    * Nothing is pinned by default. A box or line above the editor is a persistent
    * surface, and a quota command should not claim a row until asked.
@@ -869,28 +1498,33 @@ export default function quotaPanelExtension(pi: ExtensionAPI): void {
     railMode = inspection.state === "patched";
   }
 
-  async function runCli(args: string[]): Promise<QuotaReport | null> {
+  /**
+   * Run the CLI. A report run owns `lastError`; the advisory `omarchy` publish
+   * writes human text, not JSON, and must never surface as a quota failure.
+   */
+  async function runCli(args: string[], options: { reportErrors?: boolean } = {}): Promise<QuotaReport | null> {
+    const reportErrors = options.reportErrors !== false;
     const cli = resolveCliPath();
     if (!cli) {
-      lastError = "piquota not installed: run install.sh from the pi-quota repo";
+      if (reportErrors) lastError = "piquota not installed: run install.sh from the pi-quota repo";
       return null;
     }
     try {
       const runner = /node(\.exe)?$/i.test(process.execPath) ? process.execPath : "node";
       const result = await pi.exec(runner, [cli, ...args], { timeout: EXEC_TIMEOUT_MS });
       if (!result.stdout || result.stdout.trim() === "") {
-        lastError = result.stderr?.trim() || "piquota produced no output";
+        if (reportErrors) lastError = result.stderr?.trim() || "piquota produced no output";
         return null;
       }
       const parsed = JSON.parse(result.stdout) as QuotaReport;
       if (!parsed || !Array.isArray(parsed.providers)) {
-        lastError = "piquota output was not a quota report";
+        if (reportErrors) lastError = "piquota output was not a quota report";
         return null;
       }
-      lastError = null;
+      if (reportErrors) lastError = null;
       return parsed;
     } catch (error) {
-      lastError = (error as { message?: string })?.message ?? String(error);
+      if (reportErrors) lastError = (error as { message?: string })?.message ?? String(error);
       return null;
     }
   }
@@ -1050,11 +1684,14 @@ export default function quotaPanelExtension(pi: ExtensionAPI): void {
       if (disposed) return;
       if (next) {
         report = next;
-        paintUi(ctx);
-        void runCli(["omarchy"]);
+        // A bare /usage overlay is not a pinned surface: only repaint the widget
+        // and the footer when something is actually on screen.
+        if (surfaceActive()) paintUi(ctx);
+        void runCli(["omarchy"], { reportErrors: false });
       }
     } finally {
       refreshing = false;
+      overlayView?.redraw();
     }
   }
 
@@ -1063,6 +1700,8 @@ export default function quotaPanelExtension(pi: ExtensionAPI): void {
     const ui = ctx as unknown as UiContext;
     if (!ui.hasUI) return;
     disposed = false;
+    // A new session starts with every section open.
+    overlaySession = newOverlaySession();
     // Resolve the native rail mode before the first paint.
     await syncRailPatch();
     if (disposed) return;
@@ -1072,17 +1711,7 @@ export default function quotaPanelExtension(pi: ExtensionAPI): void {
     paintUi(ui);
   });
 
-  function dismissTransientPanel(ui: UiContext): void {
-    panelVisible = false;
-    transientPanel = false;
-    if (!surfaceActive()) stopPolling();
-    paintUi(ui);
-  }
-
-  pi.on("agent_start", (_event, ctx) => {
-    // SAFETY: Pi's agent_start context implements UiContext when hasUI is true.
-    const ui = ctx as unknown as UiContext;
-    if (transientPanel && panelVisible && ui?.hasUI && !disposed) dismissTransientPanel(ui);
+  pi.on("agent_start", () => {
     if (agentEndTimer) {
       clearTimeout(agentEndTimer);
       agentEndTimer = null;
@@ -1124,6 +1753,61 @@ export default function quotaPanelExtension(pi: ExtensionAPI): void {
     }
   });
 
+  /**
+   * Bare /usage: a fullscreen overlay that owns the keyboard and closes on Esc,
+   * so no panel is left above the editor. It opens with the cached report and
+   * refreshes in the background; a failure becomes a line in the view.
+   */
+  async function showOverlay(ctx: UiContext): Promise<void> {
+    // Paint on the same keystroke: the report already in memory, otherwise the
+    // CLI's on-disk cache. The forced refresh runs behind the overlay and never
+    // delays the first frame.
+    if (!report) report = readCachedReport();
+    const custom = ctx.ui.custom;
+    if (typeof custom !== "function" || (ctx.mode !== undefined && ctx.mode !== "tui")) {
+      // A host without custom components still gets the panel that /usage panel pins.
+      panelVisible = true;
+      lineVisible = false;
+      boxVisible = false;
+      explicitBox = false;
+      if (!report) await refresh(ctx, false);
+      ensurePolling(ctx);
+      paintUi(ctx);
+      ctx.ui.notify("This host has no fullscreen overlay; the quota panel is pinned above the editor", "info");
+      return;
+    }
+    await custom(
+      (tui, theme, _keybindings, done) => {
+        const view = new UsageOverlay(theme, {
+          done: () => done(undefined),
+          requestRender: () => tui?.requestRender?.(),
+          getRows: () => tui?.terminal?.rows ?? process.stdout.rows ?? 24,
+          getReport: () => report,
+          getError: () => lastError,
+          isRefreshing: () => refreshing,
+          refresh: () => {
+            void refresh(ctx, true);
+          },
+        }, overlaySession);
+        overlayView = view;
+        return {
+          render: (width: number) => view.render(width),
+          invalidate: () => view.invalidate(),
+          dispose: () => {
+            if (overlayView === view) overlayView = null;
+            view.dispose();
+          },
+          handleInput: (data: string) => {
+            view.handleInput(data);
+            tui?.requestRender?.();
+          },
+          handleMouse: (event: any) => view.handleMouse(event),
+        };
+      },
+      { overlay: true, overlayOptions: { width: "100%", maxHeight: "100%", margin: 0 } },
+    );
+  }
+
   const handler = async (args: string, ctx: UiContext): Promise<void> => {
     if (!ctx.hasUI) return;
     const action = args.trim().toLowerCase();
@@ -1151,7 +1835,6 @@ export default function quotaPanelExtension(pi: ExtensionAPI): void {
         return;
       case "panel":
         panelVisible = true;
-        transientPanel = false;
         lineVisible = false;
         boxVisible = false;
         explicitBox = false;
@@ -1198,29 +1881,15 @@ export default function quotaPanelExtension(pi: ExtensionAPI): void {
         break;
     }
 
-    // Bare /usage again while its glance is open closes it.
-    if (panelVisible && transientPanel) {
-      dismissTransientPanel(ctx);
-      return;
-    }
-
-    // Bare /usage: one on-demand refresh, show the panel, report the percentages.
-    panelVisible = true;
-    transientPanel = true;
-    lineVisible = false;
-    boxVisible = false;
-    await refresh(ctx, true);
-    ensurePolling(ctx);
-    paintUi(ctx);
-    if (!report) {
-      ctx.ui.notify(`Quota unavailable: ${lastError}`, "error");
-      return;
-    }
-    ctx.ui.notify(summarize(report) || "No active providers configured in Pi", "info");
+    // Bare /usage (or an unknown argument): open the overlay with whatever the
+    // extension already has, and refresh in the background behind it.
+    const opening = showOverlay(ctx);
+    void refresh(ctx, true);
+    await opening;
   };
 
   pi.registerCommand("usage", {
-    description: "Show read-only provider quota on demand (used %, shortest window)",
+    description: "Open the read-only quota overlay (used %, one foldable section per provider)",
     getArgumentCompletions: (prefix: string) => {
       const options = ["refresh", "line", "box", "panel", "hide", "status", "nostatus", "json"];
       const matches = options.filter((option) => option.startsWith(prefix));

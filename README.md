@@ -242,7 +242,7 @@ Inside Pi:
 
 | Command | Effect |
 | --- | --- |
-| `/usage` | one on-demand refresh, show the full panel until the next prompt (or a second `/usage`), notify a one-line summary |
+| `/usage` | open the fullscreen quota overlay: every provider, window, account and token row, folded by section, refreshed in the background; `esc` closes it |
 | `/usage box` | pin the five-row box above the editor |
 | `/usage line` | pin the compact line above the editor, in its own row |
 | `/usage panel` | full panel above the editor, pinned across prompts |
@@ -253,18 +253,53 @@ Inside Pi:
 
 ### The Pi surface
 
-Nothing is pinned by default: `/usage` is a one-shot command, so it claims no row
-above the editor and leaves the footer alone. Turn a surface on with `/usage box`,
-`/usage line`, `/usage panel` or `/usage status`; only then does the extension keep
-it fresh with a background refresh (and a gentle refresh after each agent turn).
-`/usage hide` gives the row back.
+Nothing is pinned by default: `/usage` opens a **fullscreen overlay** that takes
+the keyboard, so it claims no row above the editor and leaves the footer alone.
+It is the same `ctx.ui.custom` overlay pattern pi's `/context` uses: it fills the
+terminal, scrolls, folds and closes on Esc (or `q`), leaving nothing behind.
+Turn a persistent surface on with `/usage box`, `/usage line`, `/usage panel` or
+`/usage status`; only then does the extension keep it fresh with a background
+refresh (and a gentle refresh after each agent turn). `/usage hide` gives the row
+back. `/usage panel` still pins the same panel flat above the editor.
+
+The overlay paints on the same keystroke: it renders the report the extension
+already holds, or the CLI's on-disk report cache (`~/.cache/pi-quota/usage.json`,
+read-only) when memory is empty, and never waits for the CLI before the first
+frame. The same forced refresh bare `/usage` always ran then runs behind it: the
+header says `refreshing …` while it does, and the update time when it lands. A
+failed refresh is a line in the view, never a thrown error. Every provider is a section:
+the header is the brand-coloured name line, the body lists every window with its
+used-fraction bar, reset countdown and the token rows for today, the last seven
+days, the prompts and the heaviest models. All sections start expanded; the fold
+state lives for the pi session, so reopening `/usage` resumes it, and no file is
+written.
+
+| Key | Action |
+| --- | --- |
+| `↑`/`↓`, `j`/`k` | move the header cursor; a section taller than the viewport scrolls line by line first |
+| `enter` / `space` | fold or unfold the section under the cursor |
+| `→`/`l`, `←`/`h` | expand, collapse |
+| `PgUp`/`PgDn`, `g`/`Home`, `G`/`End` | page, first section, last section |
+| mouse wheel | scroll |
+| `r` | refresh in place |
+| `esc` / `q` | close |
+
+The legend at the bottom lists every key the current view answers, and wraps
+into a second or third row on a narrow pane instead of dropping pairs — as few
+rows as fit, with the pairs balanced across them. The frame fits from about 60
+columns up: a line wider than the terminal wraps at its separators with a
+hanging indent instead of being cut, so a row never loses the datum it ends
+with, and a resize rebuilds it. The wheel is handled by the component itself, like
+pi-context-view: pi routes fullscreen wheel events to the focused component but
+has no scrolling API for a custom screen, and this extension has no runtime
+dependencies to wrap the body in a `ScrollView`.
 
 A provider with several accounts is shown as one header (`OP-Go · 7 of 14 accounts
 ok`) plus one line per account with every window and its reset, e.g.
 `#2 ● session 2% (10m) · week 10% (6d) · month 90% (19d)`, or the reason it failed
-(`key rejected`, `no Go plan`). The leading glyph is the fullest window's band. The panel is rendered as a component, so Pi's ten-line
-cap on plain widgets never truncates it, and the summary names the account with the
-most room: `OP-Go: 7/14 ok · lowest 24% (#7)`.
+(`key rejected`, `no Go plan`). The leading glyph is the fullest window's band. The
+overlay and the pinned panel are rendered as components, so Pi's ten-line cap on
+plain widgets never truncates them.
 
 `/usage box` pins the **five-row box above the editor**:
 
@@ -510,7 +545,8 @@ is a collapsible section of one scrolling panel.
   with its window and reset (`Weekly · 1d`), a chip when something is wrong
   (`Unavailable`, `7 down`), and the headline meter while folded. The headline is
   the fullest window; for a multi-account provider it is the healthy account
-  with the most room left, the `lowest` figure `/usage` prints.
+  with the most room left. `/usage` does not collapse a family like that: its
+  panel lists one line per account, so this headline is the bar's own summary.
 - **Expanded**: the status card, LIMITS with the built-in meters and countdowns,
   then for a multi-account record one row per account with every window
   (`#2  session 2% 10m · week 10% 6d · month 90% 19d`, failed accounts dimmed
@@ -755,7 +791,7 @@ extensions/quota-panel.ts      Pi TUI line and /usage
 ## Tests
 
 ```bash
-node --test tests/*.test.mjs     # 359 tests, fake tokens only, no network
+node --test tests/*.test.mjs     # 371 tests, fake tokens only, no network
 ```
 
 Modules covered: `auth.json` parsing and de-duplication, the Claude Code store

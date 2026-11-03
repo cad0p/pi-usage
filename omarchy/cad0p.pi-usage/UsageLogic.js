@@ -172,7 +172,8 @@ function failedAccountCount(p) {
 // family are used one after another (pi rotates to the next slot when one is
 // exhausted), so what stops the next prompt is the account with the most
 // room left: the healthy account whose own fullest window is the emptiest.
-// That is the "lowest" figure /usage prints for the family.
+// /usage's panel lists every account instead of collapsing the family, so
+// this headline is the bar's own summary of those rows.
 function headline(p) {
   if (!p) return null
   var rows = accountRows(p)

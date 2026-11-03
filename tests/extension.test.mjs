@@ -204,6 +204,110 @@ async function startSession(harness, surface = "box") {
   }
 }
 
+/** Let the stubbed CLI settle: every frame is rendered from live state. */
+const settle = () => new Promise((resolve) => setTimeout(resolve, 20));
+
+/** The visible text of one frame. */
+const frameText = (overlay, width = 90) => plain(overlay.component.render(width).join("\n"));
+
+/**
+ * Mount the fullscreen overlay the way pi does: `ctx.ui.custom` builds the
+ * component with a tui, a theme, keybindings and a completion callback, and
+ * resolves when the view calls done(). Completion disposes the component, as pi
+ * does, so the extension's cleanup is exercised too.
+ */
+function installOverlay(harness, { rows = 40 } = {}) {
+  const overlays = [];
+  harness.ctx.ui.custom = (factory, options) => {
+    let finish;
+    const promise = new Promise((resolve) => {
+      finish = resolve;
+    });
+    const record = { options, rows, doneCalls: 0, renders: 0 };
+    record.tui = {
+      terminal: { rows },
+      requestRender: () => {
+        record.renders += 1;
+      },
+    };
+    record.component = factory(record.tui, harness.ctx.ui.theme, {}, () => {
+      record.doneCalls += 1;
+      record.component.dispose?.();
+      finish(undefined);
+    });
+    overlays.push(record);
+    return promise;
+  };
+  return overlays;
+}
+
+/**
+ * A report whose Now rows are wider than 64 columns: three windows per account
+ * with real reset countdowns, and a warning long enough to wrap. This is the
+ * shape that used to lose its tail to a hard clip.
+ */
+function wideReport() {
+  const account = (slot) => ({
+    family: "opencode-go",
+    label: "OpenCode Go (Pi)",
+    primaryWindowId: "5h",
+    account: slot === 1 ? "" : `#${slot}`,
+    plan: "Go subscription",
+    windows: [
+      { id: "5h", label: "5h window", usedPercent: 0, remainingPercent: 100, resetsAt: null, resetsInSec: 18_000, note: null },
+      { id: "weekly", label: "Weekly window", usedPercent: 0, remainingPercent: 100, resetsAt: null, resetsInSec: 432_000, note: null },
+      { id: "monthly", label: "Monthly window", usedPercent: 100, remainingPercent: 0, resetsAt: null, resetsInSec: 1_555_200, note: null },
+    ],
+    error: null,
+    ok: true,
+    updatedAt: "2030-01-01T00:00:00.000Z",
+    expiresInMin: null,
+  });
+  return {
+    generatedAt: "2030-01-01T00:00:00.000Z",
+    sources: [],
+    warnings: ["claude: the upstream probe fell back to a cached observation while the token expires in 3 minutes"],
+    providers: [account(1), account(2)],
+  };
+}
+
+/** The legend rows at the bottom of a frame, from the first row that names a key. */
+function legendRows(text) {
+  const lines = text.split("\n").map((line) => line.trimEnd());
+  const first = lines.findIndex((line) => line.includes("↑↓/jk move"));
+  return first === -1 ? [] : lines.slice(first);
+}
+
+/** Two families, one of them multi-account, plus the tail lines the panel shows. */
+function overlayReport() {
+  const account = (slot, used) => ({
+    family: "opencode-go",
+    label: "OpenCode Go (Pi)",
+    primaryWindowId: "5h",
+    account: `#${slot}`,
+    plan: "Go plan",
+    windows: [
+      { id: "5h", label: "5h window", usedPercent: used, remainingPercent: 100 - used, resetsAt: null, resetsInSec: 600, note: null },
+      { id: "monthly", label: "Monthly window", usedPercent: 100, remainingPercent: 0, resetsAt: null, resetsInSec: 900000, note: null },
+    ],
+    error: null,
+    ok: true,
+    updatedAt: "2030-01-01T00:00:00.000Z",
+    expiresInMin: null,
+  });
+  return {
+    generatedAt: "2030-01-01T00:00:00.000Z",
+    sources: [],
+    warnings: ["one family was throttled"],
+    providers: [
+      structuredClone(REPORT.providers[0]),
+      account(1, 10),
+      account(2, 50),
+      { ...structuredClone(REPORT.providers[1]), windows: [], error: "no openai-codex credential in the Pi store", ok: false, notConfigured: true },
+    ],
+  };
+}
+
 test("the extension loads and registers /usage", async () => {
   const module = await import(EXTENSION);
   assert.equal(typeof module.default, "function");
@@ -253,16 +357,13 @@ test("the full panel lists every account while the box and the line keep one per
   assert.equal((box.match(/OP-Go/g) ?? []).length, 1, "the box shows one row per family");
 
   const usage = harness.commands.find((command) => command.name === "usage");
-  await usage.definition.handler("", harness.ctx);
+  await usage.definition.handler("panel", harness.ctx);
   const panelWidget = harness.widgets.at(-1);
   const panel = plain(renderWidget(panelWidget).join("\n"));
   assert.match(panel, /OP-Go · 2 of 2 accounts ok/);
   assert.match(panel, /#1 +● session +10% \(10m\) +· month 100% \(10d\)/, "every window of an account shares its one line");
   assert.match(panel, /#2 +● session +50% \(10m\) +· month 100% \(10d\)/);
   assert.equal(/5h window/.test(panel), false, "per-account windows are not listed one per line");
-  assert.match(harness.notifications.at(-1), /OP-Go: 2\/2 ok · lowest 100% \(#1\)/);
-
-  assert.equal((harness.notifications.at(-1).match(/OP-Go/g) ?? []).length, 1, "the summary names each family once");
 });
 
 test("the panel adds a compact token section per provider and per account", async () => {
@@ -361,7 +462,7 @@ test("the panel adds a compact token section per provider and per account", asyn
   await startSession(harness);
 
   const usage = harness.commands.find((command) => command.name === "usage");
-  await usage.definition.handler("", harness.ctx);
+  await usage.definition.handler("panel", harness.ctx);
   const panel = plain(renderWidget(harness.widgets.at(-1)).join("\n"));
 
   assert.match(panel, /tokens\s+today 34\.6k · 7d 100k · 12 prompts/);
@@ -396,7 +497,7 @@ test("a partial scan is stated on the panel instead of being passed off as compl
   await startSession(harness);
 
   const usage = harness.commands.find((command) => command.name === "usage");
-  await usage.definition.handler("", harness.ctx);
+  await usage.definition.handler("panel", harness.ctx);
   const panel = plain(renderWidget(harness.widgets.at(-1)).join("\n"));
   assert.match(panel, /today 500 · 7d 500 · 1 prompt · scan partial/);
 });
@@ -433,7 +534,7 @@ test("a fourteen-account panel is a component, so Pi's ten-line cap never trunca
   });
   module.default(harness.pi);
   const usage = harness.commands.find((command) => command.name === "usage");
-  await usage.definition.handler("", harness.ctx);
+  await usage.definition.handler("panel", harness.ctx);
 
   const widget = harness.widgets.at(-1);
   assert.equal(typeof widget, "function", "a string array would be capped at ten lines by Pi");
@@ -445,31 +546,131 @@ test("a fourteen-account panel is a component, so Pi's ten-line cap never trunca
   assert.match(panel, /#14 .*no Go plan/);
   assert.match(panel, /#8 .*key rejected/);
   assert.match(panel, /#7 .*session +0% .*month +80%/);
-  assert.match(harness.notifications.at(-1), /OP-Go: 7\/14 ok · lowest 20% \(#1\)/);
 });
 
-test("the panel bare /usage opens closes on the next prompt or a second /usage; /usage panel stays", async () => {
+test("bare /usage opens a fullscreen overlay, refreshes behind it and leaves the editor clean", async () => {
+  const module = await import(EXTENSION);
+  const harness = makeHarness({ report: overlayReport() });
+  module.default(harness.pi);
+  await startSession(harness, null);
+  harness.widgets.length = 0;
+
+  const overlays = installOverlay(harness);
+  const usage = harness.commands.find((command) => command.name === "usage");
+  const pending = usage.definition.handler("", harness.ctx);
+  assert.equal(overlays.length, 1, "bare /usage opens one focused view");
+  assert.deepEqual(overlays[0].options, {
+    overlay: true,
+    overlayOptions: { width: "100%", maxHeight: "100%", margin: 0 },
+  }, "the view is the same fullscreen overlay pi-context-view uses");
+  await settle();
+
+  const frame = frameText(overlays[0], 90);
+  assert.match(frame, /Quota/, "the view has a title row");
+  assert.match(frame, /❯ ▾ Claude/, "the cursor starts on the first section header");
+  assert.match(frame, /5h window/);
+  assert.match(frame, /Weekly window/);
+  assert.match(frame, /▾ OP-Go · 2 of 2 accounts ok/);
+  assert.match(frame, /#1\s+●\s+session/, "a multi-account provider keeps one line per account");
+  assert.match(frame, /#2\s+●\s+session/);
+  assert.match(frame, /used % · read-only/, "the panel footer is part of the view");
+  assert.equal(frame.split("\n").filter((line) => /2030-01-01T00:00:00\.000Z/.test(line)).length, 0, "the footer does not repeat the timestamp the header already prints");
+  assert.match(frame.split("\n")[0], /updated \d\d:\d\d/, "the header is the one place the update time appears");
+  assert.match(frame, /warn: one family was throttled/);
+  assert.match(frame, /↑↓\/jk move/, "the legend lists the move keys");
+  assert.match(frame, /enter\/←→\/hl fold/, "…the fold keys");
+  assert.match(frame, /pgup\/pgdn page/, "…paging");
+  assert.match(frame, /g\/G top\/end/, "…the jumps");
+  assert.match(frame, /wheel scroll/, "…the wheel");
+  assert.match(frame, /r refresh/, "…refresh");
+  assert.match(frame, /esc\/q close/, "…and every close key");
+  assert.equal(harness.widgets.length, 0, "bare /usage pins nothing above the editor");
+
+  overlays[0].component.handleInput("\u001b");
+  await pending;
+  assert.equal(overlays[0].doneCalls, 1, "Esc closes the view");
+  assert.equal(harness.widgets.length, 0, "nothing is left on screen after Esc");
+});
+
+test("the overlay folds the section under the cursor with enter, space, h/l and the arrow keys", async () => {
+  const module = await import(EXTENSION);
+  const harness = makeHarness({ report: overlayReport() });
+  module.default(harness.pi);
+  await startSession(harness, null);
+  const overlays = installOverlay(harness);
+  const usage = harness.commands.find((command) => command.name === "usage");
+  const pending = usage.definition.handler("", harness.ctx);
+  await settle();
+  const overlay = overlays[0];
+  const frame = () => frameText(overlay);
+
+  assert.match(frame(), /5h window/, "every section starts expanded");
+
+  overlay.component.handleInput("\r");
+  assert.match(frame(), /❯ ▸ Claude/, "Enter folds the section under the cursor");
+  assert.equal(/5h window/.test(frame()), false, "a folded section hides its windows");
+
+  overlay.component.handleInput(" ");
+  assert.match(frame(), /❯ ▾ Claude/, "Space unfolds it again");
+  assert.match(frame(), /5h window/);
+
+  overlay.component.handleInput("\u001b[D");
+  assert.equal(/5h window/.test(frame()), false, "left collapses");
+  overlay.component.handleInput("\u001b[C");
+  assert.match(frame(), /5h window/, "right expands");
+
+  overlay.component.handleInput("j");
+  assert.match(frame(), /❯ ▾ OP-Go/, "j moves the cursor to the next header");
+  overlay.component.handleInput("h");
+  assert.match(frame(), /❯ ▸ OP-Go/);
+  assert.equal(/#2\s+●/.test(frame()), false, "fold state is per section");
+  overlay.component.handleInput("l");
+  assert.match(frame(), /#2\s+●/);
+  assert.match(frame(), /▾ Claude/, "the other section kept its own fold state");
+
+  overlay.component.handleInput("\u001b");
+  await pending;
+});
+
+test("a fold survives closing and reopening /usage", async () => {
+  const module = await import(EXTENSION);
+  const harness = makeHarness({ report: overlayReport() });
+  module.default(harness.pi);
+  await startSession(harness, null);
+  const overlays = installOverlay(harness, { rows: 40 });
+  const usage = harness.commands.find((command) => command.name === "usage");
+
+  let pending = usage.definition.handler("", harness.ctx);
+  await settle();
+  assert.match(frameText(overlays[0]), /5h window/);
+  overlays[0].component.handleInput("\r");
+  assert.equal(/5h window/.test(frameText(overlays[0])), false, "Enter folds the section");
+  overlays[0].component.handleInput("\u001b");
+  await pending;
+
+  pending = usage.definition.handler("", harness.ctx);
+  await settle();
+  assert.equal(overlays.length, 2, "a second bare /usage builds a new view");
+  assert.match(frameText(overlays[1]), /❯ ▸ Claude/, "the fold survived the close: the section is still folded");
+  assert.equal(/5h window/.test(frameText(overlays[1])), false);
+
+  overlays[1].component.handleInput("\u001b");
+  await pending;
+});
+
+test("a host without custom components keeps the pinned panel instead of failing", async () => {
   const module = await import(EXTENSION);
   const harness = makeHarness();
   module.default(harness.pi);
+  await startSession(harness, null);
+  harness.widgets.length = 0;
+
   const usage = harness.commands.find((command) => command.name === "usage");
-  const agentStart = harness.handlers.get("agent_start");
-
   await usage.definition.handler("", harness.ctx);
-  assert.equal(typeof harness.widgets.at(-1), "function", "bare /usage shows the panel");
-  await agentStart({}, harness.ctx);
-  assert.equal(harness.widgets.at(-1), undefined, "the next prompt dismisses it");
 
-  await usage.definition.handler("", harness.ctx);
-  assert.equal(typeof harness.widgets.at(-1), "function");
-  await usage.definition.handler("", harness.ctx);
-  assert.equal(harness.widgets.at(-1), undefined, "a second bare /usage closes it");
-
-  await usage.definition.handler("panel", harness.ctx);
-  await agentStart({}, harness.ctx);
-  assert.equal(typeof harness.widgets.at(-1), "function", "/usage panel pins it across prompts");
-  await usage.definition.handler("hide", harness.ctx);
-  assert.equal(harness.widgets.at(-1), undefined);
+  assert.equal(typeof harness.widgets.at(-1), "function", "the fallback is the old pinned panel");
+  assert.match(plain(renderWidget(harness.widgets.at(-1)).join("\n")), /used % · read-only/);
+  assert.match(harness.notifications.at(-1), /no fullscreen overlay/);
 });
 
 test("no surface is pinned at session start and the footer is left alone", async () => {
@@ -701,23 +902,349 @@ test("NO_COLOR is honoured so a mono terminal stays readable", async () => {
   }
 });
 
-test("the bare command reveals the full panel and summarises used percent", async () => {
+/** A provider with enough windows to be taller than a short overlay viewport. */
+function tallProvider(count = 14) {
+  return {
+    ...structuredClone(REPORT.providers[0]),
+    windows: Array.from({ length: count }, (_, index) => ({
+      id: index === 0 ? "5h" : `w${index}`,
+      label: `window ${index + 1}`,
+      usedPercent: index * 5,
+      remainingPercent: 100 - index * 5,
+      resetsAt: null,
+      resetsInSec: 3600 + index,
+      note: null,
+    })),
+  };
+}
+
+function tallOverlayReport(count = 14) {
+  return {
+    generatedAt: "2030-01-01T00:00:00.000Z",
+    sources: [],
+    warnings: [],
+    providers: [tallProvider(count), { ...structuredClone(REPORT.providers[1]), account: "codex@example.com" }],
+  };
+}
+
+test("the overlay walks headers, scrolling a tall open section before it jumps", async () => {
   const module = await import(EXTENSION);
-  const harness = makeHarness();
+  const harness = makeHarness({ report: tallOverlayReport() });
   module.default(harness.pi);
+  await startSession(harness, null);
+  const overlays = installOverlay(harness, { rows: 12 });
   const usage = harness.commands.find((command) => command.name === "usage");
-  await usage.definition.handler("", harness.ctx);
+  const pending = usage.definition.handler("", harness.ctx);
+  await settle();
+  const overlay = overlays[0];
+  const frame = () => frameText(overlay);
+  const firstRow = () => frame().split("\n")[2];
 
-  const widget = renderWidget(harness.widgets.at(-1));
-  assert.ok(widget.length > 1, "the panel lists every window");
-  const text = plain(widget.join("\n"));
-  assert.match(text, /5h window/);
-  assert.match(text, /Weekly window/);
-  assert.match(text, /Gemini · weekly/);
-  assert.match(text, /used %/);
+  assert.equal(overlay.component.render(90).length, 12, "the overlay owns the whole terminal height");
+  assert.match(firstRow(), /❯ ▾ Claude/);
 
-  assert.ok(harness.notifications.some((message) => message.includes("Claude: 4% used")));
-  assert.ok(harness.notifications.some((message) => message.includes("OP-Go: unavailable")));
+  overlay.component.handleInput("j");
+  assert.equal(/▾ Claude/.test(frame()), false, "a section taller than the viewport scrolls one line first");
+  assert.match(frame(), /window 1 .*0\.0%/, "…so its body moves before the cursor can move on");
+
+  for (let step = 0; step < 20; step += 1) overlay.component.handleInput("j");
+  assert.match(frame(), /❯ ▾ Codex/, "past the section the cursor reaches the next header");
+
+  overlay.component.handleInput("k");
+  assert.match(frame(), /❯ ▾ Claude/);
+  for (let step = 0; step < 20; step += 1) overlay.component.handleInput("k");
+  assert.match(firstRow(), /❯ ▾ Claude/, "k at the first header scrolls back to the top and stops");
+
+  overlay.component.handleInput("G");
+  assert.match(frame(), /❯ ▾ Codex/, "End/G picks the last header");
+  assert.match(frame(), /used % · read-only/, "…and scrolls to the bottom of the view");
+  overlay.component.handleInput("g");
+  assert.match(firstRow(), /❯ ▾ Claude/, "Home/g returns to the top");
+
+  overlays[0].component.handleInput("\u001b");
+  await pending;
+});
+
+test("the overlay pages, jumps and scrolls with the wheel, and ignores other mouse events", async () => {
+  const module = await import(EXTENSION);
+  const harness = makeHarness({ report: tallOverlayReport() });
+  module.default(harness.pi);
+  await startSession(harness, null);
+  const overlays = installOverlay(harness, { rows: 12 });
+  const usage = harness.commands.find((command) => command.name === "usage");
+  const pending = usage.definition.handler("", harness.ctx);
+  await settle();
+  const overlay = overlays[0];
+  const frame = () => frameText(overlay);
+
+  assert.match(frame(), /1-7\/\d+/, "the status row reports the visible range");
+
+  overlay.component.handleInput("\u001b[6~");
+  assert.match(frame(), /8-14\/\d+/, "PgDn scrolls one page");
+  overlay.component.handleInput("\u001b[5~");
+  assert.match(frame(), /1-7\/\d+/, "PgUp scrolls back");
+
+  assert.equal(overlay.component.handleMouse({ type: "mousedown", wheelDelta: 3 }), undefined, "only wheel events are handled");
+  assert.equal(overlay.component.handleMouse({ type: "wheel", wheelDelta: 0 }), undefined, "a zero notch is not a scroll");
+  assert.deepEqual(overlay.component.handleMouse({ type: "wheel", wheelDelta: 3 }), { handled: true, render: true });
+  assert.match(frame(), /4-10\/\d+/, "the wheel scrolls by its delta");
+  overlay.component.handleMouse({ type: "wheel", wheelDelta: -100 });
+  assert.match(frame(), /1-7\/\d+/, "the wheel clamps at the top");
+
+  overlays[0].component.handleInput("\u001b");
+  await pending;
+});
+
+test("r refreshes from inside the overlay and never closes it", async () => {
+  const module = await import(EXTENSION);
+  const harness = makeHarness({ report: overlayReport() });
+  const calls = [];
+  const exec = harness.pi.exec;
+  harness.pi.exec = async (...args) => {
+    calls.push(args);
+    return exec(...args);
+  };
+  module.default(harness.pi);
+  await startSession(harness, null);
+
+  const overlays = installOverlay(harness);
+  const usage = harness.commands.find((command) => command.name === "usage");
+  const pending = usage.definition.handler("", harness.ctx);
+  await settle();
+  assert.ok(calls.some(([, argv]) => argv.includes("--force")), "bare /usage forces one refresh on open");
+
+  const baseline = calls.length;
+  overlays[0].component.handleInput("r");
+  await settle();
+  const forced = calls.slice(baseline).filter(([, argv]) => argv.includes("--force"));
+  assert.equal(forced.length, 1, "r runs another forced refresh");
+  assert.equal(overlays[0].doneCalls, 0, "r leaves the view open");
+
+  overlays[0].component.handleInput("q");
+  await pending;
+  assert.equal(overlays[0].doneCalls, 1, "q closes the view too");
+});
+
+test("the overlay fits 64 columns and rebuilds the frame after a resize", async () => {
+  const module = await import(EXTENSION);
+  const harness = makeHarness({ report: overlayReport() });
+  module.default(harness.pi);
+  await startSession(harness, null);
+  const overlays = installOverlay(harness, { rows: 30 });
+  const usage = harness.commands.find((command) => command.name === "usage");
+  const pending = usage.definition.handler("", harness.ctx);
+  await settle();
+  const overlay = overlays[0];
+
+  const wide = overlay.component.render(90);
+  const narrow = overlay.component.render(64);
+  assert.notEqual(narrow, wide, "a width change invalidates the cached frame");
+  assert.equal(narrow.length, 30, "the frame always fills the terminal height");
+  assert.ok(narrow.every((line) => plain(line).length <= 64), "no line is wider than the terminal");
+
+  const tiny = overlay.component.render(40);
+  assert.ok(tiny.every((line) => plain(line).length <= 40));
+  const legend = plain(tiny.slice(-4).join("\n"));
+  for (const keys of ["↑↓/jk", "enter/←→/hl", "pgup/pgdn", "g/G", "wheel", "r refresh", "esc/q"]) {
+    assert.ok(legend.includes(keys), `a narrow pane wraps the legend instead of dropping "${keys}"`);
+  }
+
+  overlay.tui.terminal.rows = 20;
+  const short = overlay.component.render(64);
+  assert.equal(short.length, 20, "a height change rebuilds the frame for the new terminal");
+
+  overlay.component.handleInput("\u001b");
+  await pending;
+});
+
+test("a row wider than the pane wraps at its separators instead of losing its tail", async () => {
+  const module = await import(EXTENSION);
+  const harness = makeHarness({ report: wideReport() });
+  module.default(harness.pi);
+  await startSession(harness, null);
+  const overlays = installOverlay(harness, { rows: 40 });
+  const usage = harness.commands.find((command) => command.name === "usage");
+  const pending = usage.definition.handler("", harness.ctx);
+  await settle();
+  const overlay = overlays[0];
+
+  const rendered = overlay.component.render(64);
+  assert.ok(rendered.every((line) => plain(line).length <= 64), "no line is wider than the terminal");
+  const frame = plain(rendered.join("\n"));
+  // The datum the old hard clip cut off: when the month resets.
+  assert.match(frame, /month\s+100% \(18d\)/, "the month reset survives the wrap");
+  assert.match(frame, /session\s+0% \(5h\)/, "…and the session reset on the row above it");
+  assert.match(frame, /week\s+0% \(5d\)/, "…and the weekly one");
+  assert.equal(/\u2026/.test(frame), false, "nothing is elided: the row wraps, it does not clip");
+  // A warning in the tail has no separators, so it wraps between words.
+  const rejoined = frame.split("\n").map((line) => line.trim()).join(" ");
+  assert.match(
+    rejoined,
+    /the upstream probe fell back to a cached observation while the token expires in 3 minutes/,
+    "a long warning wraps between words and loses nothing",
+  );
+
+  // The same rows must survive the pinned panel, which clips at width - 1.
+  await usage.definition.handler("panel", harness.ctx);
+  const panel = renderWidget(harness.widgets.at(-1), harness.ctx.ui.theme, 64).map(plain);
+  assert.ok(panel.every((line) => line.length <= 64), "the pinned panel wraps too");
+  assert.match(panel.join("\n"), /month\s+100% \(18d\)/);
+
+  overlay.component.handleInput("\u001b");
+  await pending;
+});
+
+test("paging a page that cannot scroll leaves the selection where it was", async () => {
+  const module = await import(EXTENSION);
+  const harness = makeHarness({ report: overlayReport() });
+  module.default(harness.pi);
+  await startSession(harness, null);
+  const overlays = installOverlay(harness, { rows: 40 });
+  const usage = harness.commands.find((command) => command.name === "usage");
+  const pending = usage.definition.handler("", harness.ctx);
+  await settle();
+  const overlay = overlays[0];
+  assert.match(frameText(overlay), /❯ ▾ Claude/, "the cursor starts on the first header");
+
+  // Every row fits, so PgUp/PgDn cannot scroll. They used to re-snap the cursor
+  // to the last visible header, moving the selection *down* on PgUp.
+  overlay.component.handleInput("\u001b[5~");
+  assert.match(frameText(overlay), /❯ ▾ Claude/, "PgUp on a page that cannot scroll does not move the cursor");
+  overlay.component.handleInput("\u001b[6~");
+  assert.match(frameText(overlay), /❯ ▾ Claude/, "…and neither does PgDn");
+  overlay.component.handleInput("j");
+  assert.match(frameText(overlay), /❯ ▾ OP-Go/, "the cursor still walks with j");
+
+  overlay.component.handleInput("\u001b");
+  await pending;
+});
+
+test("the legend balances its rows instead of orphaning the close key", async () => {
+  const module = await import(EXTENSION);
+  const harness = makeHarness({ report: overlayReport() });
+  module.default(harness.pi);
+  await startSession(harness, null);
+  const overlays = installOverlay(harness, { rows: 40 });
+  const usage = harness.commands.find((command) => command.name === "usage");
+  const pending = usage.definition.handler("", harness.ctx);
+  await settle();
+
+  const legend = legendRows(plain(overlays[0].component.render(80).join("\n")));
+  assert.equal(legend.length, 2, `the legend needs two rows at 80 columns: ${JSON.stringify(legend)}`);
+  for (const row of legend) {
+    assert.ok((row.match(/ · /g) ?? []).length >= 2, `every row carries a fair share of the pairs: ${JSON.stringify(row)}`);
+  }
+  assert.equal(legend.some((row) => /^\s*esc\/q close\s*$/.test(row)), false, "the close key is never alone on a row");
+  assert.match(legend.join(" "), /esc\/q close/, "…and it is still listed");
+
+  overlays[0].component.handleInput("\u001b");
+  await pending;
+});
+
+test("the header shows a refresh indicator, then the time the update landed", async () => {
+  const module = await import(EXTENSION);
+  const harness = makeHarness({ report: overlayReport() });
+  module.default(harness.pi);
+  await startSession(harness, null);
+  const overlays = installOverlay(harness);
+  const usage = harness.commands.find((command) => command.name === "usage");
+  const pending = usage.definition.handler("", harness.ctx);
+
+  assert.match(frameText(overlays[0]).split("\n")[0], /refreshing …/, "the refresh is visible while it runs");
+  await settle();
+  assert.match(frameText(overlays[0]).split("\n")[0], /updated \d\d:\d\d/, "the update time replaces it");
+
+  overlays[0].component.handleInput("\u001b");
+  await pending;
+});
+
+test("bare /usage paints the cached report on the first frame without waiting for the CLI", async () => {
+  const module = await import(EXTENSION);
+  const cacheHome = mkdtempSync(join(tmpdir(), "pi-quota-overlay-cache-"));
+  mkdirSync(join(cacheHome, "pi-quota"), { recursive: true });
+  const cachePath = join(cacheHome, "pi-quota", "usage.json");
+  writeFileSync(cachePath, JSON.stringify({
+    savedAt: Date.now(),
+    key: "fixture",
+    report: withFamilies(overlayReport()),
+  }), "utf-8");
+  const cachedBefore = readFileSync(cachePath, "utf-8");
+  const previousCacheHome = process.env.XDG_CACHE_HOME;
+  process.env.XDG_CACHE_HOME = cacheHome;
+  try {
+    const harness = makeHarness({ report: overlayReport() });
+    let release;
+    harness.pi.exec = () => new Promise((resolve) => {
+      release = () => resolve({ stdout: JSON.stringify(withFamilies(overlayReport())), stderr: "", code: 0 });
+    });
+    module.default(harness.pi);
+    await startSession(harness, null);
+    const overlays = installOverlay(harness);
+    const usage = harness.commands.find((command) => command.name === "usage");
+    const pending = usage.definition.handler("", harness.ctx);
+
+    const first = frameText(overlays[0]);
+    assert.match(first, /▾ Claude/, "the cached report is painted immediately");
+    assert.match(first, /5h window/, "…with its windows, not a placeholder");
+    assert.doesNotMatch(first, /loading quota/, "the CLI is not awaited before the first frame");
+    assert.match(first.split("\n")[0], /refreshing …/, "the background refresh is still announced");
+
+    release();
+    await settle();
+    assert.match(frameText(overlays[0]).split("\n")[0], /updated \d\d:\d\d/);
+    assert.equal(readFileSync(cachePath, "utf-8"), cachedBefore, "the cache is only read, never rewritten");
+
+    overlays[0].component.handleInput("\u001b");
+    await pending;
+  } finally {
+    if (previousCacheHome === undefined) delete process.env.XDG_CACHE_HOME;
+    else process.env.XDG_CACHE_HOME = previousCacheHome;
+  }
+});
+
+test("the overlay opens on a loading line and shows a refresh failure in place", async () => {
+  const module = await import(EXTENSION);
+  const harness = makeHarness({ fail: true });
+  module.default(harness.pi);
+  await startSession(harness, null);
+  const overlays = installOverlay(harness);
+  harness.widgets.length = 0;
+
+  const usage = harness.commands.find((command) => command.name === "usage");
+  const pending = usage.definition.handler("", harness.ctx);
+  assert.match(frameText(overlays[0]), /loading quota …/, "the first frame renders before the report lands");
+  await settle();
+  assert.match(frameText(overlays[0]), /! piquota exploded/, "a failed refresh is a line, not a throw");
+  assert.match(frameText(overlays[0]), /refresh failed/);
+  assert.equal(harness.widgets.length, 0, "a failed bare /usage still paints no widget");
+
+  overlays[0].component.handleInput("\u001b");
+  await pending;
+});
+
+test("the omarchy publish after a refresh never shows up as a quota failure", async () => {
+  const module = await import(EXTENSION);
+  const harness = makeHarness({ report: overlayReport() });
+  const exec = harness.pi.exec;
+  harness.pi.exec = async (runner, argv, options) => {
+    // The real `piquota omarchy` writes human text, not JSON.
+    if (argv.includes("omarchy")) return { stdout: "omarchy: wrote 3 records\n", stderr: "", code: 0 };
+    return exec(runner, argv, options);
+  };
+  module.default(harness.pi);
+  await startSession(harness, null);
+  const overlays = installOverlay(harness);
+  const usage = harness.commands.find((command) => command.name === "usage");
+  const pending = usage.definition.handler("", harness.ctx);
+  await settle();
+
+  const frame = frameText(overlays[0]);
+  assert.doesNotMatch(frame, /refresh failed/, "the advisory publish is not a quota refresh");
+  assert.doesNotMatch(frame, /not valid JSON/);
+  assert.match(frame, /▾ Claude/, "the real report still landed");
+
+  overlays[0].component.handleInput("\u001b");
+  await pending;
 });
 
 test("subcommands toggle the line, the panel, the footer and hide everything", async () => {
@@ -754,8 +1281,8 @@ test("a failing CLI reports an error instead of throwing", async () => {
   assert.match(plain(renderWidget(harness.widgets.at(-1)).join("\n")), /quota …/);
 
   const usage = harness.commands.find((command) => command.name === "usage");
-  await usage.definition.handler("", harness.ctx);
-  assert.ok(harness.notifications.some((message) => message.startsWith("Quota unavailable")));
+  await usage.definition.handler("refresh", harness.ctx);
+  assert.ok(harness.notifications.some((message) => message.startsWith("Quota refresh failed: piquota exploded")));
 });
 
 test("session_shutdown clears both the footer and the widget", async () => {
@@ -950,7 +1477,7 @@ test("when mergeLastGood restores a transient failure, the line paints the carri
   assert.match(line, /Claude:\s+○\s+4%/);
   assert.equal(line.includes("Claude:!"), false);
   const usage = harness.commands.find((command) => command.name === "usage");
-  await usage.definition.handler("", harness.ctx);
+  await usage.definition.handler("panel", harness.ctx);
   assert.match(plain(renderWidget(harness.widgets.at(-1)).join("\n")), /last known values, 1 min old/);
 });
 
@@ -975,25 +1502,6 @@ test("renderPanel footer lists notConfigured providers using the flag", async ()
   assert.match(panel, /Codex/);
   assert.match(panel, /not configured in Pi: Codex/);
   assert.equal(/not configured in Pi: Claude/.test(panel), false);
-});
-
-test("the bare /usage summary uses category captions, not the word unavailable for everything", async () => {
-  const module = await import(EXTENSION);
-  const harness = makeHarness({
-    report: {
-      generatedAt: "2030-01-01T00:00:00.000Z",
-      sources: [],
-      warnings: [],
-      providers: [{ ...structuredClone(REPORT.providers[0]), error: "token expired", ok: false, windows: [], expiresInMin: -1 }],
-    },
-  });
-  module.default(harness.pi);
-  const usage = harness.commands.find((command) => command.name === "usage");
-  await usage.definition.handler("", harness.ctx);
-
-  const summary = harness.notifications.at(-1);
-  assert.match(summary, /Claude: token expired/);
-  assert.equal(summary.includes("unavailable"), false);
 });
 
 test("the panel names the Claude store, and the line never does", async () => {
@@ -1028,7 +1536,7 @@ test("the panel names the Claude store, and the line never does", async () => {
   assert.match(line, /Claude:\s+○\s+10%/);
 
   const usage = harness.commands.find((command) => command.name === "usage");
-  await usage.definition.handler("", harness.ctx);
+  await usage.definition.handler("panel", harness.ctx);
   const panel = plain(renderWidget(harness.widgets.at(-1)).join("\n"));
   assert.match(panel, /Claude Code CLI/, "the panel says which store was read");
 });
