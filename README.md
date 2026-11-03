@@ -277,7 +277,9 @@ back. `/usage panel` still pins the same panel flat above the editor.
 
 The overlay paints on the same keystroke: it renders the report the extension
 already holds, or the on-disk report cache (`~/.cache/pi-quota/usage.json`) when
-memory is empty. It never waits for network work before the first frame. Opening
+memory is empty. That cache is keyed by the Claude source the numbers in it came
+from, so a report fetched with Pi's own OAuth is stored under Pi's key and a
+reader that asked for Claude Code is not served it. It never waits for network work before the first frame. Opening
 `/usage` refreshes only families older than their own clock (60 seconds by
 default; Claude's 300-second throttle-safe interval is preserved); `r` forces
 all enabled families. Families run independently and repaint as they finish. A
@@ -856,7 +858,7 @@ extensions/quota-panel.ts      Pi TUI line and /usage
 ## Tests
 
 ```bash
-node --test tests/*.test.mjs     # 435 tests, fake tokens only, no network
+node --test tests/*.test.mjs     # 436 tests, fake tokens only, no network
 ```
 
 Modules covered: `auth.json` parsing and de-duplication, the Claude Code store

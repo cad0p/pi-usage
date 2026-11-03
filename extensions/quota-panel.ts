@@ -53,7 +53,12 @@ const RAIL_KEY = "quota";
 const SIDEBAR_STATE_KEY = Symbol.for("gentle-pi.experimental-sidebar.state");
 const REFRESH_MS = Number(process.env.PI_QUOTA_REFRESH_MS) || 300_000;
 const AGENT_END_DEBOUNCE_MS = 1_500;
-const PI_QUOTA_CACHE_KEY = `claude-source:${normalizeClaudeSourceMode(process.env.PI_QUOTA_CLAUDE_SOURCE)}`;
+/** The report cache is keyed by the Claude source its numbers came from. */
+const CLAUDE_SOURCE_CACHE_PREFIX = "claude-source:";
+
+function cacheKeyFor(source: string): string {
+  return `${CLAUDE_SOURCE_CACHE_PREFIX}${normalizeClaudeSourceMode(source)}`;
+}
 
 type QuotaWindow = {
   id: string;
@@ -1181,11 +1186,13 @@ function reportCachePath(): string {
 }
 
 /**
- * The last report the CLI cached, read synchronously so the overlay can paint
- * on the same keystroke as /usage. Read-only, age is irrelevant for a first
- * frame, and a missing or malformed cache is simply "no cached report".
+ * The last report on disk, read synchronously so the overlay paints on the same
+ * keystroke as /usage: read-only, age is irrelevant for a first frame, and a
+ * missing or malformed cache is simply "no cached report". The key travels back
+ * with it because it names the Claude source those numbers came from, and a
+ * later partial write has to keep describing the same data.
  */
-function readCachedReport(): QuotaReport | null {
+function readCachedReport(): { report: QuotaReport; key: string | null } | null {
   try {
     const parsed = JSON.parse(readFileSync(reportCachePath(), "utf-8"));
     const report = parsed?.report;
@@ -1199,7 +1206,10 @@ function readCachedReport(): QuotaReport | null {
         if (!Number.isNaN(resetsAtMs)) window.resetsInSec = Math.max(0, Math.round((resetsAtMs - now) / 1000));
       }
     }
-    return report as QuotaReport;
+    return {
+      report: report as QuotaReport,
+      key: typeof parsed?.key === "string" ? parsed.key : null,
+    };
   } catch {
     return null;
   }
@@ -2223,6 +2233,14 @@ export default function quotaPanelExtension(pi: ExtensionAPI, dependencies: Exte
   /** gentle-pi owns the footer and truncates it from the end, so start off. */
   let statusVisible = false;
   let lastError: string | null = null;
+  /**
+   * The Claude source the report in memory actually came from. The extension
+   * forces Pi's own OAuth when Pi resolves a token, and that is a different
+   * fact from what PI_QUOTA_CLAUDE_SOURCE says: keying the cache by the setting
+   * alone stored Pi-sourced numbers under the CLI's auto/claude-code key, where
+   * the next reader asked the other question and was served them anyway.
+   */
+  let claudeSourceUsed: string | null = null;
   let disposed = false;
   /** True once the installed gentle-pi is known to paint a rail slot for this card. */
   let railMode = false;
@@ -2307,12 +2325,34 @@ export default function quotaPanelExtension(pi: ExtensionAPI, dependencies: Exte
     report = merged;
   }
 
+  /**
+   * The report in memory, or the one on disk. Reading the cache also adopts the
+   * Claude source its key names, so a codex-only write keeps describing the
+   * Claude numbers the file already holds.
+   */
+  function ensureReport(): QuotaReport | null {
+    if (report) return report;
+    const cached = readCachedReport();
+    if (!cached) return null;
+    const stored = cached.key?.startsWith(CLAUDE_SOURCE_CACHE_PREFIX)
+      ? cached.key.slice(CLAUDE_SOURCE_CACHE_PREFIX.length)
+      : null;
+    if (stored) claudeSourceUsed = normalizeClaudeSourceMode(stored);
+    report = cached.report;
+    return report;
+  }
+
+  /** The key this report belongs under: the source it used, not the setting. */
+  function cacheKey(): string {
+    return cacheKeyFor(claudeSourceUsed ?? process.env.PI_QUOTA_CLAUDE_SOURCE ?? "");
+  }
+
   function persistReport(): void {
     if (!report) return;
     // Every family keeps the clock it was fetched on: this report is written one
     // family at a time, and stamping the whole file with "now" made Claude's
     // five-minute-old numbers look as fresh as the Codex ones saved beside them.
-    writeCache(report as any, { key: PI_QUOTA_CACHE_KEY, fetchedAtMs: readRefreshState().fetchedAtMs });
+    writeCache(report as any, { key: cacheKey(), fetchedAtMs: readRefreshState().fetchedAtMs });
   }
 
   function updateFamilyClock(family: string): void {
@@ -2399,6 +2439,7 @@ export default function quotaPanelExtension(pi: ExtensionAPI, dependencies: Exte
           : process.env;
         const fragment = await loadFamily(family, { force, authOverrides, env, localStats: false } as any);
         if (disposed) return false;
+        if (family === "claude") claudeSourceUsed = normalizeClaudeSourceMode(env.PI_QUOTA_CLAUDE_SOURCE);
         const stickyFragment = mergeLastGood(fragment as any, {}).report as QuotaReport;
         mergeFamilyReport(stickyFragment);
         updateFamilyClock(family);
@@ -2576,7 +2617,7 @@ export default function quotaPanelExtension(pi: ExtensionAPI, dependencies: Exte
 
   async function refresh(ctx: UiContext, force: boolean): Promise<void> {
     if (disposed) return;
-    if (!report) report = readCachedReport();
+    report = ensureReport();
     const families = enabledFamilies({ env: process.env, requested: FAMILIES });
     const now = Date.now();
     const fetchedAtMs = { ...readRefreshState().fetchedAtMs };
@@ -2705,7 +2746,7 @@ export default function quotaPanelExtension(pi: ExtensionAPI, dependencies: Exte
     // Paint on the same keystroke: the report already in memory, otherwise the
     // on-disk cache. Only stale families refresh behind the overlay; the first
     // frame never waits for the network.
-    if (!report) report = readCachedReport();
+    report = ensureReport();
     const custom = ctx.ui.custom;
     if (typeof custom !== "function" || (ctx.mode !== undefined && ctx.mode !== "tui")) {
       // A host without custom components still gets the panel that /usage panel pins.
@@ -2713,7 +2754,7 @@ export default function quotaPanelExtension(pi: ExtensionAPI, dependencies: Exte
       lineVisible = false;
       boxVisible = false;
       explicitBox = false;
-      if (!report) report = readCachedReport();
+      report = ensureReport();
       void refresh(ctx, false);
       ensurePolling(ctx);
       paintUi(ctx);
@@ -2777,7 +2818,7 @@ export default function quotaPanelExtension(pi: ExtensionAPI, dependencies: Exte
         boxVisible = false;
         explicitBox = false;
         panelVisible = false;
-        if (!report) report = readCachedReport();
+        report = ensureReport();
         if (!report) await refresh(ctx, false);
         else void refresh(ctx, false);
         ensurePolling(ctx);
@@ -2789,7 +2830,7 @@ export default function quotaPanelExtension(pi: ExtensionAPI, dependencies: Exte
         lineVisible = false;
         boxVisible = false;
         explicitBox = false;
-        if (!report) report = readCachedReport();
+        report = ensureReport();
         if (!report) await refresh(ctx, false);
         else void refresh(ctx, false);
         ensurePolling(ctx);
@@ -2801,7 +2842,7 @@ export default function quotaPanelExtension(pi: ExtensionAPI, dependencies: Exte
         boxVisible = true;
         explicitBox = true;
         panelVisible = false;
-        if (!report) report = readCachedReport();
+        report = ensureReport();
         if (!report) await refresh(ctx, false);
         else void refresh(ctx, false);
         ensurePolling(ctx);

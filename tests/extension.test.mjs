@@ -1529,6 +1529,34 @@ test("the extension resolves Claude and Codex auth through Pi without caching to
   assert.equal(cache.includes(codexToken), false);
 });
 
+test("the cache is keyed by the Claude source the extension actually used", async () => {
+  const module = await import(EXTENSION);
+  const previous = process.env.PI_QUOTA_CLAUDE_SOURCE;
+  // The CLI setting says "prefer Claude Code", but Pi's own OAuth is resolved and
+  // the extension forces Claude to `pi` for that fetch. The cache has to say so.
+  process.env.PI_QUOTA_CLAUDE_SOURCE = "claude-code";
+  try {
+    const harness = makeHarness({ report: overlayReport() });
+    harness.dependencies.getProviderAuth = async () => ({ auth: { apiKey: "fixture-claude-oauth-token" }, source: "OAuth" });
+    module.default(harness.pi);
+    await startSession(harness, null);
+    await harness.commands.find((command) => command.name === "usage").definition.handler("refresh", harness.ctx);
+
+    const cachePath = join(harness.cacheHome, "pi-quota", "usage.json");
+    const cache = JSON.parse(readFileSync(cachePath, "utf8"));
+    assert.equal(cache.key, "claude-source:pi", "Pi-sourced numbers are stored under Pi's key");
+    assert.equal(
+      readCache({ path: cachePath, now: Date.now(), ttlMs: Number.POSITIVE_INFINITY, key: "claude-source:claude-code" }),
+      null,
+      "a reader that asked for Claude Code is not served Pi's numbers",
+    );
+    assert.ok(readCache({ path: cachePath, now: Date.now(), ttlMs: Number.POSITIVE_INFINITY, key: "claude-source:pi" }));
+  } finally {
+    if (previous === undefined) delete process.env.PI_QUOTA_CLAUDE_SOURCE;
+    else process.env.PI_QUOTA_CLAUDE_SOURCE = previous;
+  }
+});
+
 test("the overlay opens on a loading line and shows a refresh failure in place", async () => {
   const module = await import(EXTENSION);
   const harness = makeHarness({ fail: true });
