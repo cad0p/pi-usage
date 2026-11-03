@@ -1235,6 +1235,18 @@ function capCause(cause: string): string {
   return cause.length > 160 ? `${cause.slice(0, 157)}…` : cause;
 }
 
+/** Append warnings that are not already there: a repeated scan repeats its notes. */
+function mergeWarnings(existing: string[], added: string[] | undefined): string[] {
+  const seen = new Set(existing);
+  const merged = [...existing];
+  for (const warning of added ?? []) {
+    if (typeof warning !== "string" || warning === "" || seen.has(warning)) continue;
+    seen.add(warning);
+    merged.push(warning);
+  }
+  return merged;
+}
+
 /** Local YYYY-MM-DD, the history's day key. */
 function localDayKey(now = new Date()): string {
   return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
@@ -2181,6 +2193,13 @@ export default function quotaPanelExtension(pi: ExtensionAPI, dependencies: Exte
   let localStatsInFlight: Promise<void> | null = null;
   let localStatsScan: LocalStatsScan | null = null;
   let localStatsResult: Awaited<LocalStatsScan["result"]> | null = null;
+  /**
+   * The notes the scan produced (its own warnings, or the one line a failure
+   * becomes). They live here, not only in the report, because the scan can
+   * finish before the first family does: it is the report that is late then,
+   * not the warning.
+   */
+  let localStatsWarnings: string[] = [];
   let timer: ReturnType<typeof setInterval> | null = null;
   let agentEndTimer: ReturnType<typeof setTimeout> | null = null;
   let panelVisible = false;
@@ -2276,6 +2295,7 @@ export default function quotaPanelExtension(pi: ExtensionAPI, dependencies: Exte
     const merged = mergeReportIntoCache(prior, fragment as any) as QuotaReport;
     merged.localStats = localStatsResult?.byFamily ?? prior?.localStats ?? fragment.localStats ?? {};
     merged.localStatsMeta = localStatsResult?.scan ?? prior?.localStatsMeta ?? fragment.localStatsMeta ?? null;
+    merged.warnings = mergeWarnings(merged.warnings ?? [], localStatsWarnings);
     const families = enabledFamilies({ env: process.env, requested: FAMILIES });
     const ordering = [...families, ...Object.keys(merged.byFamily).filter((family) => !families.includes(family))];
     merged.providers = ordering.flatMap((family) => merged.providers.filter((provider) => provider.family === family));
@@ -2305,8 +2325,17 @@ export default function quotaPanelExtension(pi: ExtensionAPI, dependencies: Exte
       .then((result) => {
         if (disposed) return;
         localStatsResult = result;
+        // The scan's own notes (a corrupt cache, an unreadable file) are part of
+        // the report the CLI already publishes; dropping them here made the same
+        // scan quieter inside Pi than in the terminal.
+        localStatsWarnings = result.warnings ?? [];
         if (report) {
-          report = { ...report, localStats: result.byFamily, localStatsMeta: result.scan };
+          report = {
+            ...report,
+            localStats: result.byFamily,
+            localStatsMeta: result.scan,
+            warnings: mergeWarnings(report.warnings, localStatsWarnings),
+          };
           persistReport();
           if (surfaceActive()) paintUi(ctx);
           try {
@@ -2317,8 +2346,18 @@ export default function quotaPanelExtension(pi: ExtensionAPI, dependencies: Exte
           overlayView?.redraw();
         }
       })
-      .catch(() => {
-        // The scan is optional; a worker failure never delays or erases quotas.
+      .catch((error: { name?: string; message?: string }) => {
+        // The scan is optional, so a failure never delays or erases quotas — but
+        // it is not the same as a scan that found nothing. The CLI reports a
+        // failed scan as one warning line; a swallowed worker error meant a
+        // crash in the scanner looked exactly like an empty token history.
+        if (disposed || error?.name === "AbortError") return;
+        const cause = capCause(redactCause(error?.message ?? String(error)).split("\n")[0]);
+        localStatsWarnings = mergeWarnings(localStatsWarnings, [`local token stats: ${cause}`]);
+        if (!report) return;
+        report = { ...report, warnings: mergeWarnings(report.warnings, localStatsWarnings) };
+        if (surfaceActive()) paintUi(ctx);
+        overlayView?.redraw();
       })
       .finally(() => {
         if (localStatsScan === scan) localStatsScan = null;

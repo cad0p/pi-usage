@@ -1589,6 +1589,46 @@ test("PI_QUOTA_LOCAL_STATS=0 disables the extension's worker scan", async () => 
   }
 });
 
+test("a failed local-stats scan is a warning in the report, not silence", async () => {
+  const module = await import(EXTENSION);
+  const harness = makeHarness({ report: overlayReport() });
+  let scans = 0;
+  harness.dependencies.startLocalStats = () => {
+    scans += 1;
+    return scanHandle(new Error("the worker thread failed"));
+  };
+  module.default(harness.pi);
+  await startSession(harness, null);
+  await harness.commands.find((command) => command.name === "usage").definition.handler("panel", harness.ctx);
+  await settle();
+
+  assert.equal(scans, 1);
+  const panel = plain(renderWidget(harness.widgets.at(-1)).join("\n"));
+  assert.match(
+    panel,
+    /warn: local token stats: the worker thread failed/,
+    "a scanner crash reads like the CLI's failed-scan warning, not like a user with no sessions",
+  );
+  assert.match(panel, /Claude/, "and the quota rows are untouched by it");
+});
+
+test("the scan's own warnings reach the report the surfaces read", async () => {
+  const module = await import(EXTENSION);
+  const harness = makeHarness({ report: overlayReport() });
+  harness.dependencies.startLocalStats = () => scanHandle({
+    byFamily: {},
+    warnings: ["local token stats: could not read /tmp/sessions/broken.jsonl: EACCES"],
+    scan: { partial: false },
+  });
+  module.default(harness.pi);
+  await startSession(harness, null);
+  await harness.commands.find((command) => command.name === "usage").definition.handler("panel", harness.ctx);
+  await settle();
+
+  const panel = plain(renderWidget(harness.widgets.at(-1)).join("\n"));
+  assert.match(panel, /warn: local token stats: could not read/, "the scan's notes are part of the report");
+});
+
 test("subcommands toggle the line, the panel, the footer and hide everything", async () => {
   const module = await import(EXTENSION);
   const harness = makeHarness();
