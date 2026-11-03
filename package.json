@@ -1,6 +1,6 @@
 {
   "name": "@cad0p/pi-usage",
-  "version": "0.11.4",
+  "version": "0.11.5",
   "publishConfig": {
     "access": "public"
   },
