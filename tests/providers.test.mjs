@@ -95,6 +95,7 @@ test("antigravity: labels multi-group buckets and always sends the CLI user agen
 
   const result = await fetchAntigravity(credential, { now: NOW, fetchFn, refresh: false });
   assert.equal(result.ok, true);
+  assert.equal(result.account, "fixture@example.com · fixture-…", "an account with an identity keeps the project beside it");
   const labels = result.windows.map((window) => window.label);
   assert.equal(labels.some((label) => label.startsWith("Gemini · ")), true);
   assert.equal(labels.some((label) => label.startsWith("Claude/GPT · ")), true);
@@ -108,6 +109,101 @@ test("antigravity: labels multi-group buckets and always sends the CLI user agen
   const headers = /** @type {Record<string, string>} */ (calls[0].init.headers);
   assert.match(headers["User-Agent"], /^antigravity\/cli\//);
   assert.equal(JSON.parse(/** @type {string} */ (calls[0].init.body)).project, "fixture-project");
+});
+
+test("antigravity: the project prints once and a token renewed in memory is not expired", async () => {
+  const { fetchFn, calls } = routedFetch([
+    ["oauth2.googleapis.com", () => jsonResponse({ access_token: "ya29.RENEWED", expires_in: 3600 })],
+    ["cloudcode", () => jsonResponse(antigravityUsageBody())],
+  ]);
+  // Pi's stored copy: no e-mail, so the project id is the whole identity, and an
+  // access token that expired long ago. pi-usage renews it in memory for the run.
+  const credential = normalizeCredential("antigravity", {
+    type: "oauth",
+    access: "ya29.STALE",
+    refresh: "1//FAKE",
+    projectId: "rising-fixture-project",
+    expires: 1_700_000_000_000,
+  }, "/tmp/auth.json");
+  assert.ok(credential);
+
+  const result = await fetchAntigravity(credential, {
+    now: NOW,
+    fetchFn,
+    expiresInMin: -271_316,
+    refresh: true,
+    env: { ANTIGRAVITY_CLIENT_ID: "id-fixture", ANTIGRAVITY_CLIENT_SECRET: "secret-fixture" },
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.account, "project rising-f…", "the project id is one identity, so it prints once");
+  assert.equal(result.expiresInMin, null, "the token this run used was renewed, so nothing is expiring");
+  assert.equal(result.tokenRenewedInMemory, true);
+  const quota = calls.find((call) => call.url.includes("retrieveUserQuotaSummary"));
+  assert.ok(quota);
+  assert.equal(quota.init.headers.Authorization, "Bearer ya29.RENEWED", "the request used the renewed token");
+  assert.equal(JSON.parse(/** @type {string} */ (quota.init.body)).project, "rising-fixture-project");
+});
+
+test("antigravity: a renewal that failed keeps the credential's expiry warning", async () => {
+  const { fetchFn } = routedFetch([
+    ["oauth2.googleapis.com", () => jsonResponse({ error: "invalid_grant" }, { status: 400 })],
+    ["cloudcode", () => jsonResponse({ error: { code: 401, message: "Request had invalid authentication credentials" } }, { status: 401 })],
+  ]);
+  const credential = normalizeCredential("antigravity", {
+    type: "oauth",
+    access: "ya29.STALE",
+    refresh: "1//FAKE",
+    projectId: "rising-fixture-project",
+    expires: 1_700_000_000_000,
+  }, "/tmp/auth.json");
+  assert.ok(credential);
+
+  const result = await fetchAntigravity(credential, {
+    now: NOW,
+    fetchFn,
+    expiresInMin: -271_316,
+    refresh: true,
+    env: { ANTIGRAVITY_CLIENT_ID: "id-fixture", ANTIGRAVITY_CLIENT_SECRET: "secret-fixture" },
+  });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.account, "project rising-f…", "the same one-line identity on the failure path");
+  assert.equal(result.expiresInMin, -271_316, "nothing was renewed, so the expiry claim stays");
+  assert.equal(result.tokenRenewedInMemory, undefined, "no renewal claim when the renewal failed");
+  assert.match(result.error ?? "", /Antigravity token rejected|quota request failed/);
+});
+
+test("antigravity: a renewal that succeeded still marks a failing result as renewed", async () => {
+  // The renewal worked, then the quota call failed for its own reason. The
+  // stored credential's expiry is still stale, so the result must keep saying
+  // that this run used a renewed token — otherwise every surface falls back to
+  // "token expired" as the explanation of an unrelated failure.
+  const { fetchFn } = routedFetch([
+    ["oauth2.googleapis.com", () => jsonResponse({ access_token: "ya29.RENEWED", expires_in: 3600 })],
+    ["cloudcode", () => jsonResponse({ error: { code: 500, message: "backend error" } }, { status: 500 })],
+  ]);
+  const credential = normalizeCredential("antigravity", {
+    type: "oauth",
+    access: "ya29.STALE",
+    refresh: "1//FAKE",
+    projectId: "rising-fixture-project",
+    expires: 1_700_000_000_000,
+  }, "/tmp/auth.json");
+  assert.ok(credential);
+
+  const result = await fetchAntigravity(credential, {
+    now: NOW,
+    fetchFn,
+    expiresInMin: -271_316,
+    refresh: true,
+    env: { ANTIGRAVITY_CLIENT_ID: "id-fixture", ANTIGRAVITY_CLIENT_SECRET: "secret-fixture" },
+  });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.expiresInMin, null, "the token in hand is fresh, whatever the call said");
+  assert.equal(result.tokenRenewedInMemory, true, "the renewed-token claim survives the failure path");
+  assert.match(result.error ?? "", /Antigravity quota request failed/);
 });
 
 test("antigravity: the license 403 becomes an actionable message", async () => {

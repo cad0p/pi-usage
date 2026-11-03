@@ -949,8 +949,12 @@ const HISTORY_TOTALS = {
       activeDates: ["2026-10-01", "2026-10-02"],
       totalPrompts: 6,
       totalSessions: 2,
+      // The family rollup is the sum of its accounts and of the frozen days in
+      // HISTORY_OCTOBER: an inconsistent fixture would look like the degraded
+      // state that withholds the all-time figure.
       modelUsage: {
-        "claude-opus-5-5": { input: 1_000, output: 200, cacheRead: 0, cacheWrite: 0 },
+        "claude-opus-5-5": { input: 1_800, output: 0, cacheRead: 0, cacheWrite: 0 },
+        "claude-sonnet-5": { input: 200, output: 0, cacheRead: 0, cacheWrite: 0 },
       },
       accounts: {
         "": { totalPrompts: 6, totalSessions: 2, modelUsage: { "claude-opus-5-5": { input: 2_000 } } },
@@ -1723,10 +1727,11 @@ test("tab opens the read-only history for the newest month", async () => {
 
   const frame = frameText(overlays[0], 100);
   assert.match(frame.split("\n")[0], /Quota · History · 2026-10/);
-  assert.match(frame, /▾ Claude \(Pi\) · 2\.0k in 2026-10 · 1\.2k all-time · 6 prompts/);
+  assert.match(frame, /▾ Claude \(Pi\) · 2\.0k in 2026-10 · 2\.0k all-time/);
   assert.match(frame, /days +10-01 1\.2k · 10-02 800/, "a month lists its frozen days");
   assert.match(frame, /models +claude-opus-5-5 1\.8k · claude-sonnet-5 200/, "…and its token split by model");
-  assert.match(frame, /▾ OP-Go · 3\.0k in 2026-10 · 3\.0k all-time · 6 prompts/);
+  assert.match(frame, /▾ OP-Go · 3\.0k in 2026-10 · 3\.0k all-time/);
+  assert.match(frame, /prompts +6 in 2026-10 · 6 all-time/, "the prompt counts carry the month and the all-time scope");
   assert.match(frame, /^ +month 1\.0k · all-time 1\.0k · deepseek-v4\.1-flash$/m, "the base account row is blank");
   assert.match(frame, /#2 +month 2\.0k · all-time 2\.0k · deepseek-v4\.1-flash/);
   assert.equal(/#1\b/.test(frame), false, "history never invents a base number");
@@ -2011,8 +2016,10 @@ test("a report generated before midnight is not merged into today", async (t) =>
 
   const open = await openHistory(frozen);
   const frame = frameText(open.overlays[0], 120);
-  assert.match(frame, /Claude \(Pi\) · 999 in 2026-11 · 3 prompts/, "the frozen 11-02 is counted once, prompts included");
+  assert.match(frame, /Claude \(Pi\) · 999 in 2026-11(?! ·)/, "the frozen 11-02 is counted once");
   assert.match(frame, /days +11-02 999/);
+  assert.match(frame, /prompts +3 in 2026-11 *$/m, "…prompts included");
+  assert.equal(/all-time/.test(frame), false, "a skipped report adds nothing to all-time either");
   assert.doesNotMatch(frame, /days .*11-03/, "yesterday's totals are never painted under today's key");
   assert.doesNotMatch(frame, /comes from the live report/, "no merge happened, so no merge note");
   assert.match(frame, /the live report is from 2026-11-02; 2026-11-03 is not merged/);
@@ -2063,8 +2070,10 @@ test("the cached report's older day is not merged into today either", async (t) 
   await settle();
 
   const frame = frameText(overlays[0], 120);
-  assert.match(frame, /Claude \(Pi\) · 1\.5k in 2026-11 · 4 prompts/, "a 11-01 cache does not add itself to 11-03");
+  assert.match(frame, /Claude \(Pi\) · 1\.5k in 2026-11(?! ·)/, "a 11-01 cache does not add itself to 11-03");
   assert.match(frame, /days +11-01 1\.5k/);
+  assert.match(frame, /prompts +4 in 2026-11 *$/m);
+  assert.equal(/all-time/.test(frame), false, "an older report never reaches the all-time rollup");
   assert.doesNotMatch(frame, /days .*11-03/);
   assert.match(frame, /the live report is from 2026-11-01; 2026-11-03 is not merged/);
 
@@ -2416,6 +2425,161 @@ test("one family frozen today does not drop another family's live day", async (t
   await pending;
 });
 
+test("today's live day counts in the all-time figures once, prompts included", async (t) => {
+  const module = await import(EXTENSION);
+  t.mock.timers.enable({ apis: ["Date"], now: new Date(2026, 10, 15, 12, 0, 0) });
+  const month = "2026-11";
+  const report = liveReport({
+    localStats: {
+      claude: {
+        hasLocalStats: true,
+        todayTotalTokens: 500,
+        todayPrompts: 2,
+        todayTokensByModel: { "claude-opus-5-5": 500 },
+        byAccount: { "": { todayTokens: 500, todayPrompts: 2, todayTokensByModel: { "claude-opus-5-5": 500 } } },
+      },
+    },
+  });
+  const days = {
+    "2026-11-01": {
+      claude: { tokens: 400, prompts: 1, slots: { "": { tokens: 400, prompts: 1, models: { "claude-opus-5-5": { tokens: 400, messages: 1 } } } } },
+    },
+  };
+  const totals = {
+    lastFrozenDay: "2026-11-01",
+    families: {
+      claude: {
+        totalPrompts: 1,
+        modelUsage: { "claude-opus-5-5": { input: 400 } },
+        accounts: { "": { totalPrompts: 1, modelUsage: { "claude-opus-5-5": { input: 400 } } } },
+      },
+    },
+  };
+  const harness = makeHarness({ report });
+  routeHistory(harness, [month], { [month]: historyPayload(month, [month], { days, totals }) });
+  module.default(harness.pi);
+  await startSession(harness, null);
+  const overlays = installOverlay(harness, { rows: 40 });
+  const usage = harness.commands.find((command) => command.name === "usage");
+  const pending = usage.definition.handler("", harness.ctx);
+  await settle();
+  overlays[0].component.handleInput("	");
+  await settle();
+
+  const frame = frameText(overlays[0], 100);
+  const merged = 400 + 500;
+  assert.match(
+    frame,
+    /▾ Claude \(Pi\) · 900 in 2026-11 · 900 all-time/,
+    "the open day is part of all time, not only of the month: 4.9M all-time under a 40.2M month is the bug",
+  );
+  assert.match(frame, /days +11-01 400 · 11-15 500/, "and the day row still holds it once");
+  assert.match(frame, /prompts +3 in 2026-11 · 3 all-time/, "today's prompts reach both counters once");
+  assert.equal(frame.includes(String(merged * 2)), false, "nothing is counted twice");
+
+  overlays[0].component.handleInput("\u001b");
+  await pending;
+});
+
+test("an all-time rollup that lags the month is printed with a note, never dropped", async (t) => {
+  const module = await import(EXTENSION);
+  t.mock.timers.enable({ apis: ["Date"], now: new Date(2026, 10, 15, 12, 0, 0) });
+  const month = "2026-11";
+  const days = {
+    "2026-11-01": {
+      "opencode-go": {
+        tokens: 2_000,
+        prompts: 4,
+        slots: { "2": { tokens: 2_000, prompts: 4, models: { "deepseek-v4.1-flash": { tokens: 2_000, messages: 4 } } } },
+      },
+    },
+  };
+  // The month file ahead of the rollup: a freeze whose totals write failed
+  // (history.js says so and points at --rebuild-totals), or a restored month.
+  // All time can never be smaller than one of its months, so this rollup lags.
+  const totals = {
+    lastFrozenDay: "2026-11-01",
+    families: {
+      "opencode-go": {
+        totalPrompts: 2,
+        modelUsage: { "deepseek-v4.1-flash": { input: 1_000 } },
+        // Both keys, so the family renders its account rows at all: the base
+        // entry is idle, and #2's rollup lags its own month exactly as the
+        // family's does.
+        accounts: {
+          "": { totalPrompts: 0, modelUsage: {} },
+          "#2": { totalPrompts: 2, modelUsage: { "deepseek-v4.1-flash": { input: 1_000 } } },
+        },
+      },
+    },
+  };
+  const harness = makeHarness({ report: overlayReport() });
+  routeHistory(harness, [month], { [month]: historyPayload(month, [month], { days, totals }) });
+  module.default(harness.pi);
+  await startSession(harness, null);
+  const overlays = installOverlay(harness, { regions: 40, rows: 40 });
+  const usage = harness.commands.find((command) => command.name === "usage");
+  const pending = usage.definition.handler("", harness.ctx);
+  await settle();
+  overlays[0].component.handleInput("\t");
+  await settle();
+
+  const frame = frameText(overlays[0], 100);
+  assert.match(frame, /▾ OP-Go · 2\.0k in 2026-11 · 1\.0k all-time/, "the lagging figure is printed, dimmed under the month");
+  assert.match(frame, /prompts +4 in 2026-11 · 2 all-time/, "…and so is its prompt count");
+  assert.match(frame, /#2 +month 2\.0k · all-time 1\.0k · deepseek-v4\.1-flash/, "…and each account's");
+  assert.match(
+    frame,
+    /~ all-time lags this month; run piquota stats --rebuild-totals/,
+    "a figure that cannot cover the month is explained, never hidden",
+  );
+
+  overlays[0].component.handleInput("\u001b");
+  await pending;
+});
+
+test("a consistent rollup prints without the lag note, account rows included", async (t) => {
+  const module = await import(EXTENSION);
+  t.mock.timers.enable({ apis: ["Date"], now: new Date(2026, 10, 15, 12, 0, 0) });
+  const month = "2026-11";
+  const days = {
+    "2026-11-01": {
+      "opencode-go": {
+        tokens: 2_000,
+        prompts: 4,
+        slots: { "2": { tokens: 2_000, prompts: 4, models: { "deepseek-v4.1-flash": { tokens: 2_000, messages: 4 } } } },
+      },
+    },
+  };
+  const totals = {
+    lastFrozenDay: "2026-11-01",
+    families: {
+      "opencode-go": {
+        totalPrompts: 4,
+        modelUsage: { "deepseek-v4.1-flash": { input: 2_000 } },
+        accounts: { "#2": { totalPrompts: 4, modelUsage: { "deepseek-v4.1-flash": { input: 2_000 } } } },
+      },
+    },
+  };
+  const harness = makeHarness({ report: overlayReport() });
+  routeHistory(harness, [month], { [month]: historyPayload(month, [month], { days, totals }) });
+  module.default(harness.pi);
+  await startSession(harness, null);
+  const overlays = installOverlay(harness, { rows: 40 });
+  const usage = harness.commands.find((command) => command.name === "usage");
+  const pending = usage.definition.handler("", harness.ctx);
+  await settle();
+  overlays[0].component.handleInput("\t");
+  await settle();
+
+  const frame = frameText(overlays[0], 100);
+  assert.match(frame, /▾ OpenCode Go \(Pi\) · 2\.0k in 2026-11 · 2\.0k all-time/);
+  assert.equal(/rebuild-totals/.test(frame), false, "a rollup that covers the month has nothing to explain");
+
+  overlays[0].component.handleInput("\u001b");
+  await pending;
+});
+
 test("the merged live day carries each account's own models", async (t) => {
   const module = await import(EXTENSION);
   t.mock.timers.enable({ apis: ["Date"], now: new Date(2026, 10, 15, 12, 0, 0) });
@@ -2468,7 +2632,7 @@ test("the merged live day carries each account's own models", async (t) => {
   await settle();
 
   const frame = frameText(overlays[0], 100);
-  assert.match(frame, /^ +month 500 · all-time 500 · deepseek-v4\.1-flash$/m, "the merged day names the model that burned it");
+  assert.match(frame, /^ +month 500 · all-time 1\.0k · deepseek-v4\.1-flash$/m, "the merged day names the model that burned it, and its tokens reach that account's all-time total");
   assert.match(frame, /#2 +month 2\.0k · all-time 2\.0k · deepseek-v4\.1-flash/);
 
   overlays[0].component.handleInput("\u001b");

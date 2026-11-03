@@ -1036,8 +1036,32 @@ type HistoryFamily = {
   models: Map<string, number>;
   accounts: Map<string, { tokens: number; prompts: number; models: Map<string, number> }>;
   allTime: number;
-  allTimeAccounts: Map<string, number>;
+  allTimePrompts: number;
+  allTimeAccounts: Map<string, { tokens: number; prompts: number }>;
+  /** The live day's delta, added to both the month and the all-time figures. */
+  liveTokens: number;
+  livePrompts: number;
+  liveAccounts: Map<string, { tokens: number; prompts: number }>;
 };
+
+/** An all-time figure, and whether the rollup behind it lags the month on screen. */
+type AllTimeFigure = { value: number; lags: boolean };
+
+/**
+ * The all-time figure for one scope. All time contains every frozen day, so it
+ * can never be smaller than a month of it: a smaller rollup means totals.json is
+ * behind the month file — a freeze whose totals write failed, a month restored
+ * behind the rollup. That is printed, dimmed and with a note, never hidden: the
+ * figure is the only answer to "how much has this burned ever", and dropping it
+ * silently is a worse lie than a number with a caveat.
+ */
+function allTimeFigure(month: number, allTime: number): AllTimeFigure {
+  if (allTime <= 0) return { value: 0, lags: false };
+  return { value: allTime, lags: allTime < month };
+}
+
+/** The note printed with an all-time figure that cannot cover the month on screen. */
+const ALL_TIME_LAGS_NOTE = "all-time lags this month; run piquota stats --rebuild-totals";
 
 /**
  * What outlives one overlay instance. Every bare `/usage` builds a fresh view,
@@ -1819,7 +1843,19 @@ export class UsageOverlay {
     const ensure = (family: string): HistoryFamily => {
       let entry = families.get(family);
       if (!entry) {
-        entry = { tokens: 0, prompts: 0, days: new Map(), models: new Map(), accounts: new Map(), allTime: 0, allTimeAccounts: new Map() };
+        entry = {
+          tokens: 0,
+          prompts: 0,
+          days: new Map(),
+          models: new Map(),
+          accounts: new Map(),
+          allTime: 0,
+          allTimePrompts: 0,
+          allTimeAccounts: new Map(),
+          liveTokens: 0,
+          livePrompts: 0,
+          liveAccounts: new Map(),
+        };
         families.set(family, entry);
       }
       return entry;
@@ -1884,6 +1920,10 @@ export class UsageOverlay {
         const entry = ensure(family);
         entry.tokens += tokens;
         entry.prompts += prompts;
+        // Kept apart from the frozen month: the all-time figures add this same
+        // delta below, and a live day may only ever be counted once in each.
+        entry.liveTokens += tokens;
+        entry.livePrompts += prompts;
         entry.days.set(today, (entry.days.get(today) ?? 0) + tokens);
         for (const [model, modelTokens] of Object.entries(familyStats.todayTokensByModel ?? {})) {
           entry.models.set(model, (entry.models.get(model) ?? 0) + Math.max(0, Math.round(Number(modelTokens) || 0)));
@@ -1891,8 +1931,12 @@ export class UsageOverlay {
         for (const [rawLabel, account] of Object.entries(familyStats.byAccount ?? {})) {
           const label = rawLabel === "#1" ? "" : rawLabel;
           const target = entry.accounts.get(label) ?? { tokens: 0, prompts: 0, models: new Map<string, number>() };
-          target.tokens += Math.max(0, Math.round(Number(account?.todayTokens) || 0));
-          target.prompts += Math.max(0, Math.round(Number(account?.todayPrompts) || 0));
+          const accountTokens = Math.max(0, Math.round(Number(account?.todayTokens) || 0));
+          const accountPrompts = Math.max(0, Math.round(Number(account?.todayPrompts) || 0));
+          target.tokens += accountTokens;
+          target.prompts += accountPrompts;
+          const liveAccount = entry.liveAccounts.get(label) ?? { tokens: 0, prompts: 0 };
+          entry.liveAccounts.set(label, { tokens: liveAccount.tokens + accountTokens, prompts: liveAccount.prompts + accountPrompts });
           // The account's own models for today: without them the merged row
           // shows a month total and no model, which reads as "no usage".
           for (const [model, modelTokens] of Object.entries(account?.todayTokensByModel ?? {})) {
@@ -1906,10 +1950,33 @@ export class UsageOverlay {
     for (const [family, totals] of Object.entries(payload.totals?.families ?? {})) {
       const entry = ensure(family);
       entry.allTime = Object.values(totals?.modelUsage ?? {}).reduce((sum, bucket) => sum + totalsModelTokens(bucket), 0);
+      entry.allTimePrompts = Math.max(0, Math.round(Number(totals?.totalPrompts) || 0));
       for (const [rawLabel, account] of Object.entries(totals?.accounts ?? {})) {
         const label = rawLabel === "#1" ? "" : rawLabel;
         const tokens = Object.values(account?.modelUsage ?? {}).reduce((sum, bucket) => sum + totalsModelTokens(bucket), 0);
-        entry.allTimeAccounts.set(label, (entry.allTimeAccounts.get(label) ?? 0) + tokens);
+        const prompts = Math.max(0, Math.round(Number(account?.totalPrompts) || 0));
+        const seen = entry.allTimeAccounts.get(label) ?? { tokens: 0, prompts: 0 };
+        entry.allTimeAccounts.set(label, { tokens: seen.tokens + tokens, prompts: seen.prompts + prompts });
+      }
+    }
+
+    // Today's live day is part of all time, not only of this month: it is the
+    // same usage the month row and the day row above already show, so it is
+    // added here exactly once — the single place the live delta is folded into
+    // a rollup, and only under the merge guard above (the day frozen, or a
+    // report from another day, never produces a delta at all).
+    //
+    // A family with no rollup in totals.json gets nothing: there is no all-time
+    // figure to extend, and calling today's tokens "all-time" would hide every
+    // frozen day before it. The page already carries the CLI's note for that.
+    for (const [family, entry] of families) {
+      if (!payload.totals?.families?.[family]) continue;
+      if (entry.liveTokens === 0 && entry.livePrompts === 0) continue;
+      entry.allTime += entry.liveTokens;
+      entry.allTimePrompts += entry.livePrompts;
+      for (const [label, delta] of entry.liveAccounts) {
+        const seen = entry.allTimeAccounts.get(label) ?? { tokens: 0, prompts: 0 };
+        entry.allTimeAccounts.set(label, { tokens: seen.tokens + delta.tokens, prompts: seen.prompts + delta.prompts });
       }
     }
 
@@ -1936,10 +2003,29 @@ export class UsageOverlay {
       // Multi-account families use the same short name as the Now panel header.
       const display = accountLabels.length > 1 ? SHORT_NAME[family] ?? FAMILY_LABEL[family] ?? family : FAMILY_LABEL[family] ?? family;
       const name = paint(BRAND[family] ?? "#8B949E", display);
+      // The month first, then the all-time rollup with today's live day folded
+      // in: every figure here counts a live day once. Prompts are scope-labelled
+      // in their own row below, because an unlabelled count reads as the wrong
+      // one of the two.
+      //
+      // Every all-time figure is computed before the first line is built: the
+      // note a lagging rollup earns belongs at the top of the section, where it
+      // explains the header, the prompts row and the account rows at once.
       const meta = [`${formatTokens(entry.tokens)} in ${month}`];
-      if (entry.allTime > 0) meta.push(`${formatTokens(entry.allTime)} all-time`);
-      if (entry.prompts > 0) meta.push(`${entry.prompts} prompt${entry.prompts === 1 ? "" : "s"}`);
+      const familyAllTime = allTimeFigure(entry.tokens, entry.allTime);
+      if (familyAllTime.value > 0) meta.push(`${formatTokens(familyAllTime.value)} all-time`);
+      const promptsAllTime = allTimeFigure(entry.prompts, entry.allTimePrompts);
+      const accountAllTime = new Map<string, AllTimeFigure>();
+      for (const accountLabel of accountLabels) {
+        accountAllTime.set(
+          accountLabel,
+          allTimeFigure(entry.accounts.get(accountLabel)?.tokens ?? 0, entry.allTimeAccounts.get(accountLabel)?.tokens ?? 0),
+        );
+      }
+      const lagsMonth =
+        familyAllTime.lags || promptsAllTime.lags || Array.from(accountAllTime.values()).some((figure) => figure.lags);
       const body: string[] = [];
+      if (lagsMonth) body.push(`  ${this.theme.fg("warning", `~ ${ALL_TIME_LAGS_NOTE}`)}`);
       const label = (text: string) => `  ${this.theme.fg("dim", text.padEnd(6))}  `;
       const rest = `  ${" ".repeat(8)}`;
       const dayCells = Array.from(entry.days.entries())
@@ -1951,6 +2037,22 @@ export class UsageOverlay {
         rest,
         bodyWidth,
       ));
+      // Both scopes, always: the live day is merged into each of them once, so
+      // the month count and the all-time count may never disagree about it.
+      const promptCells: string[] = [];
+      if (entry.prompts > 0) promptCells.push(`${entry.prompts} in ${month}`);
+      if (promptsAllTime.value > 0) {
+        // A figure that lags the month is still a figure: it is printed, dimmed
+        // whole, and the note above the rows says why it is small.
+        promptCells.push(
+          promptsAllTime.lags
+            ? this.theme.fg("dim", `${promptsAllTime.value} all-time`)
+            : `${promptsAllTime.value} ${this.theme.fg("dim", "all-time")}`,
+        );
+      }
+      if (promptCells.length > 0) {
+        body.push(...wrapCells(promptCells, label("prompts"), rest, bodyWidth));
+      }
       if (entry.models.size > 0) {
         const top = Array.from(entry.models.entries()).sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
         const shown = top.slice(0, 5).map(([model, tokens]) => `${shortModelName(model)} ${formatTokens(tokens)}`);
@@ -1962,8 +2064,14 @@ export class UsageOverlay {
         for (const accountLabel of accountLabels) {
           const account = entry.accounts.get(accountLabel) ?? { tokens: 0, prompts: 0, models: new Map<string, number>() };
           const parts = [`${this.theme.fg("dim", "month")} ${formatTokens(account.tokens)}`];
-          const allTime = entry.allTimeAccounts.get(accountLabel) ?? 0;
-          if (allTime > 0) parts.push(`${this.theme.fg("dim", "all-time")} ${formatTokens(allTime)}`);
+          const accountFigure = accountAllTime.get(accountLabel) ?? { value: 0, lags: false };
+          if (accountFigure.value > 0) {
+            parts.push(
+              accountFigure.lags
+                ? this.theme.fg("dim", `all-time ${formatTokens(accountFigure.value)}`)
+                : `${this.theme.fg("dim", "all-time")} ${formatTokens(accountFigure.value)}`,
+            );
+          }
           const best = Array.from(account.models.entries()).sort((a, b) => b[1] - a[1])[0];
           if (best) parts.push(this.theme.fg("dim", shortModelName(best[0])));
           body.push(`  ${this.theme.fg("dim", accountLabel.padEnd(labelWidth))}  ${parts.join(this.theme.fg("dim", " · "))}`);

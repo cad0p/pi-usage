@@ -404,7 +404,11 @@ export async function collectQuota(options = {}) {
       const results = [];
       const familyWarnList = [];
       for (const { result, warning, crashed } of outcomes) {
-        if (warning) familyWarnList.push(warning);
+        // The stored-credential warning is a claim about this run, and a provider
+        // that renewed the token in memory for it knows better than the store:
+        // "the Pi token expired 271316m ago" next to two healthy Antigravity
+        // windows was reading Pi's stale copy, not the token that was used.
+        if (warning && result.tokenRenewedInMemory !== true) familyWarnList.push(warning);
         if (!crashed) {
           // Bookkeeping must degrade like the provider call it follows: a
           // failing backoff write is a warning, never a rejected family.

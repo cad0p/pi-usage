@@ -15,7 +15,7 @@
  * project is read-only, so no refresh is performed here either.
  */
 
-import { buildWindow, clampPercent, degradedResult, displayIdentity, finiteNumber, stringValue, windowFromName } from "../model.js";
+import { buildWindow, clampPercent, degradedResult, displayIdentity, finiteNumber, identityKind, stringValue, windowFromName } from "../model.js";
 import { requestJson } from "../http.js";
 import { describeOAuthClient, ensureFreshAccessToken } from "./antigravity-oauth.js";
 
@@ -110,6 +110,24 @@ function windowFromBucket(bucket, context, now) {
 }
 
 /**
+ * The account line for a resolved project.
+ *
+ * Pi stores no e-mail for Antigravity, so the project id *is* the display
+ * identity; appending it again printed "project rising-f… · rising-f…". An
+ * account that has a better identity (an e-mail or an id) still gets the
+ * project, because the same login can hold several.
+ *
+ * @param {import("../auth/pi-auth.js").PiCredential} credential
+ * @param {string | null} projectId
+ * @returns {string}
+ */
+function accountLabel(credential, projectId) {
+  const identity = displayIdentity(credential);
+  if (!projectId || identityKind(credential) === "projectId") return identity;
+  return `${identity} · ${projectId.slice(0, 8)}…`;
+}
+
+/**
  * @param {import("../auth/pi-auth.js").PiCredential} credential
  * @param {{ now?: number, fetchFn?: typeof fetch, timeoutMs?: number, expiresInMin?: number | null, env?: Record<string, string | undefined>, refresh?: boolean }} [options]
  * @returns {Promise<import("../model.js").QuotaResult>}
@@ -139,7 +157,19 @@ export async function fetchQuota(credential, options = {}) {
     timeoutMs: options.timeoutMs,
     now,
     enabled: options.refresh,
+    env: options.env,
   });
+  // `expiresInMin` arrives from the engine as the freshness of the *stored*
+  // credential, and that is only the truth about this run when the refresh
+  // above did not happen: a token renewed in memory expires in an hour, so
+  // repeating the stored value made every surface print "token expired" (and
+  // the engine warn about it) next to healthy windows. A refresh that failed
+  // keeps the stored value — then the expiry claim is what the user must see.
+  const renewed = freshness.refreshed === true;
+  const expiresInMin = renewed ? null : options.expiresInMin ?? null;
+  // Present only when a renewal happened: an always-false field would be one
+  // more thing the JSON feed promises to keep.
+  const renewal = renewed ? { tokenRenewedInMemory: true } : {};
   let projectId = credential.projectId ?? null;
 
   /** @type {string | null} */
@@ -211,7 +241,9 @@ export async function fetchQuota(credential, options = {}) {
 
     return {
       ...base,
-      account: projectId ? `${displayIdentity(credential)} · ${projectId.slice(0, 8)}…` : displayIdentity(credential),
+      account: accountLabel(credential, projectId),
+      expiresInMin,
+      ...renewal,
       plan: stringValue(body.paidTier) ?? stringValue(body.currentTier),
       windows,
       error: null,
@@ -221,5 +253,11 @@ export async function fetchQuota(credential, options = {}) {
   }
 
   const suffix = authFailed ? ` (${describeOAuthClient({ env: options.env })})` : "";
-  return degradedResult({ ...base, error: `${lastError ?? "Antigravity quota unavailable"}${suffix}` });
+  return degradedResult({
+    ...base,
+    account: accountLabel(credential, projectId),
+    expiresInMin,
+    ...renewal,
+    error: `${lastError ?? "Antigravity quota unavailable"}${suffix}`,
+  });
 }
