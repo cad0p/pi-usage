@@ -8,6 +8,10 @@ All notable changes to this project will be documented in this file.
 <!-- Add your curated release notes here. -->
 <!-- USER-EDITABLE SECTION END -->
 
+### 🚀 Features
+
+- Fullscreen /usage with month history; no invented "#1" (closes #21, closes #22)
+
 ### ⚡ Performance
 
 - Query a provider's accounts in parallel; send the package User-Agent (closes #23)
