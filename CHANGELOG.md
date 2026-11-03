@@ -15,6 +15,7 @@ All notable changes to this project will be documented in this file.
 ### 🐛 Bug Fixes
 
 - History all-time counts today once; Antigravity header without the false expiry (closes #29)
+- *(extension)* /usage keys work under the kitty keyboard protocol (closes #33)
 
 
 ## [0.11.5] - 2026-11-03
