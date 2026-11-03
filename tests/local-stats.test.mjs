@@ -30,9 +30,12 @@ import { fileURLToPath } from "node:url";
 import { runStatsCommand } from "../src/cli/commands/stats.js";
 import { collectQuota } from "../src/engine.js";
 import {
+  acquireHistoryLock,
   emptyTotals,
   applyDayToTotals,
   loadTotals,
+  refreshHistoryLock,
+  releaseHistoryLock,
   rebuildTotalsFromMonths,
   resolveHistoryDir,
   resolveMonthPath,
@@ -521,6 +524,135 @@ test("a copied session file does not add its frozen days a second time", async (
   assert.equal(continued.byFamily.claude.totalPrompts, 3);
 });
 
+test("two sessions with identical head and tail but a different middle are both counted", async () => {
+  const tree = tempTree();
+  // Same size, identical first and last 40 KB, different middle: the cheap
+  // (size, head, tail) fingerprint collides, and dropping the second file would
+  // silently lose 250 prompts (review finding N1).
+  // The head and tail lines are the *same strings* in both files, so their
+  // bytes are identical and only the middle differs.
+  const head = [];
+  const tail = [];
+  for (let index = 0; index < 250; index += 1) {
+    head.push(assistantLine({ usage: { input: 1_111, output: 0, cacheRead: 0, cacheWrite: 0 } }));
+    tail.push(assistantLine({ usage: { input: 2_222, output: 0, cacheRead: 0, cacheWrite: 0 } }));
+  }
+  const middleA = [];
+  const middleB = [];
+  for (let index = 0; index < 250; index += 1) {
+    middleA.push(assistantLine({ usage: { input: 3_333, output: 0, cacheRead: 0, cacheWrite: 0 } }));
+    middleB.push(assistantLine({ usage: { input: 4_444, output: 0, cacheRead: 0, cacheWrite: 0 } }));
+  }
+  const fileA = [...head, ...middleA, ...tail];
+  const fileB = [...head, ...middleB, ...tail];
+  writeSession(tree.sessions, "a.jsonl", fileA);
+  writeSession(tree.sessions, "b.jsonl", fileB);
+  assert.equal(statSync(join(tree.sessions, "a.jsonl")).size, statSync(join(tree.sessions, "b.jsonl")).size);
+
+  const result = await scan(tree);
+  const expected = 2 * (250 * 1_111 + 250 * 2_222) + 250 * 3_333 + 250 * 4_444;
+  assert.equal(result.byFamily.claude.todayTotalTokens, expected);
+  assert.equal(result.byFamily.claude.todayPrompts, 1_500);
+  assert.equal(readJson(tree.cachePath).files[join(tree.sessions, "b.jsonl")].dedupedBy, undefined, "b is not a copy of a");
+});
+
+test("a mid-file difference is verified in full before a file is called a copy", async () => {
+  // Bounded-cost guard: the cheap fingerprint is only a *candidate*. Two files
+  // that differ in the middle must both count, and the full comparison must not
+  // be used for files that never matched the sample.
+  const tree = tempTree();
+  const head = [];
+  for (let index = 0; index < 300; index += 1) head.push(assistantLine({ usage: { input: 10, output: 0, cacheRead: 0, cacheWrite: 0 } }));
+  const middleA = [];
+  const middleB = [];
+  for (let index = 0; index < 300; index += 1) {
+    middleA.push(assistantLine({ usage: { input: 111, output: 0, cacheRead: 0, cacheWrite: 0 } }));
+    middleB.push(assistantLine({ usage: { input: 222, output: 0, cacheRead: 0, cacheWrite: 0 } }));
+  }
+  writeSession(tree.sessions, "a.jsonl", [...head, ...middleA]);
+  writeSession(tree.sessions, "b.jsonl", [...head, ...middleB]);
+  const result = await scan(tree);
+  assert.equal(result.byFamily.claude.todayTotalTokens, 600 * 10 + 300 * 111 + 300 * 222);
+  assert.equal(result.byFamily.claude.todayPrompts, 1_200);
+});
+
+test("deleting the original keeps the copy's open-day contribution", async () => {
+  const tree = tempTree();
+  const original = writeSession(tree.sessions, "a.jsonl", [
+    assistantLine({ usage: { input: 1_000, output: 0, cacheRead: 0, cacheWrite: 0 } }),
+    assistantLine({ usage: { input: 1_000, output: 0, cacheRead: 0, cacheWrite: 0 } }),
+  ]);
+  await scan(tree);
+  copyFileSync(original, join(tree.sessions, "b.jsonl"));
+  const copied = await scan(tree);
+  assert.equal(copied.byFamily.claude.todayPrompts, 2, "the copy contributes nothing while the original exists");
+
+  // The copy was skipped as a duplicate and holds no rows of its own, so the
+  // deletion of the original must make the scan adopt it (review finding N4).
+  unlinkSync(original);
+  const adopted = await scan(tree);
+  assert.equal(adopted.byFamily.claude.todayPrompts, 2, "the copy is read once the original is gone");
+  assert.equal(adopted.byFamily.claude.todayTotalTokens, 2_000);
+  assert.equal(readJson(tree.cachePath).files[join(tree.sessions, "b.jsonl")].dedupedBy, undefined);
+});
+
+test("a lock taken over from a slow run is not deleted by that run on its way out", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-quota-lock-"));
+  const lockPath = join(dir, "x.lock");
+  const now = 1_000_000;
+
+  const first = acquireHistoryLock({ lockPath, now });
+  assert.equal(first.acquired, true);
+  assert.equal(typeof first.token, "string");
+
+  // Age it past the stale timeout: a second run takes it over.
+  const old = new Date(now - 200_000);
+  utimesSync(lockPath, old, old);
+  const second = acquireHistoryLock({ lockPath, now });
+  assert.equal(second.acquired, true, "a stale lock is taken over");
+
+  // The first run finishes late. Releasing with its own token must not remove
+  // the second run's lock, or a third run would walk straight in (N2).
+  assert.equal(releaseHistoryLock(first), false);
+  assert.equal(refreshHistoryLock(first), false, "the first run knows it lost the lock");
+  const third = acquireHistoryLock({ lockPath, now });
+  assert.equal(third.acquired, false, "the lock still belongs to the second run");
+
+  assert.equal(refreshHistoryLock(second), true);
+  assert.equal(releaseHistoryLock(second), true);
+  assert.equal(acquireHistoryLock({ lockPath, now }).acquired, true, "once released, the next run takes it");
+});
+
+test("a lost rollup is rebuilt from the month files, not from the surviving sessions", async () => {
+  const tree = tempTree();
+  const day = localDayKey(Date.parse(tsForDay(-1)));
+  writeSession(tree.sessions, "a.jsonl", [
+    assistantLine({ ts: tsForDay(-1), usage: { input: 1_000, output: 0, cacheRead: 0, cacheWrite: 0 } }),
+    assistantLine({ ts: tsForDay(0), usage: { input: 1_000, output: 0, cacheRead: 0, cacheWrite: 0 } }),
+  ]);
+  const second = writeSession(tree.sessions, "b.jsonl", [
+    assistantLine({ ts: tsForDay(-1), usage: { input: 1_000, output: 0, cacheRead: 0, cacheWrite: 0 } }),
+    assistantLine({ ts: tsForDay(-1), usage: { input: 1_000, output: 0, cacheRead: 0, cacheWrite: 0 } }),
+  ]);
+  await scan(tree);
+  assert.equal(monthOf(tree).days[day].claude.slots[""].models["claude-opus-5-5"].messages, 3);
+
+  // Losing totals.json *and* a session file used to make the rescan rewrite the
+  // frozen day with only what still exists (3 -> 1) (review finding N3).
+  unlinkSync(second);
+  rmSync(tree.totalsPath, { force: true });
+  const recovered = await scan(tree);
+
+  assert.equal(
+    monthOf(tree).days[day].claude.slots[""].models["claude-opus-5-5"].messages,
+    3,
+    "a frozen day is never rewritten from a rescan",
+  );
+  assert.equal(totalsOf(tree).families.claude.totalPrompts, 3, "the rollup is rebuilt from the month file");
+  assert.equal(totalsOf(tree).lastFrozenDay, day);
+  assert.ok(recovered.warnings.some((warning) => warning.includes("rebuilt from")), recovered.warnings.join(" | "));
+});
+
 test("a forked session that diverges from its parent is still counted", async () => {
   const tree = tempTree();
   const first = writeSession(tree.sessions, "a.jsonl", [
@@ -786,7 +918,10 @@ test("a crash between the month write and the totals write re-freezes the day ex
 
   const tomorrow = Date.parse(tsForDay(1));
   const result = await scan(tree, { now: tomorrow });
-  assert.equal(result.scan.frozenDays, 1);
+  // The rollup was empty while a month file existed, so the run restores the
+  // rollup *from that month file* instead of re-freezing from the session file.
+  assert.equal(result.scan.frozenDays, 0, "the day was already frozen; nothing to freeze again");
+  assert.ok(result.warnings.some((warning) => warning.includes("rebuilt from")), result.warnings.join(" | "));
   assert.equal(totalsOf(tree).families.claude.totalPrompts, 1, "the re-freeze is a SET, not a second add");
   assert.equal(totalsOf(tree).families.claude.modelUsage["claude-opus-5-5"].input, 40);
   assert.equal(totalsOf(tree).lastFrozenDay, TODAY);

@@ -34,7 +34,7 @@
  * still in history even when its session file is gone.
  */
 
-import { closeSync, mkdirSync, openSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { closeSync, mkdirSync, openSync, readFileSync, readdirSync, renameSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 
@@ -528,26 +528,37 @@ export function acquireHistoryLock(input) {
   const now = input.now ?? Date.now();
   const staleMs = Number.isFinite(input.staleMs) ? /** @type {number} */ (input.staleMs) : DEFAULT_LOCK_STALE_MS;
   const lockPath = input.lockPath;
+  // The pid alone is not an owner: it is repeated across containers and after a
+  // wrap, and the whole point of the token is that a run can prove the lock in
+  // the file is still the one it created.
+  const token = `${process.pid}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
 
   for (let attempt = 0; attempt < 2; attempt += 1) {
     try {
       mkdirSync(dirname(lockPath), { recursive: true, mode: 0o700 });
     } catch (error) {
-      return { acquired: false, path: lockPath, stale: false, reason: `cannot create the lock directory: ${redact(/** @type {{ message?: string }} */ (error)?.message)}` };
+      return {
+        acquired: false,
+        path: lockPath,
+        token: null,
+        stale: false,
+        reason: `cannot create the lock directory: ${redact(/** @type {{ message?: string }} */ (error)?.message)}`,
+      };
     }
     try {
       const fd = openSync(lockPath, "wx", 0o600);
       try {
-        writeFileSync(fd, `${process.pid}\n`, "utf-8");
+        writeFileSync(fd, `${token}\n`, "utf-8");
       } finally {
         closeSync(fd);
       }
-      return { acquired: true, path: lockPath, stale: false };
+      return { acquired: true, path: lockPath, token, stale: false };
     } catch (error) {
       if (/** @type {{ code?: string }} */ (error)?.code !== "EEXIST") {
         return {
           acquired: false,
           path: lockPath,
+          token: null,
           stale: false,
           reason: redact(/** @type {{ message?: string }} */ (error)?.message ?? String(error)),
         };
@@ -563,21 +574,61 @@ export function acquireHistoryLock(input) {
         rmSync(lockPath, { force: true });
         continue;
       }
-      return { acquired: false, path: lockPath, stale: false };
+      return { acquired: false, path: lockPath, token: null, stale: false };
     }
   }
-  return { acquired: false, path: lockPath, stale: true };
+  return { acquired: false, path: lockPath, token: null, stale: true };
 }
 
 /**
  * @param {string} lockPath
- * @returns {void}
+ * @returns {string | null} The owner token currently in the file.
  */
-export function releaseHistoryLock(lockPath) {
+function readLockToken(lockPath) {
   try {
-    rmSync(lockPath, { force: true });
+    return readFileSync(lockPath, "utf-8").trim();
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Say "I am still here" so a long scan is never mistaken for a dead one.
+ *
+ * @param {{ path: string, token: string | null }} lock
+ * @returns {boolean} Whether the lock is still ours.
+ */
+export function refreshHistoryLock(lock) {
+  if (!lock?.token || readLockToken(lock.path) !== lock.token) return false;
+  try {
+    const now = new Date();
+    utimesSync(lock.path, now, now);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Release only a lock this run still owns: a run that was taken over must not
+ * delete its successor's file. The lock object is required — a bare path cannot
+ * prove ownership, and an unconditional unlink is exactly the bug this
+ * signature prevents.
+ *
+ * @param {{ path: string, token: string | null } | null | undefined} lock
+ * @returns {boolean} Whether the file was ours and is now gone.
+ */
+export function releaseHistoryLock(lock) {
+  const path = lock?.path;
+  const token = lock?.token;
+  if (!path || !token) return false;
+  if (readLockToken(path) !== token) return false;
+  try {
+    rmSync(path, { force: true });
+    return true;
   } catch {
     // A lock that cannot be removed is reclaimed by the stale timeout.
+    return false;
   }
 }
 
@@ -600,6 +651,47 @@ export function writeJsonAtomic(path, value) {
 }
 
 /**
+ * Rebuild the rollup from the month files, in memory.
+ *
+ * The month files are the authoritative record of frozen days: `totals.json` is
+ * a cache of them. Whenever it is missing or unreadable, this recreates it, so a
+ * lost rollup can never make the scan treat a frozen day as open and overwrite
+ * it with whatever sessions survive (review finding N3).
+ *
+ * @param {{ historyDir: string, warnings: string[] }} input
+ * @returns {{ totals: Totals, months: number, days: number }}
+ */
+export function totalsFromMonths(input) {
+  /** @type {string[]} */
+  let names = [];
+  try {
+    names = readdirSync(input.historyDir);
+  } catch {
+    return { totals: emptyTotals(), months: 0, days: 0 };
+  }
+  const months = names
+    .map((name) => MONTH_FILE.exec(name))
+    .filter((match) => match !== null)
+    .map((match) => /** @type {RegExpExecArray} */ (match)[1])
+    .sort();
+
+  const totals = emptyTotals();
+  let days = 0;
+  for (const month of months) {
+    const entry = readMonthFile(input.historyDir, month, input.warnings);
+    if (!entry.writable) continue;
+    for (const day of Object.keys(entry.days).sort()) {
+      const rows = entry.days[day];
+      if (!rows || typeof rows !== "object") continue;
+      applyDayToTotals(totals, day, rows);
+      totals.lastFrozenDay = maxDay(totals.lastFrozenDay, day);
+      days += 1;
+    }
+  }
+  return { totals, months: months.length, days };
+}
+
+/**
  * Load the durable rollup.
  *
  * A missing totals file is a fresh history: the scan must rebuild every day it
@@ -607,20 +699,48 @@ export function writeJsonAtomic(path, value) {
  * is ever overwritten silently; when even that move fails, the history stays
  * read-only for this run rather than clobbering evidence.
  *
- * @param {{ historyDir: string, warnings: string[] }} input
- * @returns {{ totals: Totals, rescanAll: boolean, writable: boolean, path: string, exists: boolean }}
+ * When month files exist, the rollup is rebuilt from *them* rather than from
+ * the session files: they are what froze the days, and a session deleted since
+ * then must not shrink history.
+ *
+ * @param {{ historyDir: string, warnings: string[], canWrite?: boolean }} input
+ * @returns {{ totals: Totals, rescanAll: boolean, writable: boolean, path: string, exists: boolean, rebuiltFromMonths: boolean }}
  */
 export function loadTotals(input) {
   const path = resolveTotalsPath(input.historyDir);
+  /**
+   * Restore the rollup from the month files. The scan still rescans (the cache
+   * cannot be trusted to know which days are open), but every frozen day is now
+   * protected by `lastFrozenDay`, so the rescan can only rebuild open days.
+   *
+   * @param {boolean} writableRollup Whether the rollup may be written now.
+   */
+  const fromMonths = (writableRollup) => {
+    const rebuilt = totalsFromMonths({ historyDir: input.historyDir, warnings: input.warnings });
+    if (rebuilt.months === 0) {
+      return { totals: emptyTotals(), rescanAll: true, writable: writableRollup, path, exists: false, rebuiltFromMonths: false };
+    }
+    input.warnings.push(
+      `local token stats: the history rollup was rebuilt from ${rebuilt.months} month file(s) (${rebuilt.days} frozen day(s))`,
+    );
+    if (writableRollup && input.canWrite !== false) {
+      const written = writeJsonAtomic(path, totalsToJson(rebuilt.totals));
+      if (!written.ok) {
+        input.warnings.push(`local token stats: could not write the rebuilt history totals: ${written.error}`);
+      }
+    }
+    return { totals: rebuilt.totals, rescanAll: true, writable: writableRollup, path, exists: true, rebuiltFromMonths: true };
+  };
+
   let raw;
   try {
     raw = readFileSync(path, "utf-8");
   } catch (error) {
     if (/** @type {{ code?: string }} */ (error)?.code === "ENOENT") {
-      return { totals: emptyTotals(), rescanAll: true, writable: true, path, exists: false };
+      return fromMonths(true);
     }
     input.warnings.push(`local token stats: could not read the history at ${path}: ${redact(/** @type {{ message?: string }} */ (error)?.message)}`);
-    return { totals: emptyTotals(), rescanAll: true, writable: false, path, exists: true };
+    return fromMonths(false);
   }
 
   let parsed;
@@ -632,18 +752,16 @@ export function loadTotals(input) {
   const totals = parseTotals(parsed);
   if (!totals) {
     const writable = quarantine(path, input.warnings, "local token history");
-    return { totals: emptyTotals(), rescanAll: true, writable, path, exists: true };
+    if (!writable) return { totals: emptyTotals(), rescanAll: true, writable: false, path, exists: true, rebuiltFromMonths: false };
+    return fromMonths(true);
   }
   // An empty rollup is either a fresh install (nothing has closed yet) or a
-  // rollup that lost its numbers (`stats --rebuild-totals` over a directory
-  // whose month files are gone). Month files on disk settle it: they are the
-  // evidence that something was frozen, so the session files are the only
-  // remaining source and the run has to rebuild from them.
+  // rollup that lost its numbers. Month files on disk settle it: they are the
+  // evidence that something was frozen, so history is rebuilt from them.
   if (totals.families.size === 0 && totals.lastFrozenDay === "" && hasMonthFiles(input.historyDir)) {
-    input.warnings.push("local token stats: the history rollup is empty but month files exist; rebuilding from the session files");
-    return { totals, rescanAll: true, writable: true, path, exists: true };
+    return fromMonths(true);
   }
-  return { totals, rescanAll: false, writable: true, path, exists: true };
+  return { totals, rescanAll: false, writable: true, path, exists: true, rebuiltFromMonths: false };
 }
 
 /**

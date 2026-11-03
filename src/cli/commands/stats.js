@@ -39,7 +39,7 @@ export function runStatsCommand(options = {}) {
     try {
       result = rebuildTotalsFromMonths({ historyDir, warnings });
     } finally {
-      releaseHistoryLock(lockPath);
+      releaseHistoryLock(lock);
     }
     for (const warning of warnings) err(`warning: ${warning}`);
     if (!result.ok) {

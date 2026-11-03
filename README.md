@@ -542,10 +542,11 @@ crash between those two writes can double that one small delta. A
 budget-truncated scan never freezes: history is only written from complete runs.
 
 Consequences, all covered by tests: history survives session deletion and cache
-loss; a lost or corrupt `totals.json` is moved aside as
-`totals.json.corrupt-<ts>` and rebuilt from the session files still on disk;
-frozen days are never recomputed, so a replaced session file cannot rewrite them
-either. A lost *month* file loses only that month's daily detail — the all-time
+loss. A lost or corrupt `totals.json` is moved aside as
+`totals.json.corrupt-<ts>` and **rebuilt from the month files**, which are the
+authoritative record of frozen days — not from the session files, because a
+session deleted since then would otherwise shrink history. Frozen days are never
+recomputed, so a replaced session file cannot rewrite them either. A lost *month* file loses only that month's daily detail — the all-time
 totals stay — and `piquota stats --rebuild-totals` recomputes `totals.json` from
 every month file, recovering days whose session files are already gone — and it
 refuses to run when there is no month file at all while `totals.json` still has
@@ -575,15 +576,23 @@ detect. The cache is atomic and `0600`.
 
 Two writers are routine here (the systemd timer and `/usage`), so a run takes an
 exclusive lock — `local-sessions.json.lock`, with a 2-minute stale timeout —
-before it reads the history, and a run that cannot take it reports the numbers
-already on disk and writes nothing. Duplicate *sessions* are handled two ways. A
-byte-identical copy of a session file (a copy, a restored backup, a sync tool) is
-recognised by a (size, first 32 KB, last 32 KB) fingerprint and contributes
-nothing; anything appended to it later is counted normally. A *fork* that copies
-a prefix and then diverges has its own size and tail, so it is counted as a
-session of its own, duplicated prefix included: on this machine (611 files,
-186,443 assistant messages) only 11 message ids appeared in more than one file
-(0.006%), none of them on today, so message-id de-duplication would cost
+before it reads the history. The file holds an owner token, and a live run
+refreshes its mtime as it walks the store, so a slow scan is never mistaken for a
+dead one. A run that cannot take the lock reports the numbers already on disk and
+writes nothing; a run that is taken over mid-scan notices on its next refresh and
+also writes nothing (it never deletes its successor's lock).
+
+Duplicate *sessions* are handled two ways. A byte-identical copy of a session
+file (a copy, a restored backup, a sync tool) is recognised by a (size, first
+32 KB, last 32 KB) fingerprint and contributes nothing; anything appended to it
+later is counted normally, and if the original is deleted the copy is adopted and
+read on the next run. A fingerprint can collide — two same-size sessions that
+differ only in the middle — so a candidate is verified by streaming both files
+before it is called a copy; that full comparison runs only on the rare duplicate.
+A *fork* that copies a prefix and then diverges has its own size and tail, so it
+is counted as a session of its own, duplicated prefix included: on this machine
+(611 files, 186,443 assistant messages) only 11 message ids appeared in more than
+one file (0.006%), none of them on today, so message-id de-duplication would cost
 megabytes to correct a handful of tokens and is not implemented.
 
 The scan has a wall-clock budget (12 s, or `PI_QUOTA_LOCAL_STATS_BUDGET_MS`) so
@@ -649,7 +658,7 @@ extensions/quota-panel.ts      Pi TUI line and /usage
 ## Tests
 
 ```bash
-node --test tests/*.test.mjs     # 315 tests, fake tokens only, no network
+node --test tests/*.test.mjs     # 320 tests, fake tokens only, no network
 ```
 
 Modules covered: `auth.json` parsing and de-duplication, the Claude Code store

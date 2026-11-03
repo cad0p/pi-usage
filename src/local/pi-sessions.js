@@ -69,6 +69,7 @@ import {
   familyRowTokens,
   loadTotals,
   loadWindowDays,
+  refreshHistoryLock,
   releaseHistoryLock,
   resolveHistoryDir,
 } from "./history.js";
@@ -163,6 +164,9 @@ const RECENT_DAYS = 7;
  * @property {boolean} complete
  * @property {string} [fingerprint] Copy fingerprint of the content at `size`
  *                                  (see fingerprintFile), only set after a full read.
+ * @property {string} [dedupedBy]    Path of the file this one was verified to be
+ *                                  a byte-identical copy of; it holds no rows of
+ *                                  its own while that path exists.
  * @property {Record<string, Array<[string, string, string, number, number, number, number, number]>>} days
  */
 
@@ -646,6 +650,54 @@ function fingerprintFile(path, size) {
 }
 
 /**
+ * Full-content comparison of two session files, streamed in 1 MB chunks.
+ *
+ * Only called when a cheap fingerprint already matched, so the expensive path is
+ * the rare one: a real duplicate. Streams rather than buffering, because the
+ * sessions on this machine reach 240 MB.
+ *
+ * @param {string} a
+ * @param {string} b
+ * @param {number} size Expected size of both.
+ * @returns {boolean}
+ */
+function sameContent(a, b, size) {
+  let left = null;
+  let right = null;
+  try {
+    left = openSync(a, "r");
+    right = openSync(b, "r");
+    const leftBuffer = Buffer.alloc(1 << 20);
+    const rightBuffer = Buffer.alloc(1 << 20);
+    let offset = 0;
+    while (offset < size) {
+      const wanted = Math.min(leftBuffer.length, size - offset);
+      const leftRead = readSync(left, leftBuffer, 0, wanted, offset);
+      const rightRead = readSync(right, rightBuffer, 0, wanted, offset);
+      if (leftRead !== rightRead) return false;
+      if (leftBuffer.compare(rightBuffer, 0, rightRead, 0, leftRead) !== 0) return false;
+      if (leftRead <= 0) break;
+      offset += leftRead;
+    }
+    return true;
+  } catch {
+    // An unreadable candidate is not a duplicate: counting it twice is the safer
+    // error, since dropping a session silently loses tokens.
+    return false;
+  } finally {
+    for (const fd of [left, right]) {
+      if (fd !== null) {
+        try {
+          closeSync(fd);
+        } catch {
+          // Closing is best-effort.
+        }
+      }
+    }
+  }
+}
+
+/**
  * @param {string[]} roots
  * @returns {string[]}
  */
@@ -730,6 +782,7 @@ function readCacheFile(path) {
       offset: Math.max(0, entry.offset),
       complete: entry.complete !== false,
       ...(typeof entry.fingerprint === "string" && entry.fingerprint !== "" ? { fingerprint: entry.fingerprint } : {}),
+      ...(typeof entry.dedupedBy === "string" && entry.dedupedBy !== "" ? { dedupedBy: entry.dedupedBy } : {}),
       days: /** @type {SessionFileEntry["days"]} */ (entry.days),
     };
   }
@@ -1085,7 +1138,9 @@ export function buildLocalStats(input = {}) {
   const lockPath = `${cachePath}.lock`;
   const lock = acquireHistoryLock({ lockPath, now: clock() });
   if (!lock.acquired) {
-    const history = loadTotals({ historyDir, warnings });
+    // Read-only path: `canWrite: false` keeps it from rebuilding or repairing
+    // anything the run that does hold the lock is writing right now.
+    const history = loadTotals({ historyDir, warnings, canWrite: false });
     const cached = readCacheFile(cachePath);
     warnings.push(
       lock.reason
@@ -1108,7 +1163,7 @@ export function buildLocalStats(input = {}) {
     // A missing history or a missing cache means every day still on disk has to
     // be rebuildable, so both force a rescan. Frozen days are skipped in that
     // case: they were already counted and a rescan must never add them again.
-    const history = loadTotals({ historyDir, warnings });
+    const history = loadTotals({ historyDir, warnings, canWrite: true });
     const cached = readCacheFile(cachePath);
     // A rollup that lost its numbers while the cache remembers having seen
     // frozen days is a lost history: rebuild whatever the session files still
@@ -1145,7 +1200,23 @@ export function buildLocalStats(input = {}) {
     let bytesRead = 0;
     let partial = overBudget();
 
+    // The lock is refreshed as the scan walks the store: a cold scan of 1.5 GB
+    // takes seconds, but a slower machine or a bigger store could exceed the
+    // stale timeout, and another run would then take the lock over while this
+    // one kept writing. `lostLock` makes that impossible.
+    let lostLock = false;
+    let filesSinceRefresh = 0;
+    const keepLock = () => {
+      filesSinceRefresh += 1;
+      if (filesSinceRefresh < 8) return true;
+      filesSinceRefresh = 0;
+      if (refreshHistoryLock(lock)) return true;
+      lostLock = true;
+      return false;
+    };
+
     for (const path of listen) {
+      if (!keepLock()) break;
       if (!partial && overBudget()) partial = true;
       if (partial) break;
 
@@ -1162,7 +1233,12 @@ export function buildLocalStats(input = {}) {
       // this size and mtime. `offset < size` means a trailing partial line (or
       // bytes that arrived after the read reached EOF), and those must be
       // re-examined before the run can call the file unchanged.
-      const previous = cached.files[path];
+      // A file that was skipped as a copy of another path has no rows of its
+      // own: if the original is gone, this file is now the only holder of those
+      // open days and must be read again (review finding N4).
+      const cachedEntry = cached.files[path];
+      const orphanedCopy = cachedEntry?.dedupedBy !== undefined && !listedSet.has(cachedEntry.dedupedBy);
+      const previous = orphanedCopy ? undefined : cachedEntry;
       if (
         previous &&
         !rescanAll &&
@@ -1199,8 +1275,14 @@ export function buildLocalStats(input = {}) {
       // Its own fingerprint in the map is not a copy: a rescan of the same file
       // (a lost history, a rewritten file) must fold its days again.
       const twin = rescan && fingerprint ? counted.get(fingerprint) : undefined;
-      const duplicateOf = twin === path ? undefined : twin;
-      if (rescan && fingerprint && duplicateOf === undefined) counted.set(fingerprint, path);
+      const candidate = twin === path ? undefined : twin;
+      // The fingerprint samples the head and the tail, which is cheap but can
+      // collide: two sessions of the same size that differ only in the middle
+      // look identical (review finding N1). Only a candidate that already
+      // matched the sample is compared in full, so the expensive hash runs on
+      // the rare duplicate and never on a normal run.
+      const duplicateOf = candidate !== undefined && sameContent(candidate, path, stats.size) ? candidate : undefined;
+      if (rescan && fingerprint && candidate === undefined) counted.set(fingerprint, path);
       if (duplicateOf !== undefined) {
         next[path] = {
           size: stats.size,
@@ -1209,6 +1291,7 @@ export function buildLocalStats(input = {}) {
           offset: stats.size,
           complete: true,
           fingerprint,
+          dedupedBy: duplicateOf,
           days: {},
         };
         changed = true;
@@ -1283,6 +1366,31 @@ export function buildLocalStats(input = {}) {
       if (!listedSet.has(path)) changed = true;
     }
 
+    // A run that lost the lock must not write anything: another run now owns
+    // the history, and a second write is exactly the double count the lock
+    // exists to prevent.
+    if (lostLock) {
+      warnings.push(
+        "local token stats: another piquota run took the history lock over during this scan; the numbers below are read-only",
+      );
+      const windowDays = loadWindowDays({ historyDir, dates: recentLocalDates(now, RECENT_DAYS), warnings });
+      return {
+        byFamily: buildLocalStats({ totals: history.totals, openRows: buildOpenRows(next), windowDays, now }),
+        warnings,
+        scan: {
+          files: listen.length,
+          scanned,
+          reused,
+          bytesRead,
+          durationMs: clock() - startedAt,
+          partial: true,
+          budgetMs,
+          frozenDays: 0,
+          locked: true,
+        },
+      };
+    }
+
     const openRows = buildOpenRows(next);
     const applied = applyDurable({
       historyDir,
@@ -1333,6 +1441,6 @@ export function buildLocalStats(input = {}) {
       },
     };
   } finally {
-    releaseHistoryLock(lockPath);
+    releaseHistoryLock(lock);
   }
 }
