@@ -368,6 +368,36 @@ test("the output directory honours PI_QUOTA_OMARCHY_DIR, then XDG_STATE_HOME, th
   assert.equal(resolveOmarchyDir({ env: {}, home: "/h" }), "/h/.local/state/omarchy/agents/usage");
 });
 
+test("the command publishes each family immediately and prunes stale records only after completion", async () => {
+  const dir = tempDir();
+  try {
+    writeFileSync(join(dir, "pi-antigravity.json"), "{}");
+    const claude = provider({ family: "claude", label: "Claude (Pi)" });
+    const codex = provider({ family: "codex", label: "Codex (Pi)" });
+    const report = { providers: [claude, codex], byFamily: { claude: [claude], codex: [codex] } };
+    const code = await runOmarchyCommand({
+      load: async ({ onFamily }) => {
+        await onFamily("claude", { providers: [claude], byFamily: { claude: [claude] } });
+        assert.ok(existsSync(join(dir, "pi-claude.json")), "Claude is written as soon as its result arrives");
+        assert.ok(existsSync(join(dir, "pi-antigravity.json")), "the old record remains during the incomplete run");
+        await onFamily("codex", { providers: [codex], byFamily: { codex: [codex] } });
+        assert.ok(existsSync(join(dir, "pi-codex.json")), "Codex is written independently");
+        assert.ok(existsSync(join(dir, "pi-antigravity.json")), "no stale record is pruned before the final report exists");
+        return report;
+      },
+      dir,
+      env: { PI_QUOTA_OMARCHY_SKIP: "" },
+      quiet: true,
+    });
+    assert.equal(code, 0);
+    assert.equal(existsSync(join(dir, "pi-antigravity.json")), false, "the complete report prunes stale records once");
+    assert.ok(existsSync(join(dir, "pi-claude.json")));
+    assert.ok(existsSync(join(dir, "pi-codex.json")));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("the command publishes from the loaded report and survives a failing load", async () => {
   const dir = tempDir();
   try {

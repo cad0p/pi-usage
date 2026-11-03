@@ -44,19 +44,37 @@ export function skippedFamilies(env, dir) {
 }
 
 /**
- * @param {{ load: () => Promise<import("../../engine.js").PiQuotaReport>, dir?: string, env?: Record<string, string | undefined>, quiet?: boolean }} options
+ * @param {{
+ *   load: (options?: { onFamily?: (family: string, report: import("../../engine.js").PiQuotaReport) => void | Promise<void> }) => Promise<import("../../engine.js").PiQuotaReport>,
+ *   dir?: string,
+ *   env?: Record<string, string | undefined>,
+ *   quiet?: boolean,
+ * }} options
  * @returns {Promise<number>}
  */
 export async function runOmarchyCommand(options) {
+  const skip = skippedFamilies(options.env ?? process.env, options.dir);
+  const onFamily = async (family, fragment) => {
+    if (skip.has(family)) return;
+    const providers = (fragment.providers ?? []).filter((provider) => provider?.family === family && !skip.has(provider.family));
+    if (providers.length === 0) return;
+    try {
+      const familyReport = { ...fragment, providers, byFamily: { [family]: providers } };
+      publishRecords(buildRecords(familyReport), { dir: options.dir, env: options.env, prune: false });
+    } catch {
+      // A per-family write must not prevent later providers from being collected.
+      // The final complete publish below reports any persistent write failure.
+    }
+  };
+
   let report;
   try {
-    report = await options.load();
+    report = await options.load({ onFamily });
   } catch (error) {
     err(`omarchy: could not collect quota: ${redact(/** @type {{ message?: string }} */ (error)?.message ?? error)}`);
     return 1;
   }
 
-  const skip = skippedFamilies(options.env ?? process.env, options.dir);
   const records = buildRecords(skip.size > 0 ? { ...report, providers: (report.providers ?? []).filter((p) => !skip.has(p?.family)) } : report);
   let result;
   try {
