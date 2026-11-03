@@ -11,6 +11,7 @@ All notable changes to this project will be documented in this file.
 ### 🚀 Features
 
 - *(local)* Token stats by day and by model from Pi's session files (closes #16)
+- *(omarchy)* AI Usage bar plugin, every provider a collapsible section (closes #18)
 
 ### 🐛 Bug Fixes
 
