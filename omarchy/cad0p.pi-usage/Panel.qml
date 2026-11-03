@@ -45,7 +45,7 @@ Panel {
   }
 
   // Nothing to report, nothing in the bar, as with the built-in widget.
-  visible: providers.length > 0
+  visible: Logic.pluginVisible(providers)
   implicitWidth: button.implicitWidth
   implicitHeight: button.implicitHeight
 

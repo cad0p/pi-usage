@@ -524,10 +524,13 @@ is a collapsible section of one scrolling panel.
   scrolls first), Enter or Space toggles, `l`/`h` expand/collapse, `r` refreshes,
   Tab moves to the neighbouring bar panel, Esc closes. The mouse wheel scrolls;
   a click on a header toggles it.
-- **Records**: every `*.json` in the usage directory, Omarchy's own included, so
-  it can replace the built-in widget. A provider is hidden by
-  `providers.<id>.enabled = false` in the widget's settings, the same switch the
-  built-in uses.
+- **Records**: every `*.json` in the usage directory, Omarchy's own included.
+  A provider is hidden by `providers.<id>.enabled = false` in the widget's
+  settings, the same switch the built-in uses. The plugin does **not** support
+  the built-in Agents widget's synced cross-device aggregation
+  (`syncMode`, `syncDir`, `syncFileName`, `syncDeviceId`). Users who rely on
+  synced aggregation should keep the built-in widget; this plugin is not a full
+  replacement for it.
 - **Refresh**: the systemd timer and the Pi extension already publish the
   `pi-*.json` records, so the plugin never schedules `piquota`. `r`, a middle
   click or `omarchy-shell cad0p.pi-usage refresh` starts

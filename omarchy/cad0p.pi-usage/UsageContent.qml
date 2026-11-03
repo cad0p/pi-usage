@@ -547,7 +547,7 @@ Item {
         width: parent.width
         spacing: Style.spacing.md
 
-        readonly property var days: section.provider ? (section.provider.recentDays || []) : []
+        readonly property var days: section.provider ? Logic.recentDayRows(section.provider) : []
         readonly property real peak: Math.max(1, Logic.weekPeak(section.provider))
 
         PanelSectionHeader {

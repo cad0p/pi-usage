@@ -27,7 +27,7 @@ Item {
   // PI_QUOTA_OMARCHY_DIR is the writer's own override; honoring it here keeps
   // the two ends pointed at the same directory.
   readonly property string usageDir: Quickshell.env("PI_QUOTA_OMARCHY_DIR") || (stateHome + "/omarchy/agents/usage")
-  readonly property string uiStateDir: Quickshell.env("PI_USAGE_PANEL_STATE_DIR") || (stateHome + "/omarchy/settings")
+  readonly property string uiStateDir: Logic.uiStateDirectory(stateHome, Quickshell.env("PI_USAGE_PANEL_STATE_DIR"))
   readonly property string uiStatePath: uiStateDir + "/cad0p.pi-usage.json"
 
   function setting(name, fallback) {
@@ -86,7 +86,7 @@ Item {
       required property var modelData
       agentId: modelData
       path: root.usageDir + "/" + modelData + ".json"
-      onRecordChanged: root.dataRevision++
+      onRecordChanged: root.recordsChanged()
     }
 
     onObjectAdded: (index, object) => root.rebuildAgents()
@@ -100,7 +100,34 @@ Item {
       if (agent) result.push(agent)
     }
     agents = result
+    recordsChanged()
+  }
+
+  function recordsChanged() {
     dataRevision++
+    scheduleLimitsRetry()
+  }
+
+  property var retryAgentIds: []
+  property string pendingUpdateKind: ""
+  property bool pendingPublisher: false
+
+  Timer {
+    id: limitsRetry
+    interval: 30000
+    repeat: false
+    onTriggered: root.runCollectors("limits", root.retryAgentIds)
+  }
+
+  function scheduleLimitsRetry() {
+    var records = []
+    for (var i = 0; i < agents.length; i++) {
+      var record = agents[i] ? agents[i].record : null
+      if (record) records.push(record)
+    }
+    retryAgentIds = Logic.advisedRetryIds(records, settings)
+    if (retryAgentIds.length > 0) limitsRetry.restart()
+    else limitsRetry.stop()
   }
 
   readonly property var providers: {
@@ -193,14 +220,21 @@ Item {
   Process {
     id: collectorProcess
     running: false
-    onExited: root.rescan()
+    onExited: {
+      root.rescan()
+      if (root.pendingUpdateKind !== "") {
+        var kind = root.pendingUpdateKind
+        root.pendingUpdateKind = ""
+        root.runCollectors(kind)
+      }
+    }
     stderr: StdioCollector {
       waitForEnd: true
       onStreamFinished: if (text.trim() !== "") console.warn("cad0p.pi-usage", text.trim())
     }
   }
 
-  function collectorCommand(kind) {
+  function collectorCommand(kind, agentIds) {
     var args = []
     if (kind === "force") args.push("--force")
     if (kind === "limits") args.push("--limits-only")
@@ -209,20 +243,32 @@ Item {
       if (id.indexOf("pi-") === 0) continue
       if (providerSettings[id] && providerSettings[id].enabled === false) args.push("--except", id)
     }
+    if (agentIds) {
+      for (var i = 0; i < agentIds.length; i++) args.push(agentIds[i])
+    }
     // Absent on a machine without Omarchy's collectors: nothing to run.
     return ["bash", "-c", "command -v omarchy-agent-usage-update >/dev/null 2>&1 || exit 0; exec omarchy-agent-usage-update \"$@\"", "omarchy-agent-usage-update"].concat(args)
   }
 
-  function runCollectors(kind) {
-    if (collectorProcess.running) return
-    collectorProcess.command = collectorCommand(kind)
+  function runCollectors(kind, agentIds) {
+    if (collectorProcess.running) {
+      pendingUpdateKind = Logic.queueUpdateKind(pendingUpdateKind, kind)
+      return
+    }
+    collectorProcess.command = collectorCommand(kind, agentIds)
     collectorProcess.running = true
   }
 
   Process {
     id: publisherProcess
     running: false
-    onExited: root.rescan()
+    onExited: {
+      root.rescan()
+      if (root.pendingPublisher) {
+        root.pendingPublisher = false
+        root.runPublisher()
+      }
+    }
     stderr: StdioCollector {
       waitForEnd: true
       onStreamFinished: if (text.trim() !== "") console.warn("cad0p.pi-usage", text.trim())
@@ -253,7 +299,10 @@ Item {
   }
 
   function runPublisher() {
-    if (publisherProcess.running) return
+    if (publisherProcess.running) {
+      pendingPublisher = true
+      return
+    }
     publisherProcess.command = publisherCommand()
     publisherProcess.running = true
   }

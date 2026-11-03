@@ -155,6 +155,57 @@ test("providers follow the built-in rules: enabled, with data, sorted by id", ()
   assert.deepEqual(ids, ["claude", "pi-claude", "pi-opencode-go"]);
 });
 
+test("refresh, retry, visibility and state helpers retain their contracts", () => {
+  assert.equal(Logic.queueUpdateKind("", "limits"), "limits");
+  assert.equal(Logic.queueUpdateKind("limits", "normal"), "limits");
+  assert.equal(Logic.queueUpdateKind("limits", "force"), "force");
+  assert.deepEqual(plain(Logic.advisedRetryIds([
+    { id: "claude", retryAdvised: true },
+    { id: "codex", retryAdvised: true },
+    { id: "pi-claude", retryAdvised: false },
+  ], { providers: { codex: { enabled: false } } })), ["claude"]);
+  assert.equal(Logic.pluginVisible([]), false);
+  assert.equal(Logic.pluginVisible([{}]), true);
+  assert.equal(Logic.uiStateDirectory("/home/u/.local/state", ""), "/home/u/.local/state/omarchy/settings");
+  assert.equal(Logic.uiStateDirectory("/home/u/.local/state", "/tmp/plugin-state"), "/tmp/plugin-state");
+});
+
+test("QML binds provider sections to the tested logic instead of unconditional visibility", () => {
+  const panel = readFileSync(join(PLUGIN, "Panel.qml"), "utf-8");
+  const main = readFileSync(join(PLUGIN, "Main.qml"), "utf-8");
+  const content = readFileSync(join(PLUGIN, "UsageContent.qml"), "utf-8");
+  assert.match(panel, /visible: Logic\.pluginVisible\(providers\)/);
+  assert.match(main, /uiStateDir: Logic\.uiStateDirectory\(stateHome, Quickshell\.env\("PI_USAGE_PANEL_STATE_DIR"\)\)/);
+  assert.match(content, /readonly property var accountList: Logic\.accountRows\(provider\)/);
+  assert.match(content, /readonly property var days: section\.provider \? Logic\.recentDayRows\(section\.provider\) : \[\]/);
+  assert.match(content, /visible: section\.limitList\.length > 0/);
+  assert.match(content, /visible: section\.accountList\.length > 0/);
+  assert.match(content, /visible: section\.hasDays/);
+  assert.match(content, /visible: section\.models\.length > 0/);
+  assert.doesNotMatch(main, /\.cache\/pi-quota/);
+  const harness = readFileSync(join(ROOT, "tests", "omarchy-harness", "render.sh"), "utf-8");
+  assert.match(harness, /grep -Ei 'WARN\|WARNING\|ERROR\|TypeError\|ReferenceError'/);
+  assert.match(harness, /scenario.*did not produce/);
+  assert.match(readFileSync(join(ROOT, "tests", "omarchy-harness", "fixtures.mjs"), "utf-8"), /recentDays: \[null\]/);
+});
+
+test("limit percentages are clamped to the normalized range", () => {
+  const limits = plain(Logic.limitWindows([
+    { title: "Huge", percent: 1e9 },
+    { title: "Infinite", percent: Infinity },
+    { title: "Normal", percent: 0.42 },
+    { title: "Invalid", percent: NaN },
+  ]));
+  assert.deepEqual(limits.map((/** @type {any} */ w) => w.percent), [1, 1, 0.42]);
+});
+
+test("null recent-day entries are ignored by logic", () => {
+  const provider = Logic.displayProvider({ id: "claude", hasLocalStats: true, recentDays: [null] });
+  assert.deepEqual(plain(Logic.recentDayRows(provider)), []);
+  assert.equal(Logic.weekPeak(provider), 0);
+  assert.equal(Logic.hasDays(provider), false);
+});
+
 test("a single-account headline is its fullest window", () => {
   const head = plain(Logic.headline(Logic.displayProvider(claudeRecord())));
   assert.equal(head.title, "Weekly");

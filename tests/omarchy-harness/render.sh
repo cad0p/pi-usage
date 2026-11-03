@@ -65,6 +65,38 @@ s = s.replace("  BarIconButton {\n    id: button\n    anchors.fill: parent\n", "
 open(path, "w").write(s)
 PY
 
+# The plugin's malformed recentDays fixture is under test; keep it out of the
+# baseline Agents renderer, which dereferences every day without a null guard.
+python3 - "$ROOT/builtin/Main.qml" <<'PY'
+import sys
+path = sys.argv[1]
+s = open(path).read()
+old = 'if (name.slice(-5) === ".json") ids.push(name.slice(0, -5))'
+new = 'if (name.slice(-5) === ".json" && name !== "null-days.json") ids.push(name.slice(0, -5))'
+if old not in s:
+    raise SystemExit("could not isolate the null-days fixture from the built-in comparison")
+open(path, "w").write(s.replace(old, new))
+PY
+
+# The built-in may not ship aliases/light twins for every fixture provider;
+# add those fallbacks in this temp renderer without touching installed assets.
+for family in claude codex antigravity fireworks opencode-go github-actions; do
+  if [[ ! -e "$ROOT/builtin/assets/$family.svg" && -e "$REPO/omarchy/cad0p.pi-usage/assets/$family.svg" ]]; then
+    ln -s "$REPO/omarchy/cad0p.pi-usage/assets/$family.svg" "$ROOT/builtin/assets/$family.svg"
+  fi
+  if [[ -e "$ROOT/builtin/assets/$family.svg" ]]; then
+    if [[ ! -e "$ROOT/builtin/assets/pi-$family.svg" ]]; then
+      ln -s "$family.svg" "$ROOT/builtin/assets/pi-$family.svg"
+    fi
+    if [[ ! -e "$ROOT/builtin/assets/$family-light.svg" ]]; then
+      ln -s "$family.svg" "$ROOT/builtin/assets/$family-light.svg"
+    fi
+    if [[ ! -e "$ROOT/builtin/assets/pi-$family-light.svg" ]]; then
+      ln -s "$family-light.svg" "$ROOT/builtin/assets/pi-$family-light.svg"
+    fi
+  fi
+done
+
 # Theme: the user's current one, or a light palette. The generated shell.toml
 # carries the current palette as literal hex values, so for --light every
 # colour is translated key by key (foreground, background, accent, ...) from
@@ -105,6 +137,8 @@ if [[ -d "$REAL_HOME/.config/fontconfig" ]]; then ln -s "$REAL_HOME/.config/font
 
 if [[ -n "$RECORDS" ]]; then
   cp "$RECORDS"/*.json "$USAGE/"
+  node "$HERE/fixtures.mjs" "$WORK/fixtures" >/dev/null
+  cp "$WORK/fixtures/null-days.json" "$USAGE/"
 else
   node "$HERE/fixtures.mjs" "$USAGE" >/dev/null
 fi
@@ -118,9 +152,33 @@ if [[ "$LIGHT" == "true" ]]; then PREFIX="light-"; fi
 # would make that /bin, where Omarchy installs them), so with none there it
 # writes nothing over the fixtures. The display
 # variables are dropped so nothing can reach the running compositor.
-env -u WAYLAND_DISPLAY -u DISPLAY -u HYPRLAND_INSTANCE_SIGNATURE -u QS_CONFIG_PATH \
+STDOUT="$OUT/${PREFIX}harness.stdout.log"
+STDERR="$OUT/${PREFIX}harness.stderr.log"
+if ! env -u WAYLAND_DISPLAY -u DISPLAY -u HYPRLAND_INSTANCE_SIGNATURE -u QS_CONFIG_PATH \
   -u QT_QPA_PLATFORMTHEME -u QT_IM_MODULE -u GDK_BACKEND \
   HOME="$FAKE_HOME" XDG_STATE_HOME="$STATE" XDG_CONFIG_HOME="$FAKE_HOME/.config" \
   XDG_CACHE_HOME="$WORK/cache" OMARCHY_PATH="$WORK/no-omarchy" PI_QUOTA_OMARCHY_DIR="$USAGE" \
   QT_QPA_PLATFORM=offscreen HARNESS_OUT="$OUT" HARNESS_SCENARIOS="$SCENARIOS" HARNESS_PREFIX="$PREFIX" \
-  timeout 60 qs -p "$ROOT" 2>&1 | tee "$OUT/${PREFIX}harness.log" || true
+  timeout 60 qs -p "$ROOT" >"$STDOUT" 2>"$STDERR"; then
+  cat "$STDOUT" "$STDERR" >&2
+  exit 1
+fi
+
+cat "$STDOUT"
+WARNINGS="$OUT/${PREFIX}harness.warnings.log"
+if { cat "$STDOUT"; cat "$STDERR"; } \
+  | grep -Ei 'WARN|WARNING|ERROR|TypeError|ReferenceError' \
+  | grep -Ev 'This plugin does not support setting window masks' >"$WARNINGS"; then
+  cat "$STDOUT" "$STDERR" >&2
+  echo "QML warning/error detected; see $WARNINGS" >&2
+  exit 1
+fi
+cat "$STDERR" >&2
+
+IFS=',' read -r -a SCENARIO_LIST <<<"$SCENARIOS"
+for scenario in "${SCENARIO_LIST[@]}"; do
+  if [[ ! -s "$OUT/${PREFIX}${scenario}.png" ]]; then
+    echo "scenario '$scenario' did not produce $OUT/${PREFIX}${scenario}.png" >&2
+    exit 1
+  fi
+done

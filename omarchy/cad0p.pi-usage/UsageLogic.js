@@ -77,8 +77,10 @@ function limitWindows(list) {
   for (var i = 0; i < list.length; i++) {
     var entry = list[i] || {}
     var percent = Number(entry.percent)
-    if (entry.percent !== null && entry.percent !== undefined && entry.percent !== "" && percent >= 0)
+    if (entry.percent !== null && entry.percent !== undefined && entry.percent !== "" && percent >= 0) {
+      percent = clamp(percent, 0, 1)
       out.push(limitWindow(entry.label, percent, entry.resetsAt, entry.title))
+    }
   }
   return out
 }
@@ -312,6 +314,31 @@ function providerEnabled(settings, id) {
   return settings.providers[id].enabled !== false
 }
 
+function pluginVisible(providers) {
+  return isList(providers) && providers.length > 0
+}
+
+function uiStateDirectory(stateHome, override) {
+  var path = String(override || "")
+  return path !== "" ? path : String(stateHome || "") + "/omarchy/settings"
+}
+
+function queueUpdateKind(pending, requested) {
+  if (requested === "force" || pending === "") return requested
+  return pending
+}
+
+function advisedRetryIds(records, settings) {
+  var ids = []
+  records = toArray(records)
+  for (var i = 0; i < records.length; i++) {
+    var record = records[i]
+    var id = record && String(record.id || "")
+    if (id && record.retryAdvised === true && providerEnabled(settings, id)) ids.push(id)
+  }
+  return ids
+}
+
 // Records sorted by id, the built-in's order, enabled and non-empty only.
 function visibleProviders(records, settings) {
   var list = []
@@ -406,14 +433,27 @@ function friendlyModelName(id) {
   return words.length > 0 ? words.join(" ") : "Unknown"
 }
 
+function recentDayRows(p) {
+  var days = p && isList(p.recentDays) ? p.recentDays : []
+  var rows = []
+  for (var i = 0; i < days.length; i++) {
+    var day = days[i]
+    if (day && typeof day === "object") rows.push(day)
+  }
+  return rows
+}
+
 function hasDays(p) {
-  return !!p && p.hasLocalStats !== false && isList(p.recentDays) && p.recentDays.length > 0
+  return !!p && p.hasLocalStats !== false && recentDayRows(p).length > 0
 }
 
 function weekPeak(p) {
   var days = p ? (p.recentDays || []) : []
   var peak = 0
-  for (var i = 0; i < days.length; i++) peak = Math.max(peak, Number(days[i].messageCount || 0))
+  for (var i = 0; i < days.length; i++) {
+    var day = days[i]
+    peak = Math.max(peak, Number(day && day.messageCount || 0))
+  }
   return peak
 }
 

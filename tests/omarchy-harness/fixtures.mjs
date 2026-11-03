@@ -142,6 +142,23 @@ writeFileSync(
 );
 
 writeFileSync(
+  join(out, "null-days.json"),
+  `${JSON.stringify({
+    schemaVersion: 1,
+    id: "codex",
+    name: "Adversarial days",
+    updatedAt: at(-MIN),
+    ready: true,
+    limits: [{ label: "Weekly window", title: "Weekly", percent: 0.25, resetsAt: at(2 * DAY) }],
+    hasLocalStats: true,
+    hasPromptStats: true,
+    recentDays: [null],
+    todayPrompts: 1,
+    totalPrompts: 1,
+  }, null, 1)}\n`,
+);
+
+writeFileSync(
   join(out, "fireworks.json"),
   `${JSON.stringify({
     schemaVersion: 1,

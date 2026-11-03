@@ -111,21 +111,42 @@ test("buildRecords keeps one record per family and never throws on garbage", () 
   assert.deepEqual(buildRecords(/** @type {any} */ (null)), []);
 });
 
-test("records never carry tokens, accounts or e-mail addresses", () => {
+test("records never carry tokens, account identifiers, or e-mail addresses", () => {
   const secret = "sk-abcdefSECRETSECRET";
   const records = buildRecords(
     /** @type {any} */ ({
       providers: [
         provider({ plan: "pro", account: "someone@example.com", accessToken: secret }),
         provider({ family: "codex", label: "Codex (Pi)", ok: false, windows: [], error: `Bearer ${secret} rejected for someone@example.com` }),
+        provider({
+          family: "opencode-go",
+          label: "OpenCode Go (Pi)",
+          account: "someone@example.com",
+          slot: null,
+          plan: "Go plan",
+          windows: [{ id: "weekly", label: "Weekly window", usedPercent: 20, remainingPercent: 80, resetsAt: null }],
+          accessToken: secret,
+        }),
+        provider({
+          family: "opencode-go",
+          label: "OpenCode Go (Pi)",
+          account: "second@example.com",
+          slot: "2",
+          plan: "Go plan",
+          ok: false,
+          windows: [],
+          error: `Bearer ${secret} rejected for second@example.com`,
+        }),
       ],
     }),
     { now: NOW },
   );
   const text = JSON.stringify(records);
   assert.ok(!text.includes("someone@example.com"));
+  assert.ok(!text.includes("second@example.com"));
   assert.ok(!text.includes("SECRETSECRET"));
-  assert.ok(!text.includes("account"));
+  assert.ok(text.includes('"accounts":['), "multi-account records keep their public accounts[] shape");
+  assert.ok(!text.includes('"account":'), "provider account identifiers are not serialized");
   assert.ok(!text.includes("/home/u"), "credential source paths stay out of the record");
 });
 
