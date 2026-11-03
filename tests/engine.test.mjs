@@ -9,7 +9,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 
-import { collectQuota } from "../src/engine.js";
+import { collectFamily, collectQuota } from "../src/engine.js";
 import { clearCache, readCache, withCache, writeCache } from "../src/cache.js";
 import {
   antigravityUsageBody,
@@ -68,6 +68,74 @@ test("collectQuota reports all five registered families when GitHub Actions is e
   assert.equal(byFamily["opencode-go"].ok, false);
   assert.match(byFamily["opencode-go"].error ?? "", /piquota auth opencode/);
   assert.equal(byFamily["github-actions"].ok, true);
+});
+
+test("host-resolved OAuth credentials override access and Codex identity only in memory", async () => {
+  const routes = fullRoutes().fetchFn;
+  const codexToken = [
+    "header",
+    Buffer.from(JSON.stringify({ exp: NOW / 1000 + 600 })).toString("base64url"),
+    "signature",
+  ].join(".");
+  let sentAuthorization = null;
+  let sentAccountId = null;
+  const fetchFn = async (input, init) => {
+    if (String(input).includes("chatgpt.com")) {
+      sentAuthorization = init.headers.Authorization;
+      sentAccountId = init.headers["chatgpt-account-id"];
+    }
+    return routes(input, init);
+  };
+  const report = await collectFamily("codex", {
+    paths: [FIXTURE],
+    claudeCodePaths: [],
+    now: NOW,
+    fetchFn,
+    env: {},
+    stores: [],
+    allowBrowser: false,
+    localStats: false,
+    authOverrides: {
+      "openai-codex": { access: codexToken, expiresAtMs: NOW + 600_000, accountId: "acct-from-pi" },
+    },
+  });
+
+  assert.equal(sentAuthorization, `Bearer ${codexToken}`);
+  assert.equal(sentAccountId, "acct-from-pi");
+  assert.equal(report.byFamily.codex[0].account, "acct-fro…", "the display identity is shortened; the full account id was sent in the request header");
+  assert.equal(JSON.stringify(report).includes(codexToken), false, "the report never carries a resolved auth token");
+});
+
+test("Pi OAuth overrides supply credentials when the standalone reader has no matching store entry", async () => {
+  const routes = fullRoutes().fetchFn;
+  let sentAuthorization = null;
+  const fetchFn = async (input, init) => {
+    if (String(input).includes("chatgpt.com")) sentAuthorization = init.headers.Authorization;
+    return routes(input, init);
+  };
+  const token = [
+    "header",
+    Buffer.from(JSON.stringify({
+      exp: NOW / 1000 + 600,
+      "https://api.openai.com/auth": { chatgpt_account_id: "acct-runtime" },
+    })).toString("base64url"),
+    "signature",
+  ].join(".");
+  const report = await collectFamily("codex", {
+    paths: [],
+    now: NOW,
+    fetchFn,
+    env: {},
+    stores: [],
+    allowBrowser: false,
+    localStats: false,
+    authOverrides: { "openai-codex": { access: token, expiresAtMs: NOW + 600_000 } },
+  });
+
+  assert.equal(sentAuthorization, `Bearer ${token}`);
+  assert.equal(report.byFamily.codex[0].account, "acct-run…");
+  assert.equal(report.byFamily.codex[0].source, "Pi runtime auth");
+  assert.equal(JSON.stringify(report).includes(token), false, "the synthesized credential is in-memory only");
 });
 
 test("collectQuota emits one-family fragments before slower families finish", async () => {

@@ -16,7 +16,7 @@ import test from "node:test";
 
 import { mergeLastGood } from "../src/sticky.js";
 
-const EXTENSION = new URL("../extensions/quota-panel.ts", import.meta.url).href;
+const EXTENSION = new URL("./extension-test-entry.mjs", import.meta.url).href;
 const RAIL_PATCH_MODULE = fileURLToPath(new URL("../src/gentle-pi/rail-patch.js", import.meta.url));
 process.env.XDG_CACHE_HOME = mkdtempSync(join(tmpdir(), "pi-quota-extension-cache-"));
 // These tests must never edit the real gentle-pi package, so the default lookup is
@@ -45,33 +45,32 @@ function makeGentlePiFixture(patched = false) {
 }
 
 /**
- * A throwaway CLI tree holding the rail patcher where the extension looks for it,
- * so `PI_QUOTA_BIN` can point the extension at it instead of the real install.
+ * A throwaway copy of the rail inspector, injected into the extension test seam.
  */
-function makeCliTree() {
-  const root = mkdtempSync(join(tmpdir(), "pi-quota-cli-tree-"));
-  mkdirSync(join(root, "bin"), { recursive: true });
+function makeRailPatcherFixture() {
+  const root = mkdtempSync(join(tmpdir(), "pi-quota-rail-patcher-"));
   mkdirSync(join(root, "src", "gentle-pi"), { recursive: true });
-  writeFileSync(join(root, "bin", "piquota.js"), "#!/usr/bin/env node\n", "utf-8");
-  copyFileSync(RAIL_PATCH_MODULE, join(root, "src", "gentle-pi", "rail-patch.js"));
-  return join(root, "bin", "piquota.js");
+  const path = join(root, "src", "gentle-pi", "rail-patch.js");
+  copyFileSync(RAIL_PATCH_MODULE, path);
+  return path;
 }
 
+let testRailPatcherPath;
+
 /**
- * Run a body with `PI_QUOTA_BIN` and `PI_QUOTA_GENTLE_PI_DIR` pointed at fixtures,
+ * Run a body with the rail inspector and gentle-pi package pointed at fixtures,
  * restoring both afterwards so the other tests keep their hermetic defaults.
  */
 async function withRailFixtures(body, { patched = false } = {}) {
   const gentlePiDir = makeGentlePiFixture(patched);
-  const previousBin = process.env.PI_QUOTA_BIN;
+  const previousPatcher = testRailPatcherPath;
   const previousDir = process.env.PI_QUOTA_GENTLE_PI_DIR;
-  process.env.PI_QUOTA_BIN = makeCliTree();
+  testRailPatcherPath = makeRailPatcherFixture();
   process.env.PI_QUOTA_GENTLE_PI_DIR = gentlePiDir;
   try {
     await body({ gentlePiDir, layoutPath: join(gentlePiDir, "lib", "shell-sidebar-layout.ts") });
   } finally {
-    if (previousBin === undefined) delete process.env.PI_QUOTA_BIN;
-    else process.env.PI_QUOTA_BIN = previousBin;
+    testRailPatcherPath = previousPatcher;
     if (previousDir === undefined) delete process.env.PI_QUOTA_GENTLE_PI_DIR;
     else process.env.PI_QUOTA_GENTLE_PI_DIR = previousDir;
   }
@@ -162,13 +161,25 @@ function makeHarness(options = {}) {
   const widgets = [];
   const notifications = [];
   const forbidden = [];
+  const cacheHome = options.cacheHome ?? mkdtempSync(join(tmpdir(), "pi-quota-extension-cache-"));
+  process.env.XDG_CACHE_HOME = cacheHome;
+  const dependencies = {
+    collectFamily: options.collectFamily ?? (async (family) => {
+      if (options.fail) throw new Error("piquota exploded");
+      const current = withFamilies(options.report ?? REPORT);
+      return { ...current, localStats: current.localStats ?? {}, localStatsMeta: current.localStatsMeta ?? null };
+    }),
+    collectLocalStats: options.collectLocalStats ?? (async () => ({ byFamily: options.report?.localStats ?? {}, warnings: [], scan: options.report?.localStatsMeta ?? { partial: false } })),
+    getProviderAuth: options.getProviderAuth ?? (async () => undefined),
+    loadHistory: options.loadHistory ?? (async (month) => historyPayload(month ?? "2030-01", [month ?? "2030-01"])),
+    publishOmarchy: options.publishOmarchy ?? (() => {}),
+    railPatcherPath: testRailPatcherPath,
+  };
 
   const pi = {
+    __piUsageTestDependencies: dependencies,
     on: (name, handler) => handlers.set(name, handler),
-    exec: async () => {
-      if (options.fail) throw new Error("piquota exploded");
-      return { stdout: JSON.stringify(withFamilies(options.report ?? REPORT)), stderr: "", code: 0 };
-    },
+    exec: async () => ({ stdout: "", stderr: "", code: 0 }),
     registerCommand: (name, definition) => commands.push({ name, definition }),
     registerTool: () => forbidden.push("registerTool"),
     registerFlag: () => forbidden.push("registerFlag"),
@@ -187,7 +198,7 @@ function makeHarness(options = {}) {
     },
   };
 
-  return { pi, ctx, commands, handlers, statuses, widgets, notifications, forbidden };
+  return { pi, ctx, commands, handlers, statuses, widgets, notifications, forbidden, dependencies, cacheHome };
 }
 
 /**
@@ -201,6 +212,7 @@ async function startSession(harness, surface = "box") {
   if (surface) {
     const usage = harness.commands.find((command) => command.name === "usage");
     await usage.definition.handler(surface, harness.ctx);
+    await new Promise((resolve) => setTimeout(resolve, 50));
   }
 }
 
@@ -1012,48 +1024,39 @@ function currentMonthHistory(todayKey, month, extraDays = {}) {
   });
 }
 
-/** Route `pi.exec`: `stats --json` answers from the fixtures, the report path stays. */
+/** Route in-process History reads to fixtures. */
 function routeHistory(harness, months, byMonth) {
   const calls = [];
-  const exec = harness.pi.exec;
-  harness.pi.exec = async (runner, argv, options) => {
-    if (argv.includes("stats")) {
-      const index = argv.indexOf("--month");
-      const requested = index === -1 ? null : argv[index + 1];
-      const month = requested ?? months[months.length - 1];
-      calls.push(requested);
-      const payload = byMonth[month] ?? historyPayload(month, months, { notes: [`no frozen days for ${month} in /tmp/pi-usage`] });
-      return { stdout: JSON.stringify(payload), stderr: "", code: 0 };
-    }
-    return exec(runner, argv, options);
+  harness.dependencies.loadHistory = async (requested) => {
+    const month = requested ?? months[months.length - 1];
+    calls.push(requested);
+    return byMonth[month] ?? historyPayload(month, months, { notes: [`no frozen days for ${month} in /tmp/pi-usage`] });
   };
   return calls;
 }
 
 /**
- * Route `stats --json` to promises the test settles in whatever order it likes:
- * overlapping ←/→ presses are the point, and their answers arrive out of order.
+ * Route in-process History reads to promises the test settles in whatever order it likes.
  */
 function routeHistoryDeferred(harness) {
   const waiting = new Map();
   const calls = [];
-  const exec = harness.pi.exec;
-  harness.pi.exec = async (runner, argv, options) => {
-    if (!argv.includes("stats")) return exec(runner, argv, options);
-    const index = argv.indexOf("--month");
-    const month = index === -1 ? null : argv[index + 1];
+  harness.dependencies.loadHistory = (month) => {
     calls.push(month);
-    return new Promise((resolve) => waiting.set(month, resolve));
+    return new Promise((resolve, reject) => waiting.set(month, { resolve, reject }));
   };
-  const settle = (month, result) => {
-    const resolve = waiting.get(month);
-    assert.ok(resolve, `no stats request is waiting for ${month}`);
+  const answer = (month, payload) => {
+    const pending = waiting.get(month);
+    assert.ok(pending, `no stats request is waiting for ${month}`);
     waiting.delete(month);
-    resolve(result);
+    pending.resolve(payload);
   };
-  const answer = (month, payload) => settle(month, { stdout: JSON.stringify(payload), stderr: "", code: 0 });
-  const fail = (month, stderr = "stats: another piquota run holds the history lock") =>
-    settle(month, { stdout: "", stderr: `${stderr}\n`, code: 1 });
+  const fail = (month, message = "stats: another piquota run holds the history lock") => {
+    const pending = waiting.get(month);
+    assert.ok(pending, `no stats request is waiting for ${month}`);
+    waiting.delete(month);
+    pending.reject(new Error(message));
+  };
   return { calls, answer, fail };
 }
 
@@ -1150,14 +1153,20 @@ test("the overlay pages, jumps and scrolls with the wheel, and ignores other mou
   await pending;
 });
 
-test("r refreshes from inside the overlay and never closes it", async () => {
+test("r forces every provider in the background and never closes the overlay", async () => {
   const module = await import(EXTENSION);
   const harness = makeHarness({ report: overlayReport() });
   const calls = [];
-  const exec = harness.pi.exec;
-  harness.pi.exec = async (...args) => {
-    calls.push(args);
-    return exec(...args);
+  harness.dependencies.collectFamily = async (family, options) => {
+    calls.push({ family, force: options.force });
+    const current = withFamilies(overlayReport());
+    const providers = current.providers.filter((provider) => provider.family === family);
+    return { ...current, providers, byFamily: { [family]: providers } };
+  };
+  const historyCalls = [];
+  harness.dependencies.loadHistory = async (month) => {
+    historyCalls.push(month);
+    return historyPayload(month ?? "2030-01", ["2030-01"]);
   };
   module.default(harness.pi);
   await startSession(harness, null);
@@ -1166,24 +1175,26 @@ test("r refreshes from inside the overlay and never closes it", async () => {
   const usage = harness.commands.find((command) => command.name === "usage");
   const pending = usage.definition.handler("", harness.ctx);
   await settle();
-  assert.ok(calls.some(([, argv]) => argv.includes("--force")), "bare /usage forces one refresh on open");
+  assert.ok(calls.length > 0, "opening fetches stale families in the background");
+  assert.equal(calls.some((call) => call.force), false, "opening never forces a fresh provider");
 
   const baseline = calls.length;
   overlays[0].component.handleInput("r");
   await settle();
-  const forced = calls.slice(baseline).filter(([, argv]) => argv.includes("--force"));
-  assert.equal(forced.length, 1, "r runs another forced refresh");
+  const forced = calls.slice(baseline).filter((call) => call.force);
+  assert.equal(forced.length, 4, "r forces Claude, Codex, Antigravity and OpenCode Go independently");
   assert.equal(overlays[0].doneCalls, 0, "r leaves the view open");
 
   // On History, r reloads the month AND the report its today row depends on.
   overlays[0].component.handleInput("2");
   await settle();
   const onHistory = calls.length;
+  const historyBefore = historyCalls.length;
   overlays[0].component.handleInput("r");
   await settle();
   const after = calls.slice(onHistory);
-  assert.equal(after.filter(([, argv]) => argv.includes("--force")).length, 1, "r on History forces a report refresh");
-  assert.ok(after.some(([, argv]) => argv.includes("stats")), "r on History reloads the month");
+  assert.equal(after.filter((call) => call.force).length, 4, "r on History forces every provider");
+  assert.ok(historyCalls.length > historyBefore, "r on History reloads the month");
   assert.match(frameText(overlays[0]).split("\n")[0], /updated \d\d:\d\d/, "History's header shows when the report it merges was updated");
 
   overlays[0].component.handleInput("q");
@@ -1324,7 +1335,7 @@ test("the header shows a refresh indicator, then the time the update landed", as
   await pending;
 });
 
-test("bare /usage paints the cached report on the first frame without waiting for the CLI", async () => {
+test("bare /usage paints cached data instantly while stale refreshes run in the background", async () => {
   const module = await import(EXTENSION);
   const cacheHome = mkdtempSync(join(tmpdir(), "pi-quota-overlay-cache-"));
   mkdirSync(join(cacheHome, "pi-quota"), { recursive: true });
@@ -1338,11 +1349,15 @@ test("bare /usage paints the cached report on the first frame without waiting fo
   const previousCacheHome = process.env.XDG_CACHE_HOME;
   process.env.XDG_CACHE_HOME = cacheHome;
   try {
-    const harness = makeHarness({ report: overlayReport() });
+    const harness = makeHarness({ report: overlayReport(), cacheHome });
     let release;
-    harness.pi.exec = () => new Promise((resolve) => {
-      release = () => resolve({ stdout: JSON.stringify(withFamilies(overlayReport())), stderr: "", code: 0 });
-    });
+    const gate = new Promise((resolve) => { release = resolve; });
+    harness.dependencies.collectFamily = async (family) => {
+      await gate;
+      const current = withFamilies(overlayReport());
+      const providers = current.providers.filter((provider) => provider.family === family);
+      return { ...current, providers, byFamily: { [family]: providers } };
+    };
     module.default(harness.pi);
     await startSession(harness, null);
     const overlays = installOverlay(harness);
@@ -1358,7 +1373,9 @@ test("bare /usage paints the cached report on the first frame without waiting fo
     release();
     await settle();
     assert.match(frameText(overlays[0]).split("\n")[0], /updated \d\d:\d\d/);
-    assert.equal(readFileSync(cachePath, "utf-8"), cachedBefore, "the cache is only read, never rewritten");
+    const updatedCache = JSON.parse(readFileSync(cachePath, "utf-8"));
+    assert.notEqual(readFileSync(cachePath, "utf-8"), cachedBefore, "each arriving family is written back to the cache");
+    assert.ok(updatedCache.report.providers.some((provider) => provider.family === "claude"));
 
     overlays[0].component.handleInput("\u001b");
     await pending;
@@ -1366,6 +1383,131 @@ test("bare /usage paints the cached report on the first frame without waiting fo
     if (previousCacheHome === undefined) delete process.env.XDG_CACHE_HOME;
     else process.env.XDG_CACHE_HOME = previousCacheHome;
   }
+});
+
+test("opening uses per-family clocks and r forces all enabled families", async () => {
+  const module = await import(EXTENSION);
+  const cacheHome = mkdtempSync(join(tmpdir(), "pi-quota-family-clock-"));
+  mkdirSync(join(cacheHome, "pi-quota"), { recursive: true });
+  const cachePath = join(cacheHome, "pi-quota", "usage.json");
+  const now = Date.now();
+  const cached = withFamilies(overlayReport());
+  cached.providers.push(structuredClone(REPORT.providers.find((provider) => provider.family === "antigravity")));
+  cached.generatedAt = new Date(now).toISOString();
+  cached.providers = cached.providers.map((provider) => ({
+    ...provider,
+    updatedAt: new Date(provider.family === "codex" ? now - 90_000 : now).toISOString(),
+  }));
+  cached.byFamily = Object.fromEntries(cached.providers.map((provider) => [provider.family, cached.providers.filter((other) => other.family === provider.family)]));
+  writeFileSync(cachePath, JSON.stringify({ savedAt: now, key: "fixture", report: cached }));
+  const harness = makeHarness({ report: overlayReport(), cacheHome });
+  const calls = [];
+  harness.dependencies.collectFamily = async (family, options) => {
+    calls.push({ family, force: options.force });
+    const providers = cached.providers.filter((provider) => provider.family === family);
+    return { ...cached, providers, byFamily: { [family]: providers } };
+  };
+  module.default(harness.pi);
+  await startSession(harness, null);
+  const overlays = installOverlay(harness);
+  const usage = harness.commands.find((command) => command.name === "usage");
+  const pending = usage.definition.handler("", harness.ctx);
+
+  const firstFrame = frameText(overlays[0]);
+  assert.match(firstFrame, /▾ Claude/, "the cached report paints before refresh work");
+  await settle();
+  assert.deepEqual(calls.map((call) => call.family), ["codex"], "only the expired family clock is refreshed on open");
+  assert.equal(calls[0].force, false, "opening never forces providers");
+
+  overlays[0].component.handleInput("r");
+  await settle();
+  const forced = calls.filter((call) => call.force).map((call) => call.family).sort();
+  assert.deepEqual(forced, ["antigravity", "claude", "codex", "opencode-go"]);
+  overlays[0].component.handleInput("\u001b");
+  await pending;
+});
+
+test("a slow family never delays others, and does not block their forced refresh", async () => {
+  const module = await import(EXTENSION);
+  const harness = makeHarness({ report: overlayReport() });
+  let releaseAntigravity;
+  const antigravityGate = new Promise((resolve) => { releaseAntigravity = resolve; });
+  const calls = [];
+  const completed = [];
+  const published = [];
+  harness.dependencies.publishOmarchy = (report, prune) => published.push({ families: report.providers.map((provider) => provider.family), prune });
+  const current = withFamilies(overlayReport());
+  harness.dependencies.collectFamily = async (family, options) => {
+    calls.push({ family, force: options.force });
+    if (family === "antigravity") await antigravityGate;
+    const providers = current.providers.filter((provider) => provider.family === family);
+    completed.push(family);
+    return { ...current, providers, byFamily: { [family]: providers } };
+  };
+  module.default(harness.pi);
+  await startSession(harness, null);
+  const overlays = installOverlay(harness);
+  const usage = harness.commands.find((command) => command.name === "usage");
+  const pending = usage.definition.handler("", harness.ctx);
+  await settle();
+  assert.deepEqual(completed.sort(), ["claude", "codex", "opencode-go"], "fast sections land while Antigravity is held");
+  assert.match(frameText(overlays[0]), /Claude/);
+  assert.match(frameText(overlays[0]), /OP-Go/);
+  assert.ok(published.some((item) => item.families.includes("claude") && !item.prune), "each arrived family publishes its Omarchy record immediately");
+  assert.equal(published.some((item) => item.prune), false, "no stale record is pruned while a family is still running");
+
+  overlays[0].component.handleInput("r");
+  await settle();
+  const forcedFamilies = calls.filter((call) => call.force).map((call) => call.family).sort();
+  assert.deepEqual(forcedFamilies, ["claude", "codex", "opencode-go"], "the in-flight Antigravity request does not serialize forced refreshes for other families");
+  assert.equal(calls.filter((call) => call.family === "antigravity").length, 1, "the same family is never double-started");
+
+  releaseAntigravity();
+  await settle();
+  assert.equal(published.filter((item) => item.prune).length, 1, "the complete refresh prunes stale records once");
+  overlays[0].component.handleInput("\u001b");
+  await pending;
+});
+
+test("the extension resolves Claude and Codex auth through Pi without caching tokens", async () => {
+  const module = await import(EXTENSION);
+  const nowSeconds = Math.floor(Date.now() / 1000) + 600;
+  const codexToken = [
+    "header",
+    Buffer.from(JSON.stringify({
+      exp: nowSeconds,
+      "https://api.openai.com/auth": { chatgpt_account_id: "acct-from-jwt" },
+    })).toString("base64url"),
+    "signature",
+  ].join(".");
+  const tokens = { anthropic: "fixture-claude-oauth-token", "openai-codex": codexToken };
+  const authCalls = [];
+  const overrides = new Map();
+  const environments = new Map();
+  const harness = makeHarness({ report: overlayReport() });
+  harness.dependencies.getProviderAuth = async (_ctx, provider) => {
+    authCalls.push(provider);
+    return { auth: { apiKey: tokens[provider] }, source: "OAuth" };
+  };
+  harness.dependencies.collectFamily = async (family, options) => {
+    if (options.authOverrides) overrides.set(family, options.authOverrides);
+    if (options.env) environments.set(family, options.env);
+    const current = withFamilies(overlayReport());
+    return { ...current, providers: current.providers.filter((provider) => provider.family === family) };
+  };
+  module.default(harness.pi);
+  const usage = harness.commands.find((command) => command.name === "usage");
+  await usage.definition.handler("refresh", harness.ctx);
+
+  assert.deepEqual(authCalls.sort(), ["anthropic", "openai-codex"]);
+  assert.equal(overrides.get("claude").anthropic.access, tokens.anthropic);
+  assert.equal(environments.get("claude").PI_QUOTA_CLAUDE_SOURCE, "pi", "the host-resolved token takes precedence over Claude Code auth");
+  assert.equal(overrides.get("codex")["openai-codex"].access, codexToken);
+  assert.equal(overrides.get("codex")["openai-codex"].accountId, "acct-from-jwt");
+  assert.equal(overrides.get("codex")["openai-codex"].expiresAtMs, nowSeconds * 1000);
+  const cache = readFileSync(join(harness.cacheHome, "pi-quota", "usage.json"), "utf8");
+  assert.equal(cache.includes(tokens.anthropic), false);
+  assert.equal(cache.includes(codexToken), false);
 });
 
 test("the overlay opens on a loading line and shows a refresh failure in place", async () => {
@@ -1388,15 +1530,11 @@ test("the overlay opens on a loading line and shows a refresh failure in place",
   await pending;
 });
 
-test("the omarchy publish after a refresh never shows up as a quota failure", async () => {
+test("quota refresh runs in-process and never shells out to piquota", async () => {
   const module = await import(EXTENSION);
   const harness = makeHarness({ report: overlayReport() });
-  const exec = harness.pi.exec;
-  harness.pi.exec = async (runner, argv, options) => {
-    // The real `piquota omarchy` writes human text, not JSON.
-    if (argv.includes("omarchy")) return { stdout: "omarchy: wrote 3 records\n", stderr: "", code: 0 };
-    return exec(runner, argv, options);
-  };
+  let execCalls = 0;
+  harness.pi.exec = async () => { execCalls += 1; throw new Error("unexpected child process"); };
   module.default(harness.pi);
   await startSession(harness, null);
   const overlays = installOverlay(harness);
@@ -1407,10 +1545,31 @@ test("the omarchy publish after a refresh never shows up as a quota failure", as
   const frame = frameText(overlays[0]);
   assert.doesNotMatch(frame, /refresh failed/, "the advisory publish is not a quota refresh");
   assert.doesNotMatch(frame, /not valid JSON/);
-  assert.match(frame, /▾ Claude/, "the real report still landed");
+  assert.match(frame, /▾ Claude/, "the in-process report still landed");
+  assert.equal(execCalls, 0, "quota and History reads do not spawn child processes");
 
   overlays[0].component.handleInput("\u001b");
   await pending;
+});
+
+test("PI_QUOTA_LOCAL_STATS=0 disables the extension's worker scan", async () => {
+  const module = await import(EXTENSION);
+  const previous = process.env.PI_QUOTA_LOCAL_STATS;
+  process.env.PI_QUOTA_LOCAL_STATS = "0";
+  try {
+    let scans = 0;
+    const harness = makeHarness({ report: overlayReport() });
+    harness.dependencies.collectLocalStats = async () => {
+      scans += 1;
+      return { byFamily: {}, warnings: [], scan: { partial: false } };
+    };
+    module.default(harness.pi);
+    await harness.commands.find((command) => command.name === "usage").definition.handler("refresh", harness.ctx);
+    assert.equal(scans, 0);
+  } finally {
+    if (previous === undefined) delete process.env.PI_QUOTA_LOCAL_STATS;
+    else process.env.PI_QUOTA_LOCAL_STATS = previous;
+  }
 });
 
 test("subcommands toggle the line, the panel, the footer and hide everything", async () => {
@@ -1902,19 +2061,15 @@ test("a damaged month and a failed history fetch are lines, not throws", async (
   assert.match(frame, /! 2026-09 was quarantined as tokens-2026-09\.json\.corrupt-1/);
   assert.match(frame, /no token history for 2026-10/);
 
-  // The next fetch fails: the error is a line and the previous month stays usable.
-  harness.pi.exec = async () => {
-    throw new Error("stats --json exploded");
-  };
+  // The next in-process read fails: the error is a line and the previous month stays usable.
+  harness.dependencies.loadHistory = async () => { throw new Error("stats --json exploded"); };
   overlays[0].component.handleInput("r");
   await settle();
   assert.match(frameText(overlays[0]), /! stats --json exploded/);
   assert.match(frameText(overlays[0]), /history failed/);
 
   // A pathological thrown message still paints one capped line, not a page.
-  harness.pi.exec = async () => {
-    throw new Error(`stats failed: ${"x".repeat(600)}`);
-  };
+  harness.dependencies.loadHistory = async () => { throw new Error(`stats failed: ${"x".repeat(600)}`); };
   overlays[0].component.handleInput("r");
   await settle();
   const cappedFrame = frameText(overlays[0]);
@@ -1944,9 +2099,7 @@ test("a failed fetch of an uncached month is not also a loading line", async () 
 
   // 2026-09 has no payload yet, so the failure lands on a month with no frame to
   // fall back on. "loading" is not the post-error state any more.
-  harness.pi.exec = async () => {
-    throw new Error("stats --json exploded");
-  };
+  harness.dependencies.loadHistory = async () => { throw new Error("stats --json exploded"); };
   overlays[0].component.handleInput("\u001b[D");
   assert.match(frameText(overlays[0]), /loading 2026-09 …/, "the request is visible while it runs");
   await settle();
@@ -1958,18 +2111,15 @@ test("a failed fetch of an uncached month is not also a loading line", async () 
 
   // r retries the month that failed, not the newest one.
   let retried = null;
-  harness.pi.exec = async (runner, argv) => {
-    // r on History also forces a report refresh; only the stats call is the retry.
-    if (!argv.includes("stats")) return { stdout: "", stderr: "", code: 0 };
-    const index = argv.indexOf("--month");
-    retried = index === -1 ? null : argv[index + 1];
-    return { stdout: JSON.stringify(historyPayload("2026-09", ["2026-09", "2026-10"], { days: {}, totals: null })), stderr: "", code: 0 };
+  harness.dependencies.loadHistory = async (month) => {
+    retried = month;
+    return historyPayload(month ?? "2026-09", ["2026-09", "2026-10"], { days: {}, totals: null });
   };
   overlays[0].component.handleInput("r");
   await settle();
   assert.equal(retried, "2026-09", "the retry asks for the month that failed");
   assert.doesNotMatch(frameText(overlays[0]), /stats --json exploded/);
-  assert.deepEqual(calls, [null], "the month that failed was requested before the stub replaced the router");
+  assert.deepEqual(calls, [null], "the original month request was routed once before retrying the uncached month");
 
   overlays[0].component.handleInput("\u001b");
   await pending;
@@ -2206,12 +2356,13 @@ test("a failed stats run reports the CLI's cause, not the JSON parser's", async 
   assert.match(frameText(overlays[0]), /Quota · History · 2026-10/);
 
   const failWith = (result) => {
-    harness.pi.exec = async () => result;
+    const first = String(result.stderr ?? "").split("\\n").map((line) => line.trim()).find(Boolean);
+    const message = first || (result.code ? `piquota stats exited ${result.code}` : "piquota stats returned no history payload");
+    harness.dependencies.loadHistory = async () => { throw new Error(message); };
     overlays[0].component.handleInput("r");
   };
 
-  // An empty stdout used to surface as "Unexpected end of JSON input", which
-  // names the parser instead of the cause: the CLI's own first stderr line.
+  // A failure cause is shown directly; the extension no longer parses child-process stdout.
   failWith({ stdout: "", stderr: "stats: another piquota run holds the history lock (/tmp/x/cache/local-sessions.json.lock); try again in a moment\nsecond line\n", code: 1 });
   await settle();
   let frame = frameText(overlays[0], 140);
@@ -2245,29 +2396,27 @@ test("a failed stats run reports the CLI's cause, not the JSON parser's", async 
   await pending;
 });
 
-test("History says a report refresh is running, because its today row waits on it", async () => {
+test("History says provider refresh is running, because its today row waits on it", async () => {
   const module = await import(EXTENSION);
   const month = "2026-10";
   const report = overlayReport();
   const harness = makeHarness({ report });
   routeHistory(harness, [month], { [month]: historyPayload(month, [month], { days: HISTORY_OCTOBER, totals: HISTORY_TOTALS }) });
-  const routed = harness.pi.exec;
-  let releaseReport = null;
-  // Hold the report run open: the overlay is painted while it is still running.
-  harness.pi.exec = async (runner, argv, options) => {
-    if (argv.includes("stats")) return routed(runner, argv, options);
-    if (argv.includes("omarchy")) return { stdout: "", stderr: "", code: 0 };
-    return new Promise((resolve) => {
-      releaseReport = () => resolve({ stdout: JSON.stringify(withFamilies(report)), stderr: "", code: 0 });
+  const releases = [];
+  // Hold provider requests open: the overlay can paint History while any one remains active.
+  harness.dependencies.collectFamily = (family) => new Promise((resolve) => {
+    releases.push(() => {
+      const providers = report.providers.filter((provider) => provider.family === family);
+      resolve({ ...withFamilies(report), providers, byFamily: { [family]: providers } });
     });
-  };
+  });
   module.default(harness.pi);
   await startSession(harness, null);
   const overlays = installOverlay(harness, { rows: 40 });
   const usage = harness.commands.find((command) => command.name === "usage");
   const pending = usage.definition.handler("", harness.ctx);
   await settle();
-  assert.ok(releaseReport, "the background report refresh is in flight");
+  assert.ok(releases.length > 0, "independent provider refreshes are in flight");
 
   overlays[0].component.handleInput("\t");
   await settle();
@@ -2275,7 +2424,7 @@ test("History says a report refresh is running, because its today row waits on i
   assert.match(frame, /Quota · History · 2026-10/);
   assert.match(frame, /refreshing …/, "History's live today row depends on the running report refresh");
 
-  releaseReport();
+  for (const release of releases) release();
   await settle();
   assert.doesNotMatch(frameText(overlays[0], 120), /refreshing …/, "the indicator clears when the refresh lands");
 
@@ -2538,6 +2687,58 @@ test("an all-time rollup that lags the month is printed with a note, never dropp
   await pending;
 });
 
+test("a lagging per-account all-time figure is dimmed even when the family rollup is current", async (t) => {
+  const module = await import(EXTENSION);
+  t.mock.timers.enable({ apis: ["Date"], now: new Date(2026, 10, 15, 12, 0, 0) });
+  const month = "2026-11";
+  const model = "deepseek-v4.1-flash";
+  const days = {
+    "2026-11-01": {
+      "opencode-go": {
+        tokens: 3_000,
+        prompts: 2,
+        slots: {
+          "": { tokens: 1_000, prompts: 1, models: { [model]: { tokens: 1_000, messages: 1 } } },
+          "2": { tokens: 2_000, prompts: 1, models: { [model]: { tokens: 2_000, messages: 1 } } },
+        },
+      },
+    },
+  };
+  const totals = {
+    lastFrozenDay: "2026-11-01",
+    families: {
+      "opencode-go": {
+        totalPrompts: 2,
+        modelUsage: { [model]: { input: 4_000 } },
+        accounts: {
+          "": { totalPrompts: 1, modelUsage: { [model]: { input: 3_000 } } },
+          "#2": { totalPrompts: 1, modelUsage: { [model]: { input: 1_000 } } },
+        },
+      },
+    },
+  };
+  const theme = { fg: (key, text) => `<${key}>${text}</${key}>`, bold: (text) => text };
+  const harness = makeHarness({ report: liveReport(), theme });
+  routeHistory(harness, [month], { [month]: historyPayload(month, [month], { days, totals }) });
+  module.default(harness.pi);
+  await startSession(harness, null);
+  const overlays = installOverlay(harness, { rows: 40 });
+  const usage = harness.commands.find((command) => command.name === "usage");
+  const pending = usage.definition.handler("", harness.ctx);
+  await settle();
+  overlays[0].component.handleInput("\t");
+  await settle();
+
+  const frame = frameText(overlays[0], 120);
+  const unstyled = frame.replace(/<[^>]+>/g, "");
+  assert.match(unstyled, /OP-Go · 3\.0k in 2026-11 · 4\.0k all-time/, "the family rollup itself is consistent");
+  assert.ok(frame.includes("<dim>#2</dim>  <dim>month</dim> 2.0k<dim> · </dim><dim>all-time 1.0k</dim>"), "the account figure keeps the lag flag, rather than presenting its smaller total as complete");
+  assert.match(unstyled, /all-time lags this month; run piquota stats --rebuild-totals/);
+
+  overlays[0].component.handleInput("\u001b");
+  await pending;
+});
+
 test("a consistent rollup prints without the lag note, account rows included", async (t) => {
   const module = await import(EXTENSION);
   t.mock.timers.enable({ apis: ["Date"], now: new Date(2026, 10, 15, 12, 0, 0) });
@@ -2686,21 +2887,20 @@ test("agent_end is a no-op while no surface is on", async () => {
   process.env.PI_QUOTA_EVENT_DEBOUNCE_MS = "20";
   try {
     const module = await import(EXTENSION);
-    let execCalls = 0;
+    let refreshCalls = 0;
     const harness = makeHarness();
-    const originalExec = harness.pi.exec;
-    /** @type {(...args: any[]) => Promise<any>} */
-    harness.pi.exec = async (...args) => {
-      execCalls++;
-      return originalExec(...args);
+    const originalLoad = harness.dependencies.collectFamily;
+    harness.dependencies.collectFamily = async (...args) => {
+      refreshCalls++;
+      return originalLoad(...args);
     };
     module.default(harness.pi);
     await startSession(harness, null);
-    const initialCalls = execCalls;
+    const initialCalls = refreshCalls;
 
     await harness.handlers.get("agent_end")({}, harness.ctx);
     await new Promise((resolve) => setTimeout(resolve, 50));
-    assert.equal(execCalls, initialCalls, "no surface is visible, so nothing polls");
+    assert.equal(refreshCalls, initialCalls, "no surface is visible, so nothing polls");
   } finally {
     if (previousDebounce === undefined) delete process.env.PI_QUOTA_EVENT_DEBOUNCE_MS;
     else process.env.PI_QUOTA_EVENT_DEBOUNCE_MS = previousDebounce;
@@ -2712,16 +2912,23 @@ test("agent_end triggers a debounced quota refresh and agent_start cancels pendi
   process.env.PI_QUOTA_EVENT_DEBOUNCE_MS = "40";
   try {
     const module = await import(EXTENSION);
-    let execCalls = 0;
+    let refreshCalls = 0;
     const harness = makeHarness();
-    const originalExec = harness.pi.exec;
-    harness.pi.exec = async (...args) => {
-      execCalls++;
-      return originalExec(...args);
+    const originalLoad = harness.dependencies.collectFamily;
+    harness.dependencies.collectFamily = async (family, options) => {
+      refreshCalls++;
+      const result = await originalLoad(family, options);
+      result.providers = result.providers.map((provider) => ({
+        ...provider,
+        updatedAt: new Date(Date.now() - 10 * 60_000).toISOString(),
+      }));
+      result.byFamily = Object.fromEntries(result.providers.map((provider) => [provider.family, result.providers.filter((other) => other.family === provider.family)]));
+      return result;
     };
     module.default(harness.pi);
     await startSession(harness);
-    const initialCalls = execCalls;
+    const initialCalls = refreshCalls;
+    writeFileSync(join(harness.cacheHome, "pi-quota", "refresh-state.json"), JSON.stringify({ fetchedAtMs: {} }));
 
     const onAgentEnd = harness.handlers.get("agent_end");
     assert.equal(typeof onAgentEnd, "function", "must register agent_end handler");
@@ -2732,12 +2939,12 @@ test("agent_end triggers a debounced quota refresh and agent_start cancels pendi
     assert.equal(typeof onAgentStart, "function", "must register agent_start handler");
     onAgentStart({}, harness.ctx);
     await new Promise((resolve) => setTimeout(resolve, 60));
-    assert.equal(execCalls, initialCalls, "agent_start must have cancelled the debounced refresh");
+    assert.equal(refreshCalls, initialCalls, "agent_start must have cancelled the debounced refresh");
 
     // 2. Calling agent_end without interruption triggers refresh
     await onAgentEnd({}, harness.ctx);
     await new Promise((resolve) => setTimeout(resolve, 60));
-    assert.ok(execCalls > initialCalls, "agent_end must have triggered a quota refresh");
+    assert.ok(refreshCalls > initialCalls, "agent_end must have triggered a stale-family refresh");
   } finally {
     if (previousDebounce === undefined) delete process.env.PI_QUOTA_EVENT_DEBOUNCE_MS;
     else process.env.PI_QUOTA_EVENT_DEBOUNCE_MS = previousDebounce;

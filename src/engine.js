@@ -6,7 +6,7 @@
  * degraded result with an actionable message.
  */
 
-import { checkFreshness, LABEL_BY_FAMILY, loadPiCredentials, resolveAuthPaths } from "./auth/pi-auth.js";
+import { checkFreshness, LABEL_BY_FAMILY, loadPiCredentials, normalizeCredential, resolveAuthPaths } from "./auth/pi-auth.js";
 import { loadClaudeCodeCredential } from "./auth/claude-code-auth.js";
 import { redact } from "./http.js";
 import { collectLocalStats } from "./local/pi-sessions.js";
@@ -242,7 +242,7 @@ const PROVIDERS = {
  *   onFamily?: (family: string, report: PiQuotaReport) => void | Promise<void>,
  *     Called once a family has settled, before the other families necessarily
  *     finish. The report fragment contains only that family's results.
- *   authOverrides?: Record<string, { access: string, expiresAtMs?: number | null }>,
+ *   authOverrides?: Record<string, { access: string, expiresAtMs?: number | null, accountId?: string | null }>,
  *     Optional in-memory OAuth access tokens supplied by the host runtime. Never
  *     persisted or included in reports.
  * }} [options]
@@ -266,10 +266,29 @@ export async function collectQuota(options = {}) {
   // underlying file reader remains read-only and the token never reaches output.
   for (const [provider, auth] of Object.entries(options.authOverrides ?? {})) {
     if (typeof auth?.access !== "string" || auth.access === "") continue;
+    let matched = false;
     for (const credential of loaded.credentials) {
       if (credential.provider !== provider) continue;
       credential.access = auth.access;
       credential.expiresAtMs = auth.expiresAtMs ?? null;
+      if (typeof auth.accountId === "string" && auth.accountId !== "") credential.accountId = auth.accountId;
+      matched = true;
+    }
+    // Pi may own auth from a non-default agent directory that the standalone
+    // read-only path discovery does not know about. A host-resolved OAuth token
+    // is sufficient to create the in-memory provider entry; never persist it.
+    if (!matched) {
+      const credential = normalizeCredential(
+        provider,
+        {
+          type: "oauth",
+          access: auth.access,
+          expires: auth.expiresAtMs,
+          accountId: auth.accountId,
+        },
+        "Pi runtime auth",
+      );
+      if (credential) loaded.credentials.push(credential);
     }
   }
 
