@@ -536,8 +536,10 @@ is a collapsible section of one scrolling panel.
   click or `omarchy-shell cad0p.pi-usage refresh` starts
   `piquota-omarchy.service` (or runs the package's `piquota omarchy` when there is
   no unit). Omarchy's collectors (`omarchy-agent-usage-update`) run on the
-  `refreshIntervalSec` timer only while the built-in Agents widget is off the bar
-  (`omarchyCollectors`: `Auto`, `On` or `Off`), so keeping both never doubles the work.
+  `refreshIntervalSec` timer and for a record's `retryAdvised` retry, and only
+  while the built-in Agents widget is off the bar (`omarchyCollectors`: `Auto`,
+  `On` or `Off`, where `Off` never runs them), so keeping both never doubles the
+  work.
 
 Install it by linking it into Omarchy's plugin directory; the link points into
 the pi package when there is one, so `pi update` updates the plugin too:

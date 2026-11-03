@@ -116,7 +116,9 @@ Item {
     id: limitsRetry
     interval: 30000
     repeat: false
-    onTriggered: root.runCollectors("limits", root.retryAgentIds)
+    // A retry is a collector run like any other: the same switch that gates the
+    // interval timer gates this one, even if it flips while the retry waits.
+    onTriggered: if (root.collectorsWanted) root.runCollectors("limits", root.retryAgentIds)
   }
 
   function scheduleLimitsRetry() {
@@ -125,10 +127,14 @@ Item {
       var record = agents[i] ? agents[i].record : null
       if (record) records.push(record)
     }
-    retryAgentIds = Logic.advisedRetryIds(records, settings)
+    retryAgentIds = Logic.advisedRetryIds(records, settings, collectorsWanted)
     if (retryAgentIds.length > 0) limitsRetry.restart()
     else limitsRetry.stop()
   }
+
+  // Turning the collectors off (or putting the built-in widget back on the
+  // bar) cancels a retry that is already waiting.
+  onCollectorsWantedChanged: scheduleLimitsRetry()
 
   readonly property var providers: {
     var rev = dataRevision
@@ -198,7 +204,7 @@ Item {
   property string collectorsSetting: String(setting("omarchyCollectors", "Auto"))
   property int refreshIntervalSec: Math.max(30, Number(setting("refreshIntervalSec", 900)))
   property bool builtinOnBar: false
-  readonly property bool collectorsWanted: collectorsSetting === "On" || (collectorsSetting === "Auto" && !builtinOnBar)
+  readonly property bool collectorsWanted: Logic.collectorsWanted(collectorsSetting, builtinOnBar)
   readonly property bool refreshing: collectorProcess.running || publisherProcess.running
 
   function updateBuiltinOnBar() {
@@ -251,6 +257,9 @@ Item {
   }
 
   function runCollectors(kind, agentIds) {
+    // The one choke point every collector run passes through: the interval
+    // timer, an explicit refresh and the retryAdvised retry.
+    if (!collectorsWanted) return
     if (collectorProcess.running) {
       pendingUpdateKind = Logic.queueUpdateKind(pendingUpdateKind, kind)
       return

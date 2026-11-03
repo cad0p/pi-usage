@@ -11,6 +11,10 @@ aggregation (`syncMode`, `syncDir`, `syncFileName`, `syncDeviceId`). Users who
 rely on synced aggregation should keep the built-in widget; this plugin is not a
 full replacement for it.
 
+Omarchy's own collectors follow the `omarchyCollectors` setting: `Off` never
+runs them, `Auto` only while the built-in Agents widget is off the bar — the
+`retryAdvised` retry included.
+
 Part of [`@cad0p/pi-usage`](../../README.md#the-ai-usage-bar-plugin), which
 documents installation, keys, settings and IPC. Install with
 `./install.sh --omarchy-plugin`, then `omarchy plugin enable cad0p.pi-usage`.

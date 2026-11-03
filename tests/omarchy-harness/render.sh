@@ -135,12 +135,19 @@ fi
 # The shell font is fontconfig's monospace alias, configured per user.
 if [[ -d "$REAL_HOME/.config/fontconfig" ]]; then ln -s "$REAL_HOME/.config/fontconfig" "$FAKE_HOME/.config/fontconfig"; fi
 
+node "$HERE/fixtures.mjs" "$WORK/fixtures" >/dev/null
 if [[ -n "$RECORDS" ]]; then
   cp "$RECORDS"/*.json "$USAGE/"
-  node "$HERE/fixtures.mjs" "$WORK/fixtures" >/dev/null
-  cp "$WORK/fixtures/null-days.json" "$USAGE/"
 else
-  node "$HERE/fixtures.mjs" "$USAGE" >/dev/null
+  cp "$WORK/fixtures"/*.json "$USAGE/"
+fi
+
+# The malformed recentDays record is adversarial input, not a provider: it is
+# copied only for the scenario that renders it, so a run against real records
+# (which carry a codex.json of their own) never grows a second codex section.
+rm -f "$USAGE/null-days.json"
+if [[ ",$SCENARIOS," == *",adversarial,"* ]]; then
+  cp "$WORK/fixtures/null-days.json" "$USAGE/"
 fi
 
 PREFIX=""

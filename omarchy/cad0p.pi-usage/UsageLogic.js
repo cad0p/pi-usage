@@ -328,7 +328,24 @@ function queueUpdateKind(pending, requested) {
   return pending
 }
 
-function advisedRetryIds(records, settings) {
+// Whether this plugin may run Omarchy's collectors at all. "On" always, "Auto"
+// only while the built-in Agents widget is off the bar (so keeping both never
+// doubles the work), "Off" never. Anything unrecognized reads as Auto, the
+// manifest default, so a missing or mistyped setting cannot switch the
+// collectors on.
+function collectorsWanted(setting, builtinOnBar) {
+  var mode = String(setting === null || setting === undefined ? "Auto" : setting).trim().toLowerCase()
+  if (mode === "off") return false
+  if (mode === "on") return true
+  return builtinOnBar !== true
+}
+
+// A collector that could not reach its limits endpoint writes retryAdvised
+// into its record. A retry is a collector run like any other, so it inherits
+// the same switch: with the setting Off, or Auto while the built-in widget is
+// on the bar, no id comes back and nothing runs.
+function advisedRetryIds(records, settings, collectors) {
+  if (!collectors) return []
   var ids = []
   records = toArray(records)
   for (var i = 0; i < records.length; i++) {
@@ -339,12 +356,40 @@ function advisedRetryIds(records, settings) {
   return ids
 }
 
-// Records sorted by id, the built-in's order, enabled and non-empty only.
-function visibleProviders(records, settings) {
-  var list = []
+function recordTime(record) {
+  var ms = Date.parse(String(record && record.updatedAt || ""))
+  return isFinite(ms) ? ms : -Infinity
+}
+
+// One id is one section. A stale file, or a fixture dropped next to a live
+// record, can claim an id that already exists; the newest updatedAt wins, so
+// the panel never draws a provider twice and the second copy cannot share the
+// first one's expansion state.
+function newestRecords(records) {
+  var chosen = {}
+  var order = []
   for (var i = 0; i < (records || []).length; i++) {
     var record = records[i]
     if (!record || !record.id) continue
+    var id = String(record.id)
+    if (!Object.prototype.hasOwnProperty.call(chosen, id)) {
+      chosen[id] = record
+      order.push(id)
+      continue
+    }
+    if (recordTime(record) >= recordTime(chosen[id])) chosen[id] = record
+  }
+  var out = []
+  for (var j = 0; j < order.length; j++) out.push(chosen[order[j]])
+  return out
+}
+
+// Records sorted by id, the built-in's order, enabled and non-empty only.
+function visibleProviders(records, settings) {
+  var list = []
+  var unique = newestRecords(records)
+  for (var i = 0; i < unique.length; i++) {
+    var record = unique[i]
     if (!providerEnabled(settings, String(record.id))) continue
     var p = displayProvider(record)
     if (providerHasData(p)) list.push(p)
@@ -395,8 +440,17 @@ function iconCandidates(providerId, lightSurface) {
 
 // -------------------------------------------------------------- local stats
 
+// A corrupt or hand-written record can carry a count no provider will ever
+// report (1e299, Infinity). Those must not reach the panel as "1e+299B" or
+// "InfinityB": a non-finite count renders as an em dash and the unit is capped
+// at billions.
+var MAX_TOKEN_COUNT = 999.9e9
+
 function formatTokenCount(n) {
   if (n === undefined || n === null) return "0"
+  var value = Number(n)
+  if (!isFinite(value)) return "—"
+  n = Math.min(value, MAX_TOKEN_COUNT)
   if (n >= 1e9) return (n / 1e9).toFixed(1) + "B"
   if (n >= 1e6) return (n / 1e6).toFixed(1) + "M"
   if (n >= 1e3) return (n / 1e3).toFixed(1) + "K"

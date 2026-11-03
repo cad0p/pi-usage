@@ -66,6 +66,27 @@ ShellRoot {
       content.moveCursor(1)
       content.toggleCursor()
       break
+    case "adversarial":
+      // The malformed recentDays record has to render without a TypeError: the
+      // day block is built from Logic.recentDayRows, so an unguarded null
+      // throws here. render.sh copies that fixture only for this scenario, and
+      // a missing record is a warning, which fails the run.
+      var adversarial = null
+      for (var a = 0; a < usage.providers.length; a++)
+        if (usage.providers[a].providerName === "Adversarial days") adversarial = usage.providers[a]
+      if (!adversarial) {
+        console.warn("harness: the adversarial record is missing; render.sh copies it only for --scenarios adversarial")
+        usage.expandedOverrides = ({})
+      } else {
+        // Fold the rest, so the malformed record's rows sit at the top of the
+        // viewport instead of below the default section.
+        var only = {}
+        for (var k = 0; k < usage.providers.length; k++)
+          only[usage.providers[k].providerId] = usage.providers[k] === adversarial
+        usage.expandedOverrides = only
+      }
+      content.resetView()
+      break
     case "builtin":
     case "builtin-2":
     case "builtin-3":

@@ -163,11 +163,26 @@ test("refresh, retry, visibility and state helpers retain their contracts", () =
     { id: "claude", retryAdvised: true },
     { id: "codex", retryAdvised: true },
     { id: "pi-claude", retryAdvised: false },
-  ], { providers: { codex: { enabled: false } } })), ["claude"]);
+  ], { providers: { codex: { enabled: false } } }, true)), ["claude"]);
   assert.equal(Logic.pluginVisible([]), false);
   assert.equal(Logic.pluginVisible([{}]), true);
   assert.equal(Logic.uiStateDirectory("/home/u/.local/state", ""), "/home/u/.local/state/omarchy/settings");
   assert.equal(Logic.uiStateDirectory("/home/u/.local/state", "/tmp/plugin-state"), "/tmp/plugin-state");
+});
+
+test("a retryAdvised record never runs collectors the setting forbids", () => {
+  const records = [{ id: "claude", retryAdvised: true }, { id: "codex", retryAdvised: true }];
+  assert.deepEqual(plain(Logic.advisedRetryIds(records, {}, false)), [], "nothing is retried while collectors are off");
+  assert.deepEqual(plain(Logic.advisedRetryIds(records, {}, true)), ["claude", "codex"]);
+  assert.equal(Logic.collectorsWanted("Off", false), false);
+  assert.equal(Logic.collectorsWanted("Off", true), false);
+  assert.equal(Logic.collectorsWanted("off", false), false, "a lowercase setting still means off");
+  assert.equal(Logic.collectorsWanted("Auto", true), false, "Auto never doubles the built-in widget's work");
+  assert.equal(Logic.collectorsWanted("Auto", false), true);
+  assert.equal(Logic.collectorsWanted(undefined, true), false, "a missing setting reads as Auto");
+  assert.equal(Logic.collectorsWanted(undefined, false), true);
+  assert.equal(Logic.collectorsWanted("On", true), true, "On is the user asking for them explicitly");
+  assert.equal(Logic.collectorsWanted(" on ", false), true);
 });
 
 test("QML binds provider sections to the tested logic instead of unconditional visibility", () => {
@@ -187,6 +202,27 @@ test("QML binds provider sections to the tested logic instead of unconditional v
   assert.match(harness, /grep -Ei 'WARN\|WARNING\|ERROR\|TypeError\|ReferenceError'/);
   assert.match(harness, /scenario.*did not produce/);
   assert.match(readFileSync(join(ROOT, "tests", "omarchy-harness", "fixtures.mjs"), "utf-8"), /recentDays: \[null\]/);
+  assert.match(harness, /if \[\[ ",\$SCENARIOS," == \*",adversarial,"\* \]\]/, "the adversarial fixture is copied only for its own scenario");
+  assert.match(readFileSync(join(ROOT, "tests", "omarchy-harness", "shell.qml"), "utf-8"), /case "adversarial":/);
+});
+
+test("the retryAdvised timer obeys the same collector switch as the interval timer", () => {
+  const main = readFileSync(join(PLUGIN, "Main.qml"), "utf-8");
+  assert.match(main, /readonly property bool collectorsWanted: Logic\.collectorsWanted\(collectorsSetting, builtinOnBar\)/);
+  assert.match(main, /onTriggered: if \(root\.collectorsWanted\) root\.runCollectors\("limits", root\.retryAgentIds\)/);
+  assert.match(main, /Logic\.advisedRetryIds\(records, settings, collectorsWanted\)/);
+  assert.match(main, /function runCollectors\(kind, agentIds\) \{[^}]*if \(!collectorsWanted\) return/, "runCollectors itself refuses to start when the switch is off");
+  assert.match(main, /onCollectorsWantedChanged: scheduleLimitsRetry\(\)/);
+});
+
+test("two records that claim one id become one section, newest wins", () => {
+  const older = { id: "codex", name: "Codex", updatedAt: "2026-11-03T10:00:00.000Z", ready: true, limits: [{ title: "Weekly", percent: 0.1 }] };
+  const newer = { id: "codex", name: "Codex", updatedAt: "2026-11-03T11:00:00.000Z", ready: true, limits: [{ title: "Weekly", percent: 0.8 }] };
+  const timeless = { id: "codex", name: "Codex", ready: true, limits: [{ title: "Weekly", percent: 0.2 }] };
+  const providers = plain(Logic.visibleProviders([newer, timeless, older], {}));
+  assert.equal(providers.length, 1, "one id is one section");
+  assert.equal(providers[0].limits[0].percent, 0.8, "the newest updatedAt wins");
+  assert.deepEqual(plain(Logic.visibleProviders([timeless, older, newer], {})).map((/** @type {any} */ p) => p.providerId), ["codex"]);
 });
 
 test("limit percentages are clamped to the normalized range", () => {
@@ -197,6 +233,16 @@ test("limit percentages are clamped to the normalized range", () => {
     { title: "Invalid", percent: NaN },
   ]));
   assert.deepEqual(limits.map((/** @type {any} */ w) => w.percent), [1, 1, 0.42]);
+});
+
+test("an absurd or non-finite token count never renders InfinityB", () => {
+  assert.equal(Logic.formatTokenCount(Infinity), "—");
+  assert.equal(Logic.formatTokenCount(-Infinity), "—");
+  assert.equal(Logic.formatTokenCount(NaN), "—");
+  assert.equal(Logic.formatTokenCount(1e299), "999.9B", "a corrupt count is clamped, not exponentiated");
+  assert.equal(Logic.formatTokenCount(1e12), "999.9B");
+  assert.equal(Logic.formatTokenCount(2_001_500), "2.0M");
+  assert.equal(Logic.formatTokenCount(900), "900");
 });
 
 test("null recent-day entries are ignored by logic", () => {
