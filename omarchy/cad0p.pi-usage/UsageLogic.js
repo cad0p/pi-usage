@@ -141,9 +141,19 @@ function compactDuration(ms) {
 
 // ----------------------------------------------------------------- accounts
 
+// The longest account label of a section, which sizes its label column.
+function longestId(rows) {
+  var longest = ""
+  var list = isList(rows) ? rows : []
+  for (var i = 0; i < list.length; i++) {
+    var id = list[i] && list[i].id != null ? String(list[i].id) : ""
+    if (id.length > longest.length) longest = id
+  }
+  return longest
+}
+
 // One row per account of a multi-account record, every window kept. The base
-// auth.json entry has no number, so its id stays empty (a blank, aligned column)
-// instead of an invented "#1"; a record cached before the fix is normalized.
+// auth.json entry is "#1"; a record written while it was unlabelled says "".
 function accountRows(p) {
   var list = p && isList(p.accounts) ? p.accounts : []
   var rows = []
@@ -151,7 +161,7 @@ function accountRows(p) {
     var entry = list[i] || {}
     var windows = limitWindows(entry.limits)
     var id = entry.id == null ? "" : String(entry.id)
-    if (id === "#1") id = ""
+    if (id === "") id = "#1"
     rows.push({
       id: id,
       ok: entry.ok === true,

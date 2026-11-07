@@ -208,7 +208,7 @@ test("assistant messages map to families and siblings, and unknown providers are
   assert.equal(result.byFamily["opencode-go"].byAccount["#7"].todayTokens, 110);
   // The per-account model split is what the History page names on an account's
   // live (unfrozen) row; without it the merged row shows a number and no model.
-  assert.deepEqual(result.byFamily.claude.byAccount[""].todayTokensByModel, { "claude-opus-5-5": 14_172 });
+  assert.deepEqual(result.byFamily.claude.byAccount["#1"].todayTokensByModel, { "claude-opus-5-5": 14_172 });
   assert.deepEqual(result.byFamily["opencode-go"].byAccount["#7"].todayTokensByModel, { "deepseek-v4.1-flash": 110 });
   assert.equal(result.byFamily.claude.recentDays.at(-1).date, TODAY);
   assert.equal(result.byFamily.claude.recentDays.length, 7);
@@ -241,7 +241,7 @@ test("usageFromLine rejects malformed lines, other roles and non-message entries
   assert.equal(usageFromLine(JSON.stringify({ type: "message", message: { role: "assistant", provider: "anthropic" } }), NOW), null);
 });
 
-test("a totals file written before the label fix reads back as one unnumbered base account", () => {
+test("a totals file written while the base was unlabelled reads back as one #1 account", () => {
   const totals = parseTotals({
     schemaVersion: 1,
     lastFrozenDay: "2026-11-02",
@@ -253,17 +253,48 @@ test("a totals file written before the label fix reads back as one unnumbered ba
         totalSessions: 1,
         modelUsage: {},
         accounts: {
-          "#1": { totalPrompts: 2, totalSessions: 1, modelUsage: {} },
+          "": { totalPrompts: 2, totalSessions: 1, modelUsage: {} },
           "#2": { totalPrompts: 0, totalSessions: 0, modelUsage: {} },
         },
       },
     },
   });
   assert.ok(totals);
-  assert.deepEqual(Array.from(totals.families.get("opencode-go").accounts.keys()).sort(), ["", "#2"]);
+  assert.deepEqual(Array.from(totals.families.get("opencode-go").accounts.keys()).sort(), ["#1", "#2"]);
 });
 
-test("the base account is unnumbered and siblings sort numerically", async () => {
+test("a totals file carrying both \"#1\" and \"\" for the base sums them instead of dropping one", () => {
+  const bucket = (input) => ({ input, output: 0, cacheRead: 0, cacheWrite: 0, messages: 1 });
+  const totals = parseTotals({
+    schemaVersion: 1,
+    lastFrozenDay: "2026-11-02",
+    families: {
+      "opencode-go": {
+        firstDay: "2026-10-01",
+        activeDates: ["2026-10-01", "2026-11-02"],
+        totalPrompts: 5,
+        totalSessions: 2,
+        modelUsage: {},
+        accounts: {
+          // Frozen before the base lost its number, then while it had none.
+          "#1": { totalPrompts: 3, totalSessions: 1, modelUsage: { "m-old": bucket(100), shared: bucket(10) } },
+          "": { totalPrompts: 2, totalSessions: 1, modelUsage: { "m-new": bucket(50), shared: bucket(5) } },
+        },
+      },
+    },
+  });
+  assert.ok(totals);
+  const accounts = totals.families.get("opencode-go").accounts;
+  assert.deepEqual(Array.from(accounts.keys()), ["#1"]);
+  const base = accounts.get("#1");
+  assert.equal(base.totalPrompts, 5);
+  assert.equal(base.totalSessions, 2);
+  assert.deepEqual(Array.from(base.models.keys()).sort(), ["m-new", "m-old", "shared"]);
+  assert.equal(base.models.get("shared").input, 15);
+  assert.equal(base.models.get("shared").messages, 2);
+});
+
+test("the base account is #1 and siblings sort numerically", async () => {
   const tree = tempTree();
   writeSession(tree.sessions, "a.jsonl", [
     assistantLine({ ts: tsForDay(0), provider: "opencode-go", usage: { input: 11, output: 0, cacheRead: 0, cacheWrite: 0 } }),
@@ -276,8 +307,8 @@ test("the base account is unnumbered and siblings sort numerically", async () =>
   const result = await scan(tree);
   const stats = result.byFamily["opencode-go"];
 
-  assert.deepEqual(Object.keys(stats.byAccount), ["", "#2", "#7", "#10"]);
-  assert.equal(stats.byAccount[""].todayTokens, 11);
+  assert.deepEqual(Object.keys(stats.byAccount), ["#1", "#2", "#7", "#10"]);
+  assert.equal(stats.byAccount["#1"].todayTokens, 11);
   assert.equal(stats.byAccount["#2"].todayTokens, 22);
   assert.equal(stats.byAccount["#2"].weekTokens, 22, "the 20-day-old message is outside the 7-day window");
   assert.equal(stats.byAccount["#2"].totalTokens, 5_022);

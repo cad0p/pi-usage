@@ -78,6 +78,20 @@ export async function fetchQuota(credential, options = {}) {
     expiresInMin: options.expiresInMin ?? null,
   };
 
+  // An OpenAI API key in a Codex slot is pay-as-you-go: no plan windows, no
+  // balance readable with it, and never sent to the ChatGPT usage endpoint.
+  if (credential.kind === "api_key") {
+    return /** @type {import("../model.js").QuotaResult} */ ({
+      ...base,
+      plan: null,
+      windows: [],
+      note: "API key · pay-as-you-go, no plan windows (OpenAI shows API keys no balance)",
+      error: null,
+      ok: true,
+      updatedAt: new Date(now).toISOString(),
+    });
+  }
+
   if (!credential.access) {
     return degradedResult({ ...base, error: "Pi store has no openai-codex access token; run /login openai-codex in Pi" });
   }

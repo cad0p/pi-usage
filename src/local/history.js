@@ -200,11 +200,11 @@ export function hasMonthFiles(historyDir) {
 
 /**
  * @param {string} slot
- * @returns {string} "" for the base entry (it has no number), "#<slot>" for a
- * real sibling slot.
+ * @returns {string} "#1" for the base entry (the first account of the family),
+ * "#<slot>" for a sibling slot ("#2", "#1-api").
  */
 export function accountLabel(slot) {
-  return slot === "" || slot === null || slot === undefined ? "" : `#${slot}`;
+  return slot === "" || slot === null || slot === undefined ? "#1" : `#${slot}`;
 }
 
 /**
@@ -521,15 +521,36 @@ export function parseTotals(raw) {
     if (entry.accounts && typeof entry.accounts === "object" && !Array.isArray(entry.accounts)) {
       for (const [rawLabel, accountValue] of Object.entries(entry.accounts)) {
         if (!accountValue || typeof accountValue !== "object") continue;
-        // Files written before the base entry lost its invented "#1" carry that
-        // key; normalize on read so one account never shows up twice.
-        const label = rawLabel === "#1" ? "" : rawLabel;
+        // Files written while the base entry was unlabelled carry "" for it;
+        // normalize on read so one account never shows up twice.
+        // A file frozen across both conventions carries "#1" and "" for the
+        // same account: the two halves are summed, never one dropped.
+        const label = rawLabel === "" ? "#1" : rawLabel;
         const account = /** @type {Record<string, unknown>} */ (accountValue);
-        familyTotals.accounts.set(label, {
+        const parsed = {
           totalPrompts: count(account.totalPrompts),
           totalSessions: count(account.totalSessions),
           models: modelsFromJson(account.modelUsage),
-        });
+        };
+        const existing = familyTotals.accounts.get(label);
+        if (!existing) {
+          familyTotals.accounts.set(label, parsed);
+          continue;
+        }
+        existing.totalPrompts += parsed.totalPrompts;
+        existing.totalSessions += parsed.totalSessions;
+        for (const [model, bucket] of parsed.models) {
+          const seen = existing.models.get(model);
+          if (!seen) {
+            existing.models.set(model, bucket);
+            continue;
+          }
+          seen.input += bucket.input;
+          seen.output += bucket.output;
+          seen.cacheRead += bucket.cacheRead;
+          seen.cacheWrite += bucket.cacheWrite;
+          seen.messages += bucket.messages;
+        }
       }
     }
   }

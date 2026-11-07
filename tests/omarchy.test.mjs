@@ -189,18 +189,17 @@ test("a multi-account family becomes one record with one binding window per acco
   assert.equal(record.tierLabel, "2 of 2 accounts");
   assert.equal(record.usageStatusText, "");
   assert.deepEqual(record.limits, [
-    { label: "Monthly window", title: "Monthly", percent: 0.9, resetsAt: "2026-10-20T00:00:00.000Z" },
+    { label: "#1 · Monthly window", title: "#1 · Monthly", percent: 0.9, resetsAt: "2026-10-20T00:00:00.000Z" },
     { label: "#2 · Weekly window", title: "#2 · Weekly", percent: 0.05, resetsAt: "2026-10-05T10:00:00.000Z" },
   ]);
 });
 
-test("a report cached before the label fix keeps the base account unnumbered", () => {
+test("a report cached while the base was unlabelled reads it back as #1", () => {
   const providers = [
     provider({
       family: "opencode-go",
       label: "OpenCode Go (Pi)",
-      account: "#1",
-      slot: null,
+      account: "",
       windows: [{ id: "monthly", label: "Monthly window", usedPercent: 90, remainingPercent: 10, resetsAt: null }],
     }),
     provider({
@@ -212,9 +211,9 @@ test("a report cached before the label fix keeps the base account unnumbered", (
     }),
   ];
   const { record } = buildRecords(/** @type {any} */ ({ providers }), { now: NOW })[0];
-  assert.equal(record.accounts[0].id, "", "the legacy #1 becomes the unnumbered base entry");
-  assert.deepEqual(record.limits.map((limit) => limit.title), ["Monthly", "#2 · Monthly"]);
-  assert.equal(/#1/.test(JSON.stringify(record)), false);
+  assert.equal(record.accounts.length, 2, "one account, never a #1 next to a blank twin");
+  assert.equal(record.accounts[0].id, "#1", "the unlabelled base reads back as #1");
+  assert.deepEqual(record.limits.map((limit) => limit.title), ["#1 · Monthly", "#2 · Monthly"]);
 });
 
 test("failed accounts add no rows and are summarised by reason with slot ranges", () => {
@@ -242,7 +241,7 @@ test("failed accounts add no rows and are summarised by reason with slot ranges"
   assert.equal(record.tierLabel, "2 of 6 accounts");
   assert.equal(record.usageStatusText, "4 of 6 accounts unavailable");
   assert.equal(record.authHelpText, "#3–#4 key rejected · #5–#6 no Go plan");
-  assert.deepEqual(record.limits.map((limit) => limit.title), ["Session", "#2 · Session"]);
+  assert.deepEqual(record.limits.map((limit) => limit.title), ["#1 · Session", "#2 · Session"]);
 });
 
 test("a multi-account family where every account fails keeps the single-failure shape", () => {
@@ -261,7 +260,7 @@ test("a multi-account family where every account fails keeps the single-failure 
   const { record } = buildRecords(/** @type {any} */ ({ providers }), { now: NOW })[0];
   assert.equal(record.ready, false);
   assert.equal(record.usageStatusText, "Credential rejected");
-  assert.equal(record.authHelpText, "base, #2 credential rejected");
+  assert.equal(record.authHelpText, "#1–#2 credential rejected");
   assert.equal(record.limits.length, 1);
   assert.ok(record.limits[0].percent < 0, "the panel filters percent < 0, so nothing is drawn");
 });
@@ -302,7 +301,7 @@ test("a multi-account record lists every window of every account, failed ones wi
   const { record } = buildRecords(/** @type {any} */ ({ providers }), { now: NOW })[0];
   assert.deepEqual(record.accounts, [
     {
-      id: "",
+      id: "#1",
       ok: true,
       status: "",
       limits: [
@@ -316,8 +315,33 @@ test("a multi-account record lists every window of every account, failed ones wi
   ]);
   // The flattened limits Omarchy's built-in panel reads are unchanged.
   assert.deepEqual(record.limits, [
-    { label: "Monthly window", title: "Monthly", percent: 0.9, resetsAt: "" },
+    { label: "#1 · Monthly window", title: "#1 · Monthly", percent: 0.9, resetsAt: "" },
   ]);
+});
+
+test("account labels come from the slot, never from a Claude or Codex identity", () => {
+  const providers = [
+    provider({
+      family: "claude",
+      label: "Claude (Pi)",
+      account: "id c64efc0f…",
+      slot: null,
+      windows: [{ id: "5h", label: "5h window", usedPercent: 10, remainingPercent: 90, resetsAt: null }],
+    }),
+    provider({
+      family: "claude",
+      label: "Claude (Pi)",
+      account: "id 00aa11bb…",
+      slot: "1-api",
+      windows: [],
+      note: "API key · pay-as-you-go, no plan windows (Anthropic shows API keys no balance)",
+    }),
+  ];
+
+  const { record } = buildRecords(/** @type {any} */ ({ providers }), { now: NOW })[0];
+  assert.deepEqual(record.accounts.map((account) => account.id), ["#1", "#1-api"]);
+  assert.equal(/c64efc0f|00aa11bb/.test(JSON.stringify(record)), false, "the identity never leaks into a label");
+  assert.equal(record.accounts[1].status, "API key · pay-as-you-go, no plan windows (Anthropic shows API keys no balance)");
 });
 
 test("a single-account record carries no accounts list", () => {

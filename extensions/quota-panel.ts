@@ -77,6 +77,8 @@ type QuotaProvider = {
   label: string;
   primaryWindowId?: string | null;
   account: string;
+  /** The auth.json slot: null for the base entry, "2" or "1-api" for a sibling. */
+  slot?: string | null;
   plan: string | null;
   windows: QuotaWindow[];
   error: string | null;
@@ -791,20 +793,22 @@ function accountReason(error: string | null | undefined): string {
 }
 
 /**
- * The slot label of an account: "" for the base auth.json entry (it has no
- * number, so no surface may invent one) and "#<slot>" for a real sibling. A
- * report cached before the fix still says "#1" for the base entry.
+ * The slot label of an account: "#1" for the base auth.json entry, "#<slot>"
+ * for a sibling ("#2", "#1-api"). Never an identity such as Claude's
+ * "id c64efc0f…". A report cached without `slot` falls back to an account that
+ * already is a slot label; one cached while the base was unlabelled says "".
  */
-function accountLabel(account: string | null | undefined): string {
-  const text = String(account ?? "");
-  if (text === "#1") return "";
-  return /^#\d+$/.test(text) ? text : text;
+function accountLabel(provider: Pick<QuotaProvider, "account" | "slot">): string {
+  if (typeof provider.slot === "string" && provider.slot !== "") return `#${provider.slot}`;
+  if (provider.slot === null || provider.slot === "") return "#1";
+  const account = String(provider.account ?? "");
+  return /^#[0-9][\w-]*$/.test(account) ? account : "#1";
 }
 
-/** The per-account token row, tolerating the old "#1" key in a cached scan. */
+/** The per-account token row, tolerating the "" key a scan cached while the base was unlabelled. */
 function accountStats(stats: LocalFamilyStats | undefined, label: string): LocalAccountStats | undefined {
   if (!stats?.byAccount) return undefined;
-  return stats.byAccount[label] ?? (label === "" ? stats.byAccount["#1"] : undefined);
+  return stats.byAccount[label] ?? (label === "#1" ? stats.byAccount[""] : undefined);
 }
 
 /**
@@ -826,9 +830,8 @@ function renderAccountRows(accounts: QuotaProvider[], theme: Theme, stats?: Loca
   const healthy = accounts.filter((account) => account.ok).length;
   const header = `${paint(BRAND[family] ?? "#8B949E", SHORT_NAME[family] ?? accounts[0].label)} ${theme.fg("dim", `· ${healthy} of ${accounts.length} accounts ok`)}`;
   const lines = [header];
-  // The base entry has no number: its label column is blank but padded to the
-  // widest sibling, so the percentage columns still line up.
-  const labels = accounts.map((account) => accountLabel(account.account));
+  // Labels are padded to the widest one ("#1-api"), so the percentage columns line up.
+  const labels = accounts.map((account) => accountLabel(account));
   const width = Math.max(...labels.map((label) => label.length));
   accounts.forEach((account, index) => {
     const label = theme.fg("dim", labels[index].padEnd(width));
@@ -841,7 +844,9 @@ function renderAccountRows(accounts: QuotaProvider[], theme: Theme, stats?: Loca
     const window = bindingWindow(account);
     const used = usedOf(window);
     if (window === null || used === null) {
-      lines.push(`  ${label}  ${theme.fg("dim", "no rate-limit windows reported")}`);
+      // An account that answered without windows (an API key, Mistral without
+      // the usage permission) says why instead of a generic line.
+      lines.push(`  ${label}  ${theme.fg("dim", account.note ?? "no rate-limit windows reported")}`);
       return;
     }
     // Every window on one line, each in its own band colour; the leading glyph
@@ -873,8 +878,9 @@ function renderProviderLines(provider: QuotaProvider, theme: Theme, localStats: 
   const lines: string[] = [];
   const labelWidth = Math.max(6, ...provider.windows.map((window) => String(window.label ?? "").length));
   const name = paint(BRAND[provider.family] ?? "#8B949E", provider.label);
-  const account = accountLabel(provider.account);
-  const meta: string[] = account === "" ? [] : [account];
+  // A lone account is the family: its "#1" would say nothing.
+  const account = String(provider.account ?? "");
+  const meta: string[] = account === "" || account === "#1" ? [] : [account];
   if (provider.plan) meta.push(`plan ${provider.plan}`);
   // Two stores can back Claude, and this is the one place that says which.
   if (provider.sourceKind === "claude-code") meta.push("Claude Code CLI");
@@ -1271,9 +1277,9 @@ function totalsModelTokens(bucket: HistoryTotalsModel | undefined): number {
   return values.reduce((sum, value) => sum + Math.max(0, Math.round(Number(value) || 0)), 0);
 }
 
-/** Slot labels sort "" (the unnumbered base) first, then #2, #3 … #10 numerically. */
+/** Slot labels sort the base ("#1", or "" from older files) first, then #2, #3 … #10 numerically. */
 function slotOrder(label: string): number {
-  if (label === "") return -1;
+  if (label === "" || label === "#1") return -1;
   const numeric = Number.parseInt(label.replace(/^#/, ""), 10);
   return Number.isFinite(numeric) ? numeric : Number.MAX_SAFE_INTEGER;
 }
@@ -1893,7 +1899,7 @@ export class UsageOverlay {
         entry.prompts += Math.max(0, Math.round(Number(day?.prompts) || 0));
         entry.days.set(date, (entry.days.get(date) ?? 0) + tokens);
         for (const [slot, slotRow] of Object.entries(day?.slots ?? {})) {
-          const label = slot === "" ? "" : `#${slot}`;
+          const label = slot === "" ? "#1" : `#${slot}`;
           const account = entry.accounts.get(label) ?? { tokens: 0, prompts: 0, models: new Map<string, number>() };
           account.tokens += Math.max(0, Math.round(Number(slotRow?.tokens) || 0));
           account.prompts += Math.max(0, Math.round(Number(slotRow?.prompts) || 0));
@@ -1953,7 +1959,7 @@ export class UsageOverlay {
           entry.models.set(model, (entry.models.get(model) ?? 0) + Math.max(0, Math.round(Number(modelTokens) || 0)));
         }
         for (const [rawLabel, account] of Object.entries(familyStats.byAccount ?? {})) {
-          const label = rawLabel === "#1" ? "" : rawLabel;
+          const label = rawLabel === "" ? "#1" : rawLabel;
           const target = entry.accounts.get(label) ?? { tokens: 0, prompts: 0, models: new Map<string, number>() };
           const accountTokens = Math.max(0, Math.round(Number(account?.todayTokens) || 0));
           const accountPrompts = Math.max(0, Math.round(Number(account?.todayPrompts) || 0));
@@ -1976,7 +1982,7 @@ export class UsageOverlay {
       entry.allTime = Object.values(totals?.modelUsage ?? {}).reduce((sum, bucket) => sum + totalsModelTokens(bucket), 0);
       entry.allTimePrompts = Math.max(0, Math.round(Number(totals?.totalPrompts) || 0));
       for (const [rawLabel, account] of Object.entries(totals?.accounts ?? {})) {
-        const label = rawLabel === "#1" ? "" : rawLabel;
+        const label = rawLabel === "" ? "#1" : rawLabel;
         const tokens = Object.values(account?.modelUsage ?? {}).reduce((sum, bucket) => sum + totalsModelTokens(bucket), 0);
         const prompts = Math.max(0, Math.round(Number(account?.totalPrompts) || 0));
         const seen = entry.allTimeAccounts.get(label) ?? { tokens: 0, prompts: 0 };

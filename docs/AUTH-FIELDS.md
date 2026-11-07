@@ -44,6 +44,12 @@ and is ignored). Siblings share the base family; the base entry itself has a
 `null` slot. Different secrets in two slots stay separate credentials, while the
 same secret in two slots collapses into one.
 
+An `api_key` entry also works as a Claude or Codex sibling (`anthropic-1-api`,
+`openai-codex-1-api`): it is a working pay-as-you-go account shown with a note
+and no plan windows — Anthropic and OpenAI serve no balance to an API key — and
+the key is never sent anywhere. Choosing the Claude Code CLI store over Pi's
+`anthropic` login replaces only that OAuth login; an API-key account stays.
+
 ### Claude Code entry schema
 
 ```jsonc
@@ -85,7 +91,7 @@ session state, and none of it is read or echoed.
 | `accountId` | Codex | `chatgpt-account-id` header, display identity | no |
 | `projectId` | Antigravity | `{ project }` body field, display identity (printed once, also when it is the only identity there is) | no |
 | `email` | all | display identity, redacted in artifacts | no |
-| `key` | OpenCode Go, Mistral | OpenCode: Zen validity probe; Mistral: `Authorization: Bearer` to `api.mistral.ai/v1/billing/*` only; both: identity fingerprint | no |
+| `key` | OpenCode Go, Mistral, Claude/Codex `api_key` siblings | OpenCode: Zen validity probe; Mistral: `Authorization: Bearer` to `api.mistral.ai/v1/billing/*` only; Claude/Codex API keys: never sent, identity fingerprint only | no |
 
 Codex JWT **payload** only (signature never verified, token never disclosed):
 `https://api.openai.com/auth.chatgpt_account_id`, `…chatgpt_plan_type`,
@@ -119,6 +125,7 @@ Codex JWT **payload** only (signature never verified, token never disclosed):
 | Antigravity | no | **yes, in memory only** | transparent; nothing is preserved to disk, and the report describes the renewed token (no expiry claim) — a failed renewal keeps the stored countdown and its warning |
 | OpenCode Go | n/a (API key) | n/a | n/a |
 | Mistral | n/a (API key) | n/a | n/a |
+| Claude / Codex `api_key` sibling | n/a (API key) | n/a | n/a — the key is never sent; the account shows a note and no windows |
 
 Claude and OpenAI rotate the refresh token. Refreshing them here would invalidate
 Pi's stored copy and break Pi, so the provider degrades with an instruction

@@ -60,7 +60,7 @@ test("mistral: reads the Vibe and API monthly budgets and the plan", async () =>
   assert.equal(result.ok, true);
   assert.equal(result.family, "mistral");
   assert.equal(result.plan, "EDU");
-  assert.equal(result.account, "", "the base entry carries no number");
+  assert.equal(result.account, "#1", "the base entry is the family's first account");
   assert.deepEqual(result.windows.map((window) => [window.id, window.label]), [["vibe", "Vibe monthly"], ["api", "API monthly"]]);
   assert.equal(result.windows[0].usedPercent, 81.053541208);
   assert.equal(result.windows[1].remainingPercent, 0);
@@ -218,7 +218,7 @@ test("mistral: collectQuota reports every Mistral slot in auth.json order", asyn
   const { fetchFn, calls } = routes();
   const report = await collectQuota({ paths: [authPath], claudeCodePaths: [], now: NOW, fetchFn, families: ["mistral"], env: {}, home: directory, stores: [], allowBrowser: false });
   const results = report.byFamily.mistral;
-  assert.deepEqual(results.map((result) => [result.slot ?? null, result.account, result.ok]), [[null, "", true], ["1-api", "#1-api", true]]);
+  assert.deepEqual(results.map((result) => [result.slot ?? null, result.account, result.ok]), [[null, "#1", true], ["1-api", "#1-api", true]]);
   assert.equal(calls.some((call) => String(call.init.headers.Authorization).includes("ignored")), false, "a non-slot suffix is never queried");
   assert.equal(JSON.stringify(report).includes("mistral-FAKE"), false, "no key reaches the report");
 });
@@ -265,7 +265,7 @@ test("mistral: without the usage permission every surface says why", async () =>
   const { fetchFn: healthy } = routes();
   const sibling = { ...(await fetchQuota(credential("mistral-1-api"), { now: NOW, fetchFn: healthy })), slot: "1-api" };
   const family = buildRecords(/** @type {any} */ ({ providers: [quiet, sibling], byFamily: { mistral: [quiet, sibling] } }), { now: NOW })[0].record;
-  const base = family.accounts.find((account) => account.id === "");
+  const base = family.accounts.find((account) => account.id === "#1");
   assert.equal(base.ok, true);
   assert.match(base.status, /see_org_inference_usage/, "the multi-account row says why it is empty");
 });
@@ -330,7 +330,7 @@ test("mistral: the Omarchy record carries both budgets, the plan and no key", as
   assert.equal(text.includes(KEY), false);
   assert.match(text, /Vibe monthly/);
   assert.match(text, /API monthly/);
-  assert.deepEqual(record.accounts.map((account) => account.id), ["", "#1-api"]);
+  assert.deepEqual(record.accounts.map((account) => account.id), ["#1", "#1-api"]);
   for (const account of record.accounts) {
     for (const limit of account.limits) assert.ok(limit.percent >= 0 && limit.percent <= 1, JSON.stringify(limit));
   }

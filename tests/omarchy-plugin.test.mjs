@@ -62,12 +62,12 @@ function goRecord() {
     usageStatusText: "1 of 3 accounts unavailable",
     authHelpText: "#3 key rejected",
     limits: [
-      { label: "Monthly window", title: "Monthly", percent: 1, resetsAt: at(18 * DAY) },
+      { label: "#1 · Monthly window", title: "#1 · Monthly", percent: 1, resetsAt: at(18 * DAY) },
       { label: "#2 · Monthly window", title: "#2 · Monthly", percent: 0.9, resetsAt: at(19 * DAY) },
     ],
     accounts: [
       {
-        id: "",
+        id: "#1",
         ok: true,
         status: "",
         limits: [
@@ -278,21 +278,38 @@ test("a multi-account headline is the healthy account with the most room left", 
   assert.equal(Logic.headerMeta(p), "2 of 3 accounts");
 });
 
-test("a record written before the label fix does not print an invented #1", () => {
+test("a record written while the base was unlabelled reads it back as #1", () => {
   const record = goRecord();
   record.accounts = [
-    { id: "#1", ok: true, status: "", limits: [{ label: "5h window", title: "Session", percent: 0.1, resetsAt: at(HOUR) }] },
+    { id: "", ok: true, status: "", limits: [{ label: "5h window", title: "Session", percent: 0.1, resetsAt: at(HOUR) }] },
     ...record.accounts.slice(1),
   ];
   record.limits = record.limits.slice(1);
   const rows = plain(Logic.accountRows(Logic.displayProvider(record)));
-  assert.equal(rows[0].id, "", "the base row is blank, not #1");
-  assert.equal(plain(Logic.headline(Logic.displayProvider(record))).title, "Session", "an unnumbered base headline has no prefix");
+  assert.equal(rows[0].id, "#1", "the unlabelled base reads back as #1");
+  assert.equal(plain(Logic.headline(Logic.displayProvider(record))).title, "#1 · Session", "the headline carries the slot prefix");
+});
+
+test("longestId returns the longest account id and tolerates junk", () => {
+  assert.equal(Logic.longestId([{ id: "#1" }, { id: "#1-api" }, { id: "#2" }]), "#1-api");
+  assert.equal(Logic.longestId([]), "");
+  assert.equal(Logic.longestId(null), "");
+  assert.equal(Logic.longestId({ id: "#1" }), "");
+  assert.equal(Logic.longestId([null, { id: "#14" }, {}, { id: null }]), "#14");
+});
+
+test("the account label column is sized by the longest id, capped and elided", () => {
+  const content = readFileSync(join(PLUGIN, "UsageContent.qml"), "utf-8");
+  assert.match(content, /TextMetrics \{[\s\S]*?text: Logic\.longestId\(section\.accountList\)/, "the label column measures the longest account id");
+  assert.match(content, /labelWidth: accountsSection\.labelWidth/, "each account row gets the section's computed width");
+  assert.match(content, /width: accountRow\.labelWidth/, "the slot label takes that width");
+  assert.match(content, /width \* 0\.35/, "a pathological label is capped at a share of the row");
+  assert.match(content, /elide: Text\.ElideRight/, "…and elided");
 });
 
 test("every account keeps every window, and a failed account keeps its status", () => {
   const rows = plain(Logic.accountRows(Logic.displayProvider(goRecord())));
-  assert.deepEqual(rows.map((/** @type {any} */ row) => row.id), ["", "#2", "#3"], "the base entry has no number");
+  assert.deepEqual(rows.map((/** @type {any} */ row) => row.id), ["#1", "#2", "#3"], "the base entry is #1");
   assert.deepEqual(rows[1].windows.map((/** @type {any} */ w) => Logic.windowTag(w.title)), ["session", "week", "month"]);
   assert.equal(rows[1].binding.title, "Monthly");
   assert.equal(rows[2].ok, false);

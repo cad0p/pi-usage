@@ -282,7 +282,8 @@ function wideReport() {
     family: "opencode-go",
     label: "OpenCode Go (Pi)",
     primaryWindowId: "5h",
-    account: slot === 1 ? "" : `#${slot}`,
+    account: `#${slot}`,
+    slot: slot === 1 ? null : String(slot),
     plan: "Go subscription",
     windows: [
       { id: "5h", label: "5h window", usedPercent: 0, remainingPercent: 100, resetsAt: null, resetsInSec: 18_000, note: null },
@@ -324,7 +325,8 @@ function overlayReport() {
     family: "opencode-go",
     label: "OpenCode Go (Pi)",
     primaryWindowId: "5h",
-    account: slot === 1 ? "" : `#${slot}`,
+    account: `#${slot}`,
+    slot: slot === 1 ? null : String(slot),
     plan: "Go plan",
     windows: [
       { id: "5h", label: "5h window", usedPercent: used, remainingPercent: 100 - used, resetsAt: null, resetsInSec: 600, note: null },
@@ -370,7 +372,7 @@ test("the full panel lists every account while the box and the line keep one per
     family: "opencode-go",
     label: "OpenCode Go (Pi)",
     primaryWindowId: "5h",
-    account: slot === 1 ? "" : `#${slot}`,
+    account: `#${slot}`,
     slot: slot === 1 ? null : String(slot),
     plan: "Go plan",
     windows: [
@@ -401,8 +403,8 @@ test("the full panel lists every account while the box and the line keep one per
   const panelWidget = harness.widgets.at(-1);
   const panel = plain(renderWidget(panelWidget).join("\n"));
   assert.match(panel, /OP-Go · 2 of 2 accounts ok/);
-  assert.match(panel, /^ +● session +10% \(10m\) +· month 100% \(10d\)/m, "the base entry has no number and still lists every window");
-  assert.equal(/#1\b/.test(panel), false, "no surface invents a number for the base entry");
+  assert.match(panel, /#1 +● session +10% \(10m\) +· month 100% \(10d\)/, "the base entry is #1 and still lists every window");
+  assert.equal((panel.match(/#1/g) ?? []).length, 1, "the base label prints once, on its own row");
   assert.match(panel, /#2 +● session +50% \(10m\) +· month 100% \(10d\)/);
   assert.equal(/5h window/.test(panel), false, "per-account windows are not listed one per line");
 });
@@ -413,7 +415,7 @@ test("the panel adds a compact token section per provider and per account", asyn
     family: "opencode-go",
     label: "OpenCode Go (Pi)",
     primaryWindowId: "5h",
-    account: slot === 1 ? "" : `#${slot}`,
+    account: `#${slot}`,
     slot: slot === 1 ? null : String(slot),
     plan: "Go plan",
     windows: [
@@ -518,7 +520,7 @@ test("the panel adds a compact token section per provider and per account", asyn
   assert.match(accountLines[1], /1\.3M today/, "the account line carries its own tokens");
 });
 
-test("a report cached before the label fix still renders the base account without a number", async () => {
+test("a report cached while the base was unlabelled reads it back as #1", async () => {
   const module = await import(EXTENSION);
   const legacy = (account, slot, today) => ({
     family: "opencode-go",
@@ -537,12 +539,12 @@ test("a report cached before the label fix still renders the base account withou
       generatedAt: "2030-01-01T00:00:00.000Z",
       sources: [],
       warnings: [],
-      providers: [legacy("#1", null), legacy("#2", "2")],
+      providers: [legacy("", null), legacy("#2", "2")],
       localStats: {
         "opencode-go": {
           hasLocalStats: true,
           todayTotalTokens: 500,
-          byAccount: { "#1": { todayTokens: 500 }, "#2": { todayTokens: 0 } },
+          byAccount: { "": { todayTokens: 500 }, "#2": { todayTokens: 0 } },
         },
       },
     },
@@ -552,9 +554,111 @@ test("a report cached before the label fix still renders the base account withou
   await usage.definition.handler("panel", harness.ctx);
   const panel = plain(renderWidget(harness.widgets.at(-1)).join("\n"));
 
-  assert.equal(/#1\b/.test(panel), false, "the legacy label is not printed");
+  assert.match(panel, /#1/, "the unlabelled base reads back as #1");
   assert.match(panel, /#2/, "a real slot keeps its number");
-  assert.match(panel, /500 today/, "the base row still finds its tokens under the old key");
+  assert.match(panel, /500 today/, "the base row still finds its tokens under the unlabelled key");
+});
+
+test("a Claude report labels its account rows by slot, never by identity", async () => {
+  const module = await import(EXTENSION);
+  const claudeAccount = (account, slot, used) => ({
+    family: "claude",
+    label: "Claude (Pi)",
+    primaryWindowId: "5h",
+    account,
+    slot,
+    plan: null,
+    windows: [{ id: "5h", label: "5h window", usedPercent: used, remainingPercent: 100 - used, resetsAt: null, resetsInSec: 600, note: null }],
+    error: null,
+    ok: true,
+    updatedAt: "2030-01-01T00:00:00.000Z",
+    expiresInMin: 600,
+  });
+  const harness = makeHarness({
+    report: {
+      generatedAt: "2030-01-01T00:00:00.000Z",
+      sources: [],
+      warnings: [],
+      providers: [
+        claudeAccount("id c64efc0f…", null, 10),
+        claudeAccount("id 00aa11bb…", "1-api", 50),
+      ],
+    },
+  });
+  module.default(harness.pi);
+  const usage = harness.commands.find((command) => command.name === "usage");
+  await usage.definition.handler("panel", harness.ctx);
+  const panel = plain(renderWidget(harness.widgets.at(-1)).join("\n"));
+
+  assert.match(panel, /Claude · 2 of 2 accounts ok/);
+  assert.match(panel, /#1 +○ session +10% \(10m\)/, "the base entry is #1, not its identity");
+  assert.match(panel, /#1-api +◕ session +50% \(10m\)/);
+  assert.equal(/c64efc0f|00aa11bb/.test(panel), false, "the identity is not a label");
+});
+
+test("a lone account's header carries no #1", async () => {
+  const module = await import(EXTENSION);
+  const harness = makeHarness({
+    report: {
+      generatedAt: "2030-01-01T00:00:00.000Z",
+      sources: [],
+      warnings: [],
+      providers: [{
+        family: "opencode-go",
+        label: "OpenCode Go (Pi)",
+        primaryWindowId: "5h",
+        account: "#1",
+        slot: null,
+        plan: "go",
+        windows: [{ id: "5h", label: "5h window", usedPercent: 10, remainingPercent: 90, resetsAt: null, resetsInSec: 600, note: null }],
+        error: null,
+        ok: true,
+        updatedAt: "2030-01-01T00:00:00.000Z",
+        expiresInMin: null,
+      }],
+    },
+  });
+  module.default(harness.pi);
+  const usage = harness.commands.find((command) => command.name === "usage");
+  await usage.definition.handler("panel", harness.ctx);
+  const panel = plain(renderWidget(harness.widgets.at(-1)).join("\n"));
+  assert.match(panel, /plan go/);
+  assert.equal(/#1/.test(panel), false);
+});
+
+test("an account row without windows prints the account's note, not a generic line", async () => {
+  const module = await import(EXTENSION);
+  const note = "API key · pay-as-you-go, no plan windows (Anthropic shows API keys no balance)";
+  const base = {
+    family: "claude",
+    label: "Claude (Pi)",
+    primaryWindowId: "5h",
+    plan: null,
+    error: null,
+    ok: true,
+    updatedAt: "2030-01-01T00:00:00.000Z",
+    expiresInMin: null,
+  };
+  const harness = makeHarness({
+    report: {
+      generatedAt: "2030-01-01T00:00:00.000Z",
+      sources: [],
+      warnings: [],
+      providers: [
+        { ...base, account: "id c64efc0f…", slot: null, note: null,
+          windows: [{ id: "5h", label: "5h window", usedPercent: 10, remainingPercent: 90, resetsAt: null, resetsInSec: 600, note: null }] },
+        { ...base, account: "id 00aa11bb…", slot: "1-api", note, windows: [] },
+      ],
+    },
+  });
+  module.default(harness.pi);
+  const usage = harness.commands.find((command) => command.name === "usage");
+  await usage.definition.handler("panel", harness.ctx);
+  const panel = plain(renderWidget(harness.widgets.at(-1)).join("\n"));
+
+  assert.match(panel, /Claude · 2 of 2 accounts ok/, "the API key is not a down account");
+  assert.match(panel, /#1-api +API key · pay-as-you-go/);
+  assert.equal(/no rate-limit windows reported/.test(panel), false);
 });
 
 test("a partial scan is stated on the panel instead of being passed off as complete", async () => {
@@ -651,8 +755,7 @@ test("bare /usage opens a fullscreen overlay, refreshes behind it and leaves the
   assert.match(frame, /5h window/);
   assert.match(frame, /Weekly window/);
   assert.match(frame, /▾ OP-Go · 2 of 2 accounts ok/);
-  assert.match(frame, /\s+●\s+session/, "the base account row carries no invented number");
-  assert.equal(/#1\b/.test(frame), false, "the base entry has no number in any surface");
+  assert.match(frame, /#1\s+●\s+session/, "the base account row is #1");
   assert.match(frame, /#2\s+●\s+session/);
   assert.match(frame, /used % · read-only/, "the panel footer is part of the view");
   assert.equal(frame.split("\n").filter((line) => /2030-01-01T00:00:00\.000Z/.test(line)).length, 0, "the footer does not repeat the timestamp the header already prints");
@@ -2526,9 +2629,8 @@ test("tab opens the read-only history for the newest month", async () => {
   assert.match(frame, /models +claude-opus-5-5 1\.8k · claude-sonnet-5 200/, "…and its token split by model");
   assert.match(frame, /▾ OP-Go · 3\.0k in 2026-10 · 3\.0k all-time/);
   assert.match(frame, /prompts +6 in 2026-10 · 6 all-time/, "the prompt counts carry the month and the all-time scope");
-  assert.match(frame, /^ +month 1\.0k · all-time 1\.0k · deepseek-v4\.1-flash$/m, "the base account row is blank");
+  assert.match(frame, /#1 +month 1\.0k · all-time 1\.0k · deepseek-v4\.1-flash/, "the unlabelled totals key reads back as #1");
   assert.match(frame, /#2 +month 2\.0k · all-time 2\.0k · deepseek-v4\.1-flash/);
-  assert.equal(/#1\b/.test(frame), false, "history never invents a base number");
   assert.match(frame, /frozen through 2026-10-02 · 2026-10 · read-only/);
   assert.match(frame, /↑↓\/jk move/, "the legend lists movement");
   assert.match(frame, /enter\/space\/h\/l fold/, "…the fold keys");
@@ -3105,7 +3207,7 @@ test("a multi-account family keeps every account row when the month only used on
 
   const frame = frameText(overlays[0], 100);
   assert.match(frame, /▾ OP-Go · 2\.0k in 2026-10/, "a family with more than one account uses the Now short name");
-  assert.match(frame, /^ +month 0 · all-time 1\.0k$/m, "the idle account keeps its all-time row");
+  assert.match(frame, /#1 +month 0 · all-time 1\.0k/, "the idle account keeps its all-time row");
   assert.match(frame, /#2 +month 2\.0k · all-time 2\.0k · deepseek-v4\.1-flash/);
 
   overlays[0].component.handleInput("\u001b");
@@ -3468,7 +3570,7 @@ test("the merged live day carries each account's own models", async (t) => {
   await settle();
 
   const frame = frameText(overlays[0], 100);
-  assert.match(frame, /^ +month 500 · all-time 1\.0k · deepseek-v4\.1-flash$/m, "the merged day names the model that burned it, and its tokens reach that account's all-time total");
+  assert.match(frame, /#1 +month 500 · all-time 1\.0k · deepseek-v4\.1-flash/, "the merged day names the model that burned it, and its tokens reach that account's all-time total");
   assert.match(frame, /#2 +month 2\.0k · all-time 2\.0k · deepseek-v4\.1-flash/);
 
   overlays[0].component.handleInput("\u001b");

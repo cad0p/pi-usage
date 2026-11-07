@@ -106,6 +106,26 @@ function formatOverage(extra) {
   return `extra usage ${amount.toFixed(decimals ?? 0)}${currency ? ` ${currency}` : ""}`;
 }
 
+/** The note an Anthropic API key carries instead of plan windows. */
+export const API_KEY_NOTE = "API key · pay-as-you-go, no plan windows (Anthropic shows API keys no balance)";
+
+/**
+ * @param {Record<string, unknown>} base
+ * @param {number} now
+ * @returns {import("../model.js").QuotaResult}
+ */
+function apiKeyResult(base, now) {
+  return /** @type {import("../model.js").QuotaResult} */ ({
+    ...base,
+    plan: null,
+    windows: [],
+    note: API_KEY_NOTE,
+    error: null,
+    ok: true,
+    updatedAt: new Date(now).toISOString(),
+  });
+}
+
 /**
  * @param {import("../auth/pi-auth.js").PiCredential} credential
  * @param {{ now?: number, fetchFn?: typeof fetch, timeoutMs?: number, expiresInMin?: number | null }} [options]
@@ -124,6 +144,12 @@ export async function fetchQuota(credential, options = {}) {
     sourceKind: credential.sourceKind ?? "pi",
     expiresInMin: options.expiresInMin ?? null,
   };
+
+  // A pay-as-you-go API key beside the subscription (`anthropic-1-api`) is a
+  // working account with no plan windows. Anthropic serves no balance to an
+  // API key (the usage and cost reports need an Admin key), so it is shown as
+  // answered with a note, never as a down account, and the key is never sent.
+  if (credential.kind === "api_key") return apiKeyResult(base, now);
 
   if (!credential.access) {
     return degradedResult({

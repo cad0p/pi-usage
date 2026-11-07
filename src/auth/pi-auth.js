@@ -367,6 +367,17 @@ export function loadPiCredentials(options = {}) {
   }
 
   credentials.sort(compareCredentials);
+  // The base entry is a family's account #1, so a "<base>-1" sibling with a
+  // different secret would show as a second "#1". Say so instead of guessing.
+  const families = new Set(credentials.map((credential) => credential.family));
+  for (const family of families) {
+    const members = credentials.filter((credential) => credential.family === family && credential.sourceKind !== "claude-code");
+    const base = members.find((credential) => credential.slot === null || credential.slot === undefined);
+    const one = members.find((credential) => credential.slot === "1");
+    if (base && one) {
+      warnings.push(`${family}: ${base.provider} and ${one.provider} are both account #1; rename ${one.provider} to the next free number`);
+    }
+  }
   return { credentials, paths: usedPaths, warnings, rawProviders: Array.from(rawProviders) };
 }
 

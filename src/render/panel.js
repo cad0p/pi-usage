@@ -164,17 +164,19 @@ function wrapPlain(text, width) {
 }
 
 /**
- * The slot label of an account: "" for the base auth.json entry (it has no
- * number, so no surface may invent one), "#<slot>" for a real sibling. A report
- * cached before the fix still says "#1" for the base entry.
+ * The slot label of an account: "#1" for the base auth.json entry, "#<slot>"
+ * for a sibling ("#2", "#1-api"). The engine sets `slot`; a report cached
+ * without it falls back to an account that already is a slot label, and a
+ * report cached while the base was unlabelled says "" for it.
  *
- * @param {string | null | undefined} account
+ * @param {import("../model.js").QuotaResult} provider
  * @returns {string}
  */
-function slotLabel(account) {
-  if (typeof account !== "string") return "";
-  if (account === "#1") return "";
-  return /^#\d+$/.test(account) ? account : "";
+function slotLabel(provider) {
+  if (typeof provider.slot === "string" && provider.slot !== "") return `#${provider.slot}`;
+  if (provider.slot === null || provider.slot === "") return "#1";
+  const account = typeof provider.account === "string" ? provider.account : "";
+  return /^#[0-9][\w-]*$/.test(account) ? account : "#1";
 }
 
 /**
@@ -192,9 +194,9 @@ export function renderProviderLines(provider, paint, contentWidth = MAX_WIDTH, o
   const lines = [];
 
   // A multi-account family puts "#<slot>" in the title, so repeating it in the
-  // meta line would print the same label twice on one row. The unnumbered base
-  // entry contributes nothing, so the meta line does not start with a separator.
-  const accountText = provider.account === "#1" ? "" : slotLabel(provider.account) || provider.account || "";
+  // meta line would print the same label twice on one row.
+  // A lone account is the family: its "#1" would say nothing.
+  const accountText = provider.account === "#1" ? "" : provider.account || "";
   const meta = options.accountInTitle || accountText === "" ? [] : [accountText];
   if (provider.plan) meta.push(`plan ${provider.plan}`);
   // Claude has two stores, and a broken one is the first thing to rule out when
@@ -349,8 +351,7 @@ export function renderPanel(providers, paint, meta = {}) {
   /** @param {import("../model.js").QuotaResult} provider */
   const accountTitle = (provider) => {
     if ((familyCounts.get(provider.family) ?? 0) <= 1) return null;
-    const slot = slotLabel(provider.account);
-    return slot === "" ? null : `${FAMILY_TITLE[provider.family] ?? provider.label} ${slot}`;
+    return `${FAMILY_TITLE[provider.family] ?? provider.label} ${slotLabel(provider)}`;
   };
 
   // Render once at the hard maximum, then settle on the natural width of the

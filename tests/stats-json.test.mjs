@@ -154,7 +154,7 @@ test("stats --json lists the months, one month's days and the all-time totals", 
   assert.equal(payload.days["2026-10-01"]["opencode-go"].tokens, 3_000);
 
   assert.equal(payload.totals.lastFrozenDay, "2026-10-02");
-  assert.deepEqual(Object.keys(payload.totals.families["opencode-go"].accounts), ["", "#2"]);
+  assert.deepEqual(Object.keys(payload.totals.families["opencode-go"].accounts), ["#1", "#2"], "the unlabelled totals key reads back as #1");
   assert.equal(payload.totals.families.claude.modelUsage["claude-opus-5-5"].input, 2_000, "totals keep the stored bucket shape");
 });
 

@@ -80,8 +80,8 @@ shuvquota, and it never writes to a credential file.
 
 | Provider | Source | Endpoint | Result |
 | --- | --- | --- | --- |
-| Claude | Claude Code CLI store, else `anthropic.access` | `GET api.anthropic.com/api/oauth/usage` | ✅ 5h + weekly + plan |
-| Codex | `openai-codex.access` + `accountId` | `GET chatgpt.com/backend-api/wham/usage` | ✅ 5h + weekly + plan |
+| Claude | Claude Code CLI store, else `anthropic.access` | `GET api.anthropic.com/api/oauth/usage` | ✅ 5h + weekly + plan; an `api_key` sibling (`anthropic-1-api`) is a working pay-as-you-go account: no windows, a note, and its key is never sent (Anthropic serves no balance to API keys) |
+| Codex | `openai-codex.access` + `accountId` | `GET chatgpt.com/backend-api/wham/usage` | ✅ 5h + weekly + plan; an `api_key` sibling (`openai-codex-1-api`) is likewise a working pay-as-you-go account whose key is never sent |
 | Antigravity | `google-antigravity.access` (or legacy `antigravity`) + `projectId` | `POST cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary` | ✅ Gemini + Claude/GPT buckets, **with in-memory refresh** |
 | OpenCode Go | `opencode-go.key`, numbered siblings included | `GET opencode.ai/zen/go/v1/usage` | ✅ 5h + weekly + monthly per account; the session cookie and SSR dashboard are a base-account fallback |
 | Mistral | `mistral.key`, numbered siblings included | `GET api.mistral.ai/v1/billing/budget` + `/v1/billing/subscription` | ✅ Vibe monthly + API monthly + plan per key; without the `see_org_inference_usage` permission the plan alone, with a note. Keys of one organisation share its budgets, so they show the same numbers |
@@ -363,9 +363,10 @@ under both.
 A provider with several accounts is shown as one header (`OP-Go · 7 of 14 accounts
 ok`) plus one line per account with every window and its reset, e.g.
 `#2 ● session 2% (10m) · week 10% (6d) · month 90% (19d)`, or the reason it failed
-(`key rejected`, `no Go plan`). The base entry in `auth.json` (`opencode-go`) has
-no number, so its label column is blank; only real sibling slots (`opencode-go-2`
-…) are numbered `#2` … `#14`. The leading glyph is the fullest window's band. The
+(`key rejected`, `no Go plan`). The base entry in `auth.json` (`opencode-go`) is the
+family's first account, `#1`; sibling slots (`opencode-go-2` …) are numbered
+`#2` … `#14`, and a lone account prints no number. A `<base>-1` sibling
+beside the base would be a second `#1`, so the report warns to renumber it. The leading glyph is the fullest window's band. The
 overlay and the pinned panel are rendered as components, so Pi's ten-line cap on
 plain widgets never truncates them.
 
@@ -602,9 +603,8 @@ piquota omarchy                  # write pi-claude.json, pi-codex.json, ... once
   `auth.json`) still gets **one** record: every healthy account contributes only
   the window that constrains it, titled `#<slot> · Session|Weekly|Monthly`, and
   failed accounts add no rows but are summarised by reason, e.g.
-  `#8–#10 key rejected · #11–#14 no Go plan`. The unnumbered base entry keeps a
-  blank `id` and its limits are untitled; only real sibling slots carry
-  `#<slot>`. The same record also carries
+  `#8–#10 key rejected · #11–#14 no Go plan`. The base entry's `id` is `#1`
+  and its limits are titled like any other slot's. The same record also carries
   `accounts[{id, ok, status, limits}]` with every window of every account
   (`status` is a short reason such as `Key rejected` for a failed one), which
   Omarchy's built-in panel ignores and this package's own plugin draws.
@@ -875,7 +875,7 @@ extensions/quota-panel.ts      Pi TUI line and /usage
 ## Tests
 
 ```bash
-node --test tests/*.test.mjs     # 476 tests, fake tokens only, no network
+node --test tests/*.test.mjs     # 489 tests, fake tokens only, no network
 ```
 
 Modules covered: `auth.json` parsing and de-duplication, the Claude Code store
