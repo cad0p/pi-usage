@@ -14,6 +14,9 @@
 
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
+import { mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 
@@ -175,4 +178,27 @@ test("a valid report still exits zero and prints one line", () => {
   const result = runCli(["auth", "status"]);
   assert.equal(result.status, 0);
   assert.match(result.stdout, /Credential sources/);
+});
+
+test("the panel is plain text when stdout is not a terminal, under NO_COLOR and with --no-color", () => {
+  // An empty store and a throwaway home: no credential, so no request is made.
+  const home = mkdtempSync(join(tmpdir(), "pi-quota-color-"));
+  const auth = join(home, "auth.json");
+  writeFileSync(auth, "{}");
+  const env = {
+    PATH: process.env.PATH,
+    HOME: home,
+    XDG_CACHE_HOME: join(home, "cache"),
+    XDG_STATE_HOME: join(home, "state"),
+    XDG_CONFIG_HOME: join(home, "config"),
+    PI_QUOTA_AUTH_PATH: auth,
+    PI_QUOTA_CLAUDE_CODE_CREDENTIALS: join(home, "none.json"),
+    PI_CODING_AGENT_DIR: join(home, "agent"),
+    PI_QUOTA_LOCAL_STATS: "0",
+  };
+  for (const [extra, argv] of [[{}, []], [{ NO_COLOR: "1" }, []], [{}, ["--no-color"]]]) {
+    const run = spawnSync(process.execPath, [CLI, "--no-cache", ...argv], { encoding: "utf-8", timeout: 30_000, env: { ...env, ...extra } });
+    assert.match(run.stdout, /pi quota/, run.stderr);
+    assert.doesNotMatch(run.stdout, /\u001b\[/, "a pipe gets no colour sequences: " + JSON.stringify(extra) + " " + argv.join(" "));
+  }
 });

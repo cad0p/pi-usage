@@ -128,16 +128,44 @@ export function renderStatusLine(providers, paint) {
   return parts.join(paint("dim", "  ·  "));
 }
 
+const SGR = /\u001b\[[0-9;]*m/y;
+const SGR_RESET = "\u001b[0m";
+
 /**
- * Truncate plain text to a visible width, appending an ellipsis when cut.
+ * Truncate text to a visible width, appending an ellipsis when cut.
+ *
+ * Painted rows carry ANSI colour sequences, which take no columns: they are
+ * copied whole and never counted, so a coloured row is cut at the same column
+ * as a plain one and never inside a sequence. A cut that leaves a colour open
+ * closes it after the ellipsis.
  *
  * @param {string} text
  * @param {number} width
  * @returns {string}
  */
-function clip(text, width) {
-  if (text.length <= width) return text;
-  return text.slice(0, Math.max(0, width - 1)).trimEnd() + "…";
+export function clip(text, width) {
+  if (visibleLength(text) <= width) return text;
+  const limit = Math.max(0, width - 1);
+  let out = "";
+  let seen = 0;
+  let open = false;
+  let index = 0;
+  while (index < text.length && seen < limit) {
+    SGR.lastIndex = index;
+    const sequence = SGR.exec(text);
+    if (sequence) {
+      out += sequence[0];
+      open = sequence[0] !== SGR_RESET;
+      index += sequence[0].length;
+      continue;
+    }
+    out += text[index];
+    index += 1;
+    seen += 1;
+  }
+  // Trailing spaces before the ellipsis read as a gap, as the plain cut trimmed them.
+  out = out.replace(/ +((?:\u001b\[[0-9;]*m)*)$/, "$1");
+  return `${out}…${open ? SGR_RESET : ""}`;
 }
 
 /**
