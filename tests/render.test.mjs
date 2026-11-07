@@ -13,6 +13,7 @@ import {
   renderProviderLines,
   renderCompact,
   renderPanel,
+  clip,
   renderStatusLine,
   visibleLength,
 } from "../src/render/panel.js";
@@ -372,4 +373,39 @@ test("model defensive parsing: booleans, arrays, reset seconds, and phantom quot
   assert.equal(windowWithInvalidRemaining.remainingPercent, null);
 
   assert.equal(humanDuration(45.8), "46s");
+});
+
+
+test("a coloured panel is cut by visible width, like a plain one", async () => {
+  const { ansiPalette } = await import("../src/render/theme.js");
+  const colour = ansiPalette({ color: true });
+  const providers = [
+    providerFixture({ windows: [windowFixture({ label: "Weekly window", usedPercent: 18, remainingPercent: 82, resetsInSec: 5 * 86_400 })] }),
+    providerFixture({ family: "mistral", label: "Mistral (Pi)", account: "#1", plan: "EDU", windows: [windowFixture({ id: "vibe", label: "Vibe monthly", usedPercent: 99, remainingPercent: 1, resetsInSec: 23 * 86_400, note: "of 127.50 EUR" })] }),
+  ];
+  const options = { generatedAt: "2030-01-01T00:00:00.000Z", width: 80 };
+  const plain = renderPanel(providers, plainPalette(), options);
+  const painted = renderPanel(providers, colour, options);
+  const strip = (line) => line.replace(/\u001b\[[0-9;]*m/g, "");
+  assert.deepEqual(painted.map(strip), plain, "colour changes no visible character, so nothing is cut early");
+  assert.match(strip(painted.join("\n")), /82% left/, "the percentage survives");
+  assert.match(strip(painted.join("\n")), /1% left/);
+  const widths = painted.map(visibleLength);
+  for (const width of widths) assert.equal(width, widths[0], "every row ends at the same border");
+  for (const line of painted) {
+    assert.doesNotMatch(line.replace(/\u001b\[[0-9;]*m/g, ""), /\u001b/, "no row holds a cut escape sequence");
+  }
+});
+
+test("clip copies colour sequences whole, never counts them, and closes a colour it cuts", () => {
+  const red = "\u001b[31m";
+  const reset = "\u001b[0m";
+  const text = red + "abcdefgh" + reset + " tail";
+  assert.equal(clip(text, 40), text, "a row that fits is untouched");
+  const cut = clip(text, 5);
+  assert.equal(visibleLength(cut), 5);
+  assert.equal(cut, red + "abcd…" + reset, "the open colour is closed after the ellipsis");
+  assert.equal(clip(red + "ab" + reset + "    " + red + "cdefgh" + reset, 7), red + "ab" + reset + "…", "spaces before the cut are trimmed, sequences kept");
+  assert.equal(clip("plain text here", 6), "plain…");
+  assert.equal(clip("abc", 0), "…");
 });

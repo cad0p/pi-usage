@@ -235,7 +235,8 @@ async function main() {
     process.stderr.write(`note: showing last known values for ${restored.join(", ")}\n`);
   }
 
-  const paint = ansiPalette({ color: args.color });
+  // --no-color forces plain text; otherwise colour follows the terminal, NO_COLOR and TERM=dumb.
+  const paint = ansiPalette({ color: args.color === false ? false : undefined });
 
   if (args.json) {
     out(JSON.stringify({ ...report, cache: { used: cached, ageMs } }, null, 2));
