@@ -142,7 +142,7 @@ test("GitHub Actions positional aliases resolve to one explicit family", () => {
 });
 
 test("enabledFamilies keeps the default set stable and adds GitHub Actions only by consent", () => {
-  assert.deepEqual(enabledFamilies({ env: {} }), ["claude", "codex", "antigravity", "opencode-go", "mistral"]);
+  assert.deepEqual(enabledFamilies({ env: {} }), ["claude", "codex", "antigravity", "opencode-go", "mistral", "devin"]);
   assert.deepEqual(enabledFamilies({ env: { PI_QUOTA_GITHUB_ACTIONS: "true" } }), FAMILIES);
   const explicit = resolveFamilies(["github-actions"]);
   assert.deepEqual(enabledFamilies({ env: {}, requested: [...explicit.families], explicit: explicit.explicit }), ["github-actions"]);

@@ -532,7 +532,27 @@ test("a corrupt per-file cache is a cache miss while history survives", async ()
   const second = await scan(tree);
   assert.equal(second.scan.scanned, 1);
   assert.equal(second.byFamily.claude.totalPrompts, 2);
-  assert.equal(readJson(tree.cachePath).schemaVersion, 2);
+  assert.equal(readJson(tree.cachePath).schemaVersion, 3);
+  assert.deepEqual(totalsOf(tree), frozen);
+});
+
+test("a cache from before Devin is a miss that recounts the open day with Devin, never the frozen one", async () => {
+  const tree = tempTree();
+  writeSession(tree.sessions, "a.jsonl", [
+    assistantLine({ ts: tsForDay(-1), usage: { input: 12, output: 0, cacheRead: 0, cacheWrite: 0 } }),
+    assistantLine({ ts: tsForDay(0), provider: "devin", model: "swe-2", usage: { input: 7, output: 0, cacheRead: 0, cacheWrite: 0 } }),
+  ]);
+  const first = await scan(tree);
+  assert.equal(first.byFamily.devin.todayTotalTokens, 7, "a devin message is the devin family");
+  const frozen = totalsOf(tree);
+
+  // A version-2 cache was written by a build that skipped devin messages.
+  const envelope = readJson(tree.cachePath);
+  writeFileSync(tree.cachePath, JSON.stringify({ ...envelope, schemaVersion: 2 }), "utf-8");
+  const second = await scan(tree);
+  assert.equal(second.scan.scanned, 1, "the old version is a miss");
+  assert.equal(second.byFamily.devin.todayTotalTokens, 7);
+  assert.equal(second.byFamily.claude.totalPrompts, 1, "the frozen day is not added again");
   assert.deepEqual(totalsOf(tree), frozen);
 });
 
@@ -1364,7 +1384,7 @@ test("the scan cache is written atomically with private permissions", async () =
   await scan(tree);
   assert.equal(statSync(tree.cachePath).mode & 0o777, 0o600);
   const envelope = readJson(tree.cachePath);
-  assert.equal(envelope.schemaVersion, 2);
+  assert.equal(envelope.schemaVersion, 3);
   const [entry] = Object.values(envelope.files);
   assert.equal(typeof entry.size, "number");
   assert.equal(typeof entry.mtimeMs, "number");

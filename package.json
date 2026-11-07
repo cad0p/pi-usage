@@ -5,7 +5,7 @@
     "access": "public"
   },
   "type": "module",
-  "description": "Read-only usage/quota for the AI subscriptions Pi already owns (Claude, Codex, multi-account OpenCode Go, Antigravity, Mistral): /usage in Pi and the Omarchy Agents panel. Fork of @j3pf/piquota.",
+  "description": "Read-only usage/quota for the AI subscriptions Pi already owns (Claude, Codex, multi-account OpenCode Go, Antigravity, Mistral, Devin): /usage in Pi and the Omarchy Agents panel. Fork of @j3pf/piquota.",
   "engines": {
     "node": ">=22.19.0"
   },
@@ -35,6 +35,7 @@
     "omarchy",
     "opencode-go",
     "mistral",
+    "devin",
     "multi-account"
   ],
   "repository": {

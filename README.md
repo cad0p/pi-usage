@@ -7,6 +7,7 @@ One source of truth for quota: **the credentials Pi already owns**.
 >
 > * **OpenCode Go from the API key**: `GET https://opencode.ai/zen/go/v1/usage` returns the rolling (5h), weekly and monthly windows for the key Pi already stores, so no browser session is needed.
 > * **Mistral from the API key**: `GET https://api.mistral.ai/v1/billing/budget` and `/v1/billing/subscription`, the two reads the Vibe CLI makes for its usage gauge, return the monthly Vibe Code and API budgets and the plan for the key Pi already stores (`mistral`, and siblings such as `mistral-1-api`). They are read-only and cost no tokens.
+> * **Devin from pi-devin's own snapshot**: [`@buyong/pi-devin`](https://www.npmjs.com/package/@buyong/pi-devin) asks Devin for the account's daily and weekly quota at sign-in and before every Devin request, and shares the answer in `~/.pi/agent/pi-devin/account-usage.json`. pi-usage reads that file read-only and makes no Devin request of its own (Devin's usage call is a private CLI RPC that needs the CLI's device fingerprint). Each window says when it was read, and a window whose reset has passed since then shows no percentage.
 > * **Numbered accounts**: `auth.json` entries such as `opencode-go-2` … `opencode-go-14` (the [pi-fallback-provider](https://github.com/cad0p/pi-fallback-provider) sibling convention) are read as extra accounts of their base provider. The accounts of one provider are queried in parallel (8 at a time, `PI_QUOTA_ACCOUNT_CONCURRENCY` from 1 to 32), so 14 OpenCode Go keys cost about one round trip instead of fourteen. Every request carries `User-Agent: pi-usage/<version> (+https://github.com/cad0p/pi-usage)` unless a provider needs its own client string: OpenCode Go asks clients not to use a generic HTTP-library name, and Node's default is `node`.
 > * **One Omarchy tab per provider**: a multi-account provider shows each account's binding window (`#2 · Monthly`) in a single tab, and summarises failed accounts.
 > * **Tokens by day and by model**: the tokens Pi's own session files recorded are folded per provider and shown in `/usage`, in `--json` (`localStats`) and in the Omarchy records, at a bounded scan cost.
@@ -85,6 +86,7 @@ shuvquota, and it never writes to a credential file.
 | Antigravity | `google-antigravity.access` (or legacy `antigravity`) + `projectId` | `POST cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary` | ✅ Gemini + Claude/GPT buckets, **with in-memory refresh** |
 | OpenCode Go | `opencode-go.key`, numbered siblings included | `GET opencode.ai/zen/go/v1/usage` | ✅ 5h + weekly + monthly per account; the session cookie and SSR dashboard are a base-account fallback |
 | Mistral | `mistral.key`, numbered siblings included | `GET api.mistral.ai/v1/billing/budget` + `/v1/billing/subscription` | ✅ Vibe monthly + API monthly + plan per key; without the `see_org_inference_usage` permission the plan alone, with a note. Keys of one organisation share its budgets, so they show the same numbers |
+| Devin | `devin.access` + `devin.devin.apiServerURL` (from `@buyong/pi-devin`'s `/login`), never sent | none: reads `<agent dir>/pi-devin/account-usage.json`, which pi-devin writes at sign-in and before each Devin request | ✅ daily + weekly, `as of` the last Devin request; a window reset since then shows no percentage; a snapshot of another sign-in (pi-devin's `scope` hash differs) is not shown; a credit-billed account shows its billing strategy |
 | GitHub Actions (opt-in) | Authenticated `gh` CLI | `gh api /organizations/<org>/settings/billing/usage/summary?product=Actions` | ✅ org-wide monthly Linux minutes, plan-derived allowance |
 
 Four findings worth recording, each of which cost a wrong hypothesis:
@@ -388,7 +390,8 @@ the numbers are not shown twice. See [the rail slot](#the-gentle-pi-rail-slot).
 
 * each name is painted with its **own brand colour** — Claude `#D97757`, Codex
   `#10A37F`, Antigravity `#4285F4`, OpenCode `#007AFF`, Mistral `#FA520F` (its row,
-  the Vibe budget, appears only when a Mistral key is configured);
+  the Vibe budget, appears only when a Mistral key is configured), Devin `#6E56CF`
+  (its row, the daily window, appears only when a Devin login is configured);
 * the numbers are **used**, not remaining, and the semaphore is both colour and
   shape (`○` plenty left → `◔` → `◕` → `●` nearly spent), so it still reads on a
   colourblind or mono terminal;
@@ -533,7 +536,8 @@ Rp suite) without external network daemons or closed-source intermediaries:
 
 A provider may also carry a top-level `note` when it answered but has no windows
 to show, such as a Mistral key without the `see_org_inference_usage` permission
-(`"ok": true`, `"windows": []`, the plan, and the reason in `note`).
+(`"ok": true`, `"windows": []`, the plan, and the reason in `note`), or a Devin
+snapshot whose windows have all reset since it was read.
 
 The token part of the same report is abridged here (`recentDays` always carries
 seven entries, oldest first, today last):
@@ -571,7 +575,7 @@ stale without triggering rate limits:
 | Family | Clock |
 | --- | --- |
 | Claude | **300 s** (`--claude-ttl`) |
-| Codex, Antigravity, OpenCode Go, Mistral | **60 s** (`--fetch-ttl`) |
+| Codex, Antigravity, OpenCode Go, Mistral, Devin | **60 s** (`--fetch-ttl`) |
 
 `src/refresh.js` keeps a timestamp per family, requests only what is past its own
 clock, and merges the result back into the canonical report. `src/sticky.js`
@@ -584,7 +588,7 @@ credential) are never masked.
 Omarchy 4.0.4's **Agents** bar panel draws every `*.json` record in
 `${XDG_STATE_HOME:-~/.local/state}/omarchy/agents/usage/`, whoever wrote it.
 `piquota omarchy` (opt-in, one shot) writes one record per provider piQuota can
-read, so Claude, Codex, Antigravity, OpenCode Go and Mistral all get a tab:
+read, so Claude, Codex, Antigravity, OpenCode Go, Mistral and Devin all get a tab:
 
 ```bash
 piquota omarchy                  # write pi-claude.json, pi-codex.json, ... once
@@ -706,7 +710,7 @@ What counts: one assistant message with a non-zero token count is one prompt,
 and its tokens are `input + output + cacheRead + cacheWrite` — the same sum the
 Omarchy panel renders. Messages are bucketed by **local** date (the panel calls
 the last row "Today"). Only providers piQuota can bill are counted:
-`anthropic`, `openai-codex`, `antigravity`, `opencode-go`, `mistral` and their numbered
+`anthropic`, `openai-codex`, `antigravity`, `opencode-go`, `mistral`, `devin` and their numbered
 siblings, so `opencode-go-7` is account `#7`. Providers it does not manage
 (`deepinfra`, `xai`, ...) are ignored, and so is the custom `claude-bridge`
 provider: its tokens are not a Pi subscription.
@@ -875,13 +879,14 @@ extensions/quota-panel.ts      Pi TUI line and /usage
 ## Tests
 
 ```bash
-node --test tests/*.test.mjs     # 489 tests, fake tokens only, no network
+node --test tests/*.test.mjs     # 502 tests, fake tokens only, no network
 ```
 
 Modules covered: `auth.json` parsing and de-duplication, the Claude Code store
 (including that the refresh token never leaves it and that reading leaves the file
-byte-identical), Claude source precedence, the six providers (including Mistral's two budgets,
-the missing usage permission and a rejected key, GitHub
+byte-identical), Claude source precedence, the seven providers (including Mistral's two budgets,
+the missing usage permission and a rejected key, Devin's snapshot: reset since the read,
+another sign-in's scope, a credit-billed account, and never a network call, GitHub
 Actions plan resolution, opt-in gating and degradation, the two Antigravity
 failures and the OpenCode degradation), the dashboard parser's three
 strategies, the Firefox cookie reader against a synthetic SQLite database, the

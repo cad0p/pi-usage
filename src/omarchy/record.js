@@ -39,6 +39,7 @@ const LOGIN_HINT = {
   antigravity: "Run `/login antigravity` in Pi to restore usage.",
   "opencode-go": "Run `piquota auth opencode` to restore usage.",
   mistral: "Run `/login mistral` in Pi to restore usage.",
+  devin: "Run `/login devin` in Pi, then send one Devin request.",
 };
 
 const HELP_MAX = 200;
@@ -182,6 +183,12 @@ function recordTierLabel(provider) {
     const plan = provider.plan ? redact(provider.plan) : "";
     if (account && plan) return `${account} · ${plan}`;
     return account || plan || "";
+  }
+  // Devin's numbers are pi-devin's last read, not this run's: the header says
+  // when, where other providers name their plan.
+  if (provider.family === "devin" && !provider.plan) {
+    const asOf = (provider.windows ?? []).map((window) => window?.note).find((note) => typeof note === "string" && /^as of /.test(note));
+    if (asOf) return redact(asOf).slice(0, 40);
   }
   return provider.plan ? redact(provider.plan) : "";
 }

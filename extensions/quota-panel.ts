@@ -190,6 +190,7 @@ const BRAND: Record<string, string> = {
   antigravity: "#4285F4",
   "opencode-go": "#007AFF",
   mistral: "#FA520F",
+  devin: "#6E56CF",
   "github-actions": "#2088FF",
 };
 
@@ -200,6 +201,7 @@ const SHORT_NAME: Record<string, string> = {
   antigravity: "Agy",
   "opencode-go": "OP-Go",
   mistral: "Mistral",
+  devin: "Devin",
   "github-actions": "GH",
 };
 
@@ -476,6 +478,9 @@ export function renderBox(report: QuotaReport, theme: Theme, totalWidth?: number
   if (providerFor("mistral") && providerFor("mistral")?.notConfigured !== true) {
     rows.push({ label: "Mistral:", color: "#FA520F", ...windowFor("mistral", (window) => window.id === "vibe") });
   }
+  if (providerFor("devin") && providerFor("devin")?.notConfigured !== true) {
+    rows.push({ label: "Devin:  ", color: "#6E56CF", ...windowFor("devin", (window) => window.id === "daily") });
+  }
   if (providerFor("github-actions")) {
     rows.push({ label: "GH Actions:", color: "#2088FF", ...windowFor("github-actions", (window) => window.id === "monthly") });
   }
@@ -527,6 +532,9 @@ function renderSidebarCard(report: QuotaReport | null, theme: Theme, width: numb
         { label: "OP-Go:  ", color: "#007AFF", ...windowFor("opencode-go", isFiveHour) },
         ...(providerFor("mistral") && providerFor("mistral")?.notConfigured !== true
           ? [{ label: "Mistral:", color: "#FA520F", ...windowFor("mistral", (window) => window.id === "vibe") }]
+          : []),
+        ...(providerFor("devin") && providerFor("devin")?.notConfigured !== true
+          ? [{ label: "Devin:  ", color: "#6E56CF", ...windowFor("devin", (window) => window.id === "daily") }]
           : []),
         ...(providerFor("github-actions")
           ? [{ label: "GH Actions:", color: "#2088FF", ...windowFor("github-actions", (window) => window.id === "monthly") }]
@@ -873,8 +881,8 @@ function renderAccountRows(accounts: QuotaProvider[], theme: Theme, stats?: Loca
  */
 type PanelSection = { key: string; header: string; body: string[] };
 
-/** The provider block of a single-account provider: its header plus its detail. */
-function renderProviderLines(provider: QuotaProvider, theme: Theme, localStats: LocalFamilyStats | undefined, partialScan: boolean): string[] {
+/** The provider block of a single-account provider: its header plus its detail. Exported for tests. */
+export function renderProviderLines(provider: QuotaProvider, theme: Theme, localStats: LocalFamilyStats | undefined, partialScan: boolean): string[] {
   const lines: string[] = [];
   const labelWidth = Math.max(6, ...provider.windows.map((window) => String(window.label ?? "").length));
   const name = paint(BRAND[provider.family] ?? "#8B949E", provider.label);
@@ -882,6 +890,9 @@ function renderProviderLines(provider: QuotaProvider, theme: Theme, localStats: 
   const account = String(provider.account ?? "");
   const meta: string[] = account === "" || account === "#1" ? [] : [account];
   if (provider.plan) meta.push(`plan ${provider.plan}`);
+  // Numbers another process read earlier (Devin: pi-devin's last request) say when.
+  const asOf = provider.windows.map((window) => window.note).find((note) => typeof note === "string" && /^as of /.test(note));
+  if (asOf) meta.push(asOf);
   // Two stores can back Claude, and this is the one place that says which.
   if (provider.sourceKind === "claude-code") meta.push("Claude Code CLI");
   if (provider.expiresInMin !== null && provider.expiresInMin <= 120) {
@@ -1145,6 +1156,7 @@ const FAMILY_LABEL: Record<string, string> = {
   antigravity: "Antigravity (Pi)",
   "opencode-go": "OpenCode Go (Pi)",
   mistral: "Mistral (Pi)",
+  devin: "Devin (Pi)",
   "github-actions": "GitHub Actions",
 };
 
