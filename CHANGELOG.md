@@ -15,6 +15,7 @@ All notable changes to this project will be documented in this file.
 ### 🐛 Bug Fixes
 
 - Base account is #1, label column fits, API-key sibling is not down (closes #38, closes #39, closes #40)
+- *(cli)* Cut coloured rows by visible width; colour follows the terminal (closes #46)
 
 
 ## [0.11.6] - 2026-11-03
