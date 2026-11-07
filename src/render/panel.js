@@ -203,6 +203,10 @@ function wrapPlain(text, width) {
  * @returns {string}
  */
 function slotLabel(provider) {
+  // Keys merged into one row (Mistral keys of one organisation) list every slot.
+  if (Array.isArray(provider.sharedSlots) && provider.sharedSlots.length > 1) {
+    return provider.sharedSlots.map((slot) => (typeof slot === "string" && slot !== "" ? `#${slot}` : "#1")).join(" · ");
+  }
   if (typeof provider.slot === "string" && provider.slot !== "") return `#${provider.slot}`;
   if (provider.slot === null || provider.slot === "") return "#1";
   const account = typeof provider.account === "string" ? provider.account : "";

@@ -16,7 +16,7 @@ import { fetchQuota as fetchClaude } from "./providers/claude.js";
 import { fetchQuota as fetchCodex } from "./providers/codex.js";
 import { fetchQuota as fetchAntigravity } from "./providers/antigravity.js";
 import { fetchQuota as fetchOpenCodeGo } from "./providers/opencode-go.js";
-import { fetchQuota as fetchMistral } from "./providers/mistral.js";
+import { fetchQuota as fetchMistral, mergeSharedBudgets as mergeMistral } from "./providers/mistral.js";
 import { fetchQuota as fetchDevin } from "./providers/devin.js";
 import { fetchQuota as fetchGithubActions } from "./providers/github-actions.js";
 
@@ -204,6 +204,18 @@ const PROVIDERS = {
   mistral: fetchMistral,
   devin: fetchDevin,
   "github-actions": fetchGithubActions,
+};
+
+/**
+ * Families whose keys can answer one shared budget, with the rule that merges
+ * them. Mistral only: its budgets are per organisation and expose no
+ * organisation id, so identical answers are the identity. A family that bills
+ * per key (OpenCode Go: two fresh keys both answer 0%) must never be merged.
+ *
+ * @type {Record<string, (results: import("./model.js").QuotaResult[]) => import("./model.js").QuotaResult[]>}
+ */
+const MERGE_SHARED = {
+  mistral: mergeMistral,
 };
 
 /**
@@ -512,7 +524,10 @@ export async function collectQuota(options = {}) {
         results.push(result);
       }
       familyWarnings[family] = familyWarnList;
-      await emitFamily(family, results);
+      // A family whose budgets belong to an organisation, not to a key, merges
+      // keys that answered the same budget, so one budget is not shown twice.
+      const merge = MERGE_SHARED[family];
+      await emitFamily(family, merge ? merge(results) : results);
     }),
   );
 

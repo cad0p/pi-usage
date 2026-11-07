@@ -177,6 +177,71 @@ function failureMessage(response, what) {
 }
 
 /**
+ * The label of one slot as every surface prints it.
+ *
+ * @param {string | null | undefined} slot
+ * @returns {string}
+ */
+function slotText(slot) {
+  return typeof slot === "string" && slot !== "" ? `#${slot}` : "#1";
+}
+
+/**
+ * Collapse keys of one organisation into one account.
+ *
+ * Mistral's budgets belong to the organisation, not to the key, so two keys of
+ * one organisation (a Vibe key and an API key, say) answer the same plan and the
+ * same budgets, and two rows would show one budget twice. Mistral exposes no
+ * organisation id to a key (`/v1/me` and its kin answer 404), so the answers
+ * themselves are the identity: results merge only when plan, window ids, used
+ * percentages, resets and notes are all identical **and** at least one used
+ * percentage lies strictly between 0 and 100. Mistral reports usage as a long
+ * fraction (81.053541208), which two organisations do not share by chance; a
+ * fresh (0) or spent (100) budget does not identify an organisation, so such
+ * keys stay apart rather than risk a false merge.
+ *
+ * The first key of a group (in auth.json order) carries the merged row:
+ * `sharedSlots` lists every slot, and the note says which keys share it.
+ * Failed results and results without windows are never merged.
+ *
+ * @param {import("../model.js").QuotaResult[]} results  In credential order, `slot` set.
+ * @returns {import("../model.js").QuotaResult[]}
+ */
+export function mergeSharedBudgets(results) {
+  /** @type {Map<string, import("../model.js").QuotaResult & { sharedSlots?: Array<string | null> }>} */
+  const groups = new Map();
+  /** @type {import("../model.js").QuotaResult[]} */
+  const merged = [];
+  for (const result of results) {
+    const windows = Array.isArray(result.windows) ? result.windows : [];
+    const identifying = windows.some((window) => typeof window.usedPercent === "number" && window.usedPercent > 0 && window.usedPercent < 100);
+    if (!result.ok || windows.length === 0 || !identifying) {
+      merged.push(result);
+      continue;
+    }
+    const key = JSON.stringify([
+      result.plan ?? null,
+      windows.map((window) => [window.id, window.usedPercent, window.resetsAt, window.note ?? null]),
+    ]);
+    const first = groups.get(key);
+    if (!first) {
+      groups.set(key, result);
+      merged.push(result);
+      continue;
+    }
+    first.sharedSlots = [...(first.sharedSlots ?? [first.slot ?? null]), result.slot ?? null];
+  }
+  for (const result of groups.values()) {
+    const slots = /** @type {{ sharedSlots?: Array<string | null> }} */ (result).sharedSlots;
+    if (!slots) continue;
+    const labels = slots.map(slotText);
+    const sharing = `${labels.slice(0, -1).join(", ")} and ${labels[labels.length - 1]} share one organisation budget`;
+    result.note = result.note ? `${result.note} · ${sharing}` : sharing;
+  }
+  return merged;
+}
+
+/**
  * @param {import("../auth/pi-auth.js").PiCredential} credential
  * @param {{
  *   now?: number,
