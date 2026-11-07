@@ -9,11 +9,14 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
-import { fetchQuota, parseBudgetWindows, parsePlanName } from "../src/providers/mistral.js";
+import { fetchQuota, mergeSharedBudgets, parseBudgetWindows, parsePlanName } from "../src/providers/mistral.js";
 import { errorKind, isRecoverableError } from "../src/providers/error-kind.js";
 import { normalizeCredential, resolveProviderSlot } from "../src/auth/pi-auth.js";
 import { collectQuota } from "../src/engine.js";
 import { jsonResponse, routedFetch } from "./helpers.mjs";
+import { buildRecords } from "../src/omarchy/record.js";
+import { renderPanel } from "../src/render/panel.js";
+import { plainPalette } from "../src/render/theme.js";
 
 const NOW = Date.parse("2026-11-07T12:00:00Z");
 const KEY = "mistral-FAKE-key-0000";
@@ -207,6 +210,15 @@ test("mistral: the plan name is a short single-line display string", () => {
   assert.equal(parsePlanName("EDU"), null);
 });
 
+/** A budget route that answers each key with its own organisation's usage. */
+function budgetPerKey(usageByKey) {
+  return (_url, init) => {
+    const key = String(init?.headers?.Authorization ?? "").replace(/^Bearer /, "");
+    const usage = usageByKey[key];
+    return jsonResponse(budgetBody(usage === undefined ? {} : { vibe_budget: { ...budgetBody().vibe_budget, usage_percentage: usage } }));
+  };
+}
+
 test("mistral: collectQuota reports every Mistral slot in auth.json order", async () => {
   const directory = mkdtempSync(join(tmpdir(), "pi-quota-mistral-"));
   const authPath = join(directory, "auth.json");
@@ -215,7 +227,8 @@ test("mistral: collectQuota reports every Mistral slot in auth.json order", asyn
     "mistral-1-api": { type: "api_key", key: "mistral-FAKE-api" },
     "mistral-api": { type: "api_key", key: "mistral-FAKE-ignored" },
   }));
-  const { fetchFn, calls } = routes();
+  // Two organisations: different answers, so two rows.
+  const { fetchFn, calls } = routes({ budget: budgetPerKey({ "mistral-FAKE-base": 81.053541208, "mistral-FAKE-api": 12.5 }) });
   const report = await collectQuota({ paths: [authPath], claudeCodePaths: [], now: NOW, fetchFn, families: ["mistral"], env: {}, home: directory, stores: [], allowBrowser: false });
   const results = report.byFamily.mistral;
   assert.deepEqual(results.map((result) => [result.slot ?? null, result.account, result.ok]), [[null, "#1", true], ["1-api", "#1-api", true]]);
@@ -334,4 +347,82 @@ test("mistral: the Omarchy record carries both budgets, the plan and no key", as
   for (const account of record.accounts) {
     for (const limit of account.limits) assert.ok(limit.percent >= 0 && limit.percent <= 1, JSON.stringify(limit));
   }
+});
+
+
+test("mistral: keys of one organisation answer one budget and merge into one row", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "pi-quota-mistral-merge-"));
+  const authPath = join(directory, "auth.json");
+  writeFileSync(authPath, JSON.stringify({
+    mistral: { type: "api_key", key: "mistral-FAKE-base" },
+    "mistral-1-api": { type: "api_key", key: "mistral-FAKE-api" },
+    "mistral-2": { type: "api_key", key: "mistral-FAKE-other" },
+  }));
+  // #1 and #1-api: the same organisation (identical answers); #2 another one.
+  const { fetchFn, calls } = routes({ budget: budgetPerKey({ "mistral-FAKE-other": 33.25 }) });
+  const report = await collectQuota({ paths: [authPath], claudeCodePaths: [], now: NOW, fetchFn, families: ["mistral"], env: {}, home: directory, stores: [], allowBrowser: false });
+  const results = report.byFamily.mistral;
+  assert.equal(calls.length, 6, "every key is still asked: the answers are the identity");
+  assert.deepEqual(results.map((result) => [result.slot ?? null, result.sharedSlots ?? null]), [[null, [null, "1-api"]], ["2", null]]);
+  assert.match(String(results[0].note), /#1 and #1-api share one organisation budget/);
+  assert.equal(results[1].note ?? null, null);
+  assert.deepEqual(report.providers.filter((provider) => provider.family === "mistral").length, 2, "the flattened list carries the merged row once");
+
+  // Every surface labels the merged row with both slots.
+  const record = buildRecords(/** @type {any} */ (report), { now: NOW }).find((entry) => entry.record.id === "pi-mistral").record;
+  assert.deepEqual(record.accounts.map((account) => account.id), ["#1 · #1-api", "#2"]);
+  assert.equal(record.tierLabel, "2 of 2 accounts");
+  const panel = renderPanel(results, plainPalette()).join("\n");
+  assert.match(panel, /Mistral \(Pi\) #1 · #1-api · plan EDU/, "the CLI title names both keys");
+  const { renderProviderLines: extensionLines } = await import("../extensions/quota-panel.ts");
+  const theme = { fg: (_key, text) => text, bold: (text) => text };
+  assert.match(extensionLines(results[0], /** @type {any} */ (theme), undefined, false).join("\n"), /share one organisation budget/);
+
+  // The session scan counts tokens per key; the merged /usage row sums its keys.
+  const { renderAccountRows } = await import("../extensions/quota-panel.ts");
+  const stats = { byAccount: { "#1": { todayTokens: 1_000_000 }, "#1-api": { todayTokens: 500_000 }, "#2": { todayTokens: 250_000 } } };
+  const rows = renderAccountRows(/** @type {any} */ (results), /** @type {any} */ (theme), /** @type {any} */ (stats));
+  assert.match(rows.find((line) => line.includes("#1 · #1-api")) ?? "", /1\.5M today/, "both keys' tokens on the merged row");
+  assert.match(rows.find((line) => /#2 /.test(line)) ?? "", /250k today/);
+});
+
+test("mistral: a fresh or spent budget does not identify an organisation, so it never merges", () => {
+  const row = (slot, used, extra = {}) => ({
+    family: "mistral", label: "Mistral (Pi)", account: slot ? `#${slot}` : "#1", slot, plan: "EDU", ok: true, error: null, updatedAt: "x", source: "s", expiresInMin: null,
+    windows: [{ id: "vibe", label: "Vibe monthly", usedPercent: used, remainingPercent: 100 - used, resetsAt: "2026-12-01T00:00:00.000Z", resetsInSec: 1, windowSeconds: 1, note: "of 127.50 EUR" },
+      { id: "api", label: "API monthly", usedPercent: 100, remainingPercent: 0, resetsAt: "2026-12-01T00:00:00.000Z", resetsInSec: 1, windowSeconds: 1, note: "of 12.75 EUR" }],
+    ...extra,
+  });
+  // 0 % and 100 %: two fresh organisations answer exactly this.
+  assert.equal(mergeSharedBudgets([row(null, 0), row("1-api", 0)]).length, 2);
+  assert.equal(mergeSharedBudgets([row(null, 100), row("1-api", 100)]).length, 2);
+  // Any difference keeps two rows: usage, plan, reset or note.
+  assert.equal(mergeSharedBudgets([row(null, 40.5), row("1-api", 40.25)]).length, 2);
+  assert.equal(mergeSharedBudgets([row(null, 40.5), row("1-api", 40.5, { plan: "Pro" })]).length, 2);
+  const otherNote = row("1-api", 40.5);
+  otherNote.windows[1] = { ...otherNote.windows[1], note: "of 12.75 EUR · pay-as-you-go" };
+  assert.equal(mergeSharedBudgets([row(null, 40.5), otherNote]).length, 2);
+  // A failed key, or one without windows, is never folded into a healthy row.
+  const failed = { ...row("1-api", 40.5), ok: false, error: "Mistral key rejected (401); run /login mistral in Pi" };
+  assert.deepEqual(mergeSharedBudgets([row(null, 40.5), failed]).map((result) => result.ok), [true, false]);
+  const plain = { ...row("1-api", 40.5), windows: [] };
+  assert.equal(mergeSharedBudgets([row(null, 40.5), plain]).length, 2);
+  // A family whose only row is merged has no account column: the record header names the keys.
+  const pair = mergeSharedBudgets([row(null, 40.5), row("1-api", 40.5)]);
+  const single = buildRecords(/** @type {any} */ ({ providers: pair, byFamily: { mistral: pair } }), { now: NOW })[0].record;
+  assert.equal(single.tierLabel, "EDU · keys #1 · #1-api");
+  assert.equal(single.accounts, undefined);
+  assert.match(renderPanel(pair, plainPalette()).join("\n"), /Mistral \(Pi\) #1 · #1-api · plan EDU/, "the CLI names the keys of a lone merged row too");
+  // Three keys of one organisation: one row, every slot in order, the note names them all.
+  const three = mergeSharedBudgets([row(null, 40.5), row("1-api", 40.5), row("2", 40.5, { note: "kept" })]);
+  assert.equal(three.length, 1);
+  assert.deepEqual(three[0].sharedSlots, [null, "1-api", "2"]);
+  assert.equal(three[0].note, "#1, #1-api and #2 share one organisation budget");
+});
+
+test("mistral: Mistral is the only family with a merge rule (per-key budgets never merge)", async () => {
+  const { readFileSync } = await import("node:fs");
+  const engine = readFileSync(new URL("../src/engine.js", import.meta.url), "utf8");
+  const block = engine.slice(engine.indexOf("const MERGE_SHARED = {"), engine.indexOf("};", engine.indexOf("const MERGE_SHARED = {")));
+  assert.deepEqual([...block.matchAll(/^\s+([\w"-]+):/gm)].map((match) => match[1]), ["mistral"]);
 });

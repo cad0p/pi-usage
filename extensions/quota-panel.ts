@@ -79,6 +79,8 @@ type QuotaProvider = {
   account: string;
   /** The auth.json slot: null for the base entry, "2" or "1-api" for a sibling. */
   slot?: string | null;
+  /** Every slot of a row that merged keys answering one shared budget (Mistral): [null, "1-api"]. */
+  sharedSlots?: Array<string | null>;
   plan: string | null;
   windows: QuotaWindow[];
   error: string | null;
@@ -806,7 +808,11 @@ function accountReason(error: string | null | undefined): string {
  * "id c64efc0f…". A report cached without `slot` falls back to an account that
  * already is a slot label; one cached while the base was unlabelled says "".
  */
-function accountLabel(provider: Pick<QuotaProvider, "account" | "slot">): string {
+function accountLabel(provider: Pick<QuotaProvider, "account" | "slot" | "sharedSlots">): string {
+  // Keys merged into one row (Mistral keys of one organisation) list every slot.
+  if (Array.isArray(provider.sharedSlots) && provider.sharedSlots.length > 1) {
+    return provider.sharedSlots.map((slot) => (typeof slot === "string" && slot !== "" ? `#${slot}` : "#1")).join(" · ");
+  }
   if (typeof provider.slot === "string" && provider.slot !== "") return `#${provider.slot}`;
   if (provider.slot === null || provider.slot === "") return "#1";
   const account = String(provider.account ?? "");
@@ -817,6 +823,17 @@ function accountLabel(provider: Pick<QuotaProvider, "account" | "slot">): string
 function accountStats(stats: LocalFamilyStats | undefined, label: string): LocalAccountStats | undefined {
   if (!stats?.byAccount) return undefined;
   return stats.byAccount[label] ?? (label === "#1" ? stats.byAccount[""] : undefined);
+}
+
+/**
+ * Today's tokens of one account row. A row that merged keys answering one
+ * shared budget (Mistral) is labelled "#1 · #1-api", but the session scan
+ * counts each key under its own label, so the row sums its keys.
+ */
+function accountTodayTokens(stats: LocalFamilyStats | undefined, account: QuotaProvider, label: string): number {
+  const slots = Array.isArray(account.sharedSlots) && account.sharedSlots.length > 1 ? account.sharedSlots : null;
+  const labels = slots ? [...new Set(slots.map((slot) => (typeof slot === "string" && slot !== "" ? `#${slot}` : "#1")))] : [label];
+  return labels.reduce((sum, each) => sum + (Number(accountStats(stats, each)?.todayTokens) || 0), 0);
 }
 
 /**
@@ -833,7 +850,7 @@ function isMultiAccount(providers: QuotaProvider[], provider: QuotaProvider): bo
  * Each line carries the account's own tokens for today, because on a
  * fourteen-key provider "which key burned today's quota" is the question.
  */
-function renderAccountRows(accounts: QuotaProvider[], theme: Theme, stats?: LocalFamilyStats): string[] {
+export function renderAccountRows(accounts: QuotaProvider[], theme: Theme, stats?: LocalFamilyStats): string[] {
   const family = accounts[0].family;
   const healthy = accounts.filter((account) => account.ok).length;
   const header = `${paint(BRAND[family] ?? "#8B949E", SHORT_NAME[family] ?? accounts[0].label)} ${theme.fg("dim", `· ${healthy} of ${accounts.length} accounts ok`)}`;
@@ -867,7 +884,7 @@ function renderAccountRows(accounts: QuotaProvider[], theme: Theme, stats?: Loca
         const reset = each.resetsInSec === null ? "" : ` ${theme.fg("dim", `(${shortDuration(each.resetsInSec)})`.padEnd(5))}`;
         return `${theme.fg("dim", WINDOW_TAG[each.id] ?? each.id)} ${paint(bandFor(pct).color, `${Math.round(pct)}%`.padStart(4))}${reset}`;
       });
-    const today = Number(accountStats(stats, labels[index])?.todayTokens) || 0;
+    const today = accountTodayTokens(stats, account, labels[index]);
     const tokens = today > 0 ? ` · ${formatTokens(today)} today` : "";
     lines.push(`  ${label}  ${paint(band.color, band.glyph)} ${cells.join(theme.fg("dim", " · "))}${theme.fg("dim", tokens)}`);
   });

@@ -85,7 +85,7 @@ shuvquota, and it never writes to a credential file.
 | Codex | `openai-codex.access` + `accountId` | `GET chatgpt.com/backend-api/wham/usage` | ✅ 5h + weekly + plan; an `api_key` sibling (`openai-codex-1-api`) is likewise a working pay-as-you-go account whose key is never sent |
 | Antigravity | `google-antigravity.access` (or legacy `antigravity`) + `projectId` | `POST cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary` | ✅ Gemini + Claude/GPT buckets, **with in-memory refresh** |
 | OpenCode Go | `opencode-go.key`, numbered siblings included | `GET opencode.ai/zen/go/v1/usage` | ✅ 5h + weekly + monthly per account; the session cookie and SSR dashboard are a base-account fallback |
-| Mistral | `mistral.key`, numbered siblings included | `GET api.mistral.ai/v1/billing/budget` + `/v1/billing/subscription` | ✅ Vibe monthly + API monthly + plan per key; without the `see_org_inference_usage` permission the plan alone, with a note. Keys of one organisation share its budgets, so they show the same numbers |
+| Mistral | `mistral.key`, numbered siblings included | `GET api.mistral.ai/v1/billing/budget` + `/v1/billing/subscription` | ✅ Vibe monthly + API monthly + plan per key; without the `see_org_inference_usage` permission the plan alone, with a note. Keys of one organisation answer the same budgets, so they are shown as one row labelled with every key (`#1 · #1-api`). Mistral exposes no organisation id, so the match is on the answers, and a budget at exactly 0 % or 100 % (which two organisations can share) never merges |
 | Devin | `devin.access` + `devin.devin.apiServerURL` (from `@buyong/pi-devin`'s `/login`), never sent | none: reads `<agent dir>/pi-devin/account-usage.json`, which pi-devin writes at sign-in and before each Devin request | ✅ daily + weekly, `as of` the last Devin request; a window reset since then shows no percentage; a snapshot of another sign-in (pi-devin's `scope` hash differs) is not shown; a credit-billed account shows its billing strategy. pi-devin keeps one snapshot, for its current sign-in, so a second Devin slot (`devin-2`) on another account reads as "another sign-in" |
 | GitHub Actions (opt-in) | Authenticated `gh` CLI | `gh api /organizations/<org>/settings/billing/usage/summary?product=Actions` | ✅ org-wide monthly Linux minutes, plan-derived allowance |
 
@@ -879,7 +879,7 @@ extensions/quota-panel.ts      Pi TUI line and /usage
 ## Tests
 
 ```bash
-node --test tests/*.test.mjs     # 507 tests, fake tokens only, no network
+node --test tests/*.test.mjs     # 510 tests, fake tokens only, no network
 ```
 
 Modules covered: `auth.json` parsing and de-duplication, the Claude Code store

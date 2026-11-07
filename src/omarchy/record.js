@@ -190,6 +190,12 @@ function recordTierLabel(provider) {
     const asOf = (provider.windows ?? []).map((window) => window?.note).find((note) => typeof note === "string" && /^as of /.test(note));
     if (asOf) return redact(asOf).slice(0, 40);
   }
+  // Keys merged into the family's only row (Mistral keys of one organisation)
+  // have no account column to name them, so the header does: "EDU · keys #1 · #1-api".
+  if (Array.isArray(provider.sharedSlots) && provider.sharedSlots.length > 1) {
+    const keys = `keys ${accountLabel(provider)}`;
+    return provider.plan ? `${redact(provider.plan)} · ${keys}` : keys;
+  }
   return provider.plan ? redact(provider.plan) : "";
 }
 
@@ -203,6 +209,10 @@ function recordTierLabel(provider) {
  * @returns {string}
  */
 function accountLabel(provider) {
+  // Keys merged into one row (Mistral keys of one organisation) list every slot.
+  if (Array.isArray(provider.sharedSlots) && provider.sharedSlots.length > 1) {
+    return provider.sharedSlots.map((slot) => (typeof slot === "string" && slot !== "" ? `#${slot}` : "#1")).join(" · ");
+  }
   if (typeof provider.slot === "string" && provider.slot !== "") return `#${provider.slot}`;
   if (provider.slot === null || provider.slot === "") return "#1";
   const account = typeof provider.account === "string" ? provider.account : "";
