@@ -75,8 +75,13 @@ import {
   resolveHistoryDir,
 } from "./history.js";
 
-/** Version of the disposable per-file cache; a foreign version is a cache miss. */
-export const LOCAL_STATS_SCHEMA_VERSION = 2;
+/**
+ * Version of the disposable per-file cache; a foreign version is a cache miss.
+ * A cached file keeps only the rows of the families known when it was read, so
+ * adding a family (3: Devin) bumps it: the miss recounts the open days with
+ * the new family included, and frozen days are never counted twice.
+ */
+export const LOCAL_STATS_SCHEMA_VERSION = 3;
 
 /**
  * How long a scan may run before it returns what it has. The /usage extension

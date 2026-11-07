@@ -2,7 +2,7 @@
 /**
  * piquota — independent, read-only quota for the credentials Pi already owns.
  *
- *   piquota                      panel for Claude, Codex, Antigravity, OpenCode Go, Mistral
+ *   piquota                      panel for Claude, Codex, Antigravity, OpenCode Go, Mistral, Devin
  *   piquota --json               normalized report (used by rp-host / tools)
  *   piquota --compact | --status | --explain
  *   piquota auth opencode        open the OpenCode login and capture the session

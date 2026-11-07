@@ -29,6 +29,8 @@ export const FAMILY_BY_PROVIDER = {
   "google-antigravity": "antigravity",
   "opencode-go": "opencode-go",
   mistral: "mistral",
+  // @buyong/pi-devin's /login; the quota comes from its snapshot file.
+  devin: "devin",
 };
 
 /** Display label used by every surface (terminal, Pi TUI, Moshi cards). */
@@ -38,6 +40,7 @@ export const LABEL_BY_FAMILY = {
   antigravity: "Antigravity (Pi)",
   "opencode-go": "OpenCode Go (Pi)",
   mistral: "Mistral (Pi)",
+  devin: "Devin (Pi)",
   "github-actions": "GitHub Actions",
 };
 
@@ -257,6 +260,10 @@ export function normalizeCredential(provider, raw, source) {
   const projectId = text(raw.projectId) ?? text(raw.project_id);
   const planType = text(raw.planType) ?? (access ? extractChatGptPlanType(access) : null);
   const expiresAtMs = epochMs(raw.expires) ?? (access ? extractExpiresAtMs(access) : null);
+  // pi-devin records its RPC origin beside the token; it names the snapshot's
+  // scope, never a place pi-usage sends anything.
+  const devinMeta = family === "devin" && raw.devin && typeof raw.devin === "object" ? /** @type {Record<string, unknown>} */ (raw.devin) : null;
+  const apiServerURL = devinMeta ? text(devinMeta.apiServerURL) : null;
 
   // Fingerprint on the BASE provider, not the raw slot id: the same secret in
   // "opencode-go" and "opencode-go-2" must still collapse to one credential,
@@ -281,6 +288,7 @@ export function normalizeCredential(provider, raw, source) {
     email,
     planType,
     kind,
+    ...(apiServerURL ? { apiServerURL } : {}),
   };
 }
 

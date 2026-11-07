@@ -12,6 +12,7 @@ Field **names** only; values never appear in code, logs, tests or artifacts.
 | Claude Code CLI store | `$PI_QUOTA_CLAUDE_CODE_CREDENTIALS`, else `$CLAUDE_CONFIG_DIR/.credentials.json`, else `$HOME/.claude/.credentials.json` | read-only (`flag: "r"`); the second Claude source |
 | Claude Code profile | `$CLAUDE_CONFIG_DIR/.claude.json`, else `$HOME/.claude.json` | read-only; only `oauthAccount.emailAddress`, `displayName` and `organizationType` are read, never project history |
 | opencode.ai session | `OPENCODE_GO_AUTH_COOKIE`, else `~/.config/pi-quota/opencode-cookie`, else a local browser cookie database (Firefox, or Chromium/Chrome/Edge/Brave on Linux) | read-only; browser databases are copied to a temp dir first |
+| pi-devin quota snapshot | `$PI_QUOTA_DEVIN_USAGE_PATH`, else `pi-devin/account-usage.json` beside the `auth.json` holding the `devin` login | read-only (`flag: "r"`), at most 64 KB; only `schemaVersion`, `scope` and `usage` are read |
 | Moshi host secret | `~/.local/state/moshi/secrets.json` | read-only; `host-secret` is sent only as a Bearer header to the paired host |
 
 Nothing else is read. `~/.shuvquota.env` is no longer used: the project does not
@@ -29,7 +30,8 @@ fingerprint of the secret). The fingerprint is one-way and is only a stable key.
   "anthropic":    { "type": "oauth",   "refresh": "sk-ant-ort01…", "access": "sk-ant-oat01…", "expires": 1789… },
   "antigravity":  { "type": "oauth",   "refresh": "1//0…", "access": "ya29.…", "expires": 1789…, "projectId": "…", "email": "…" },
   "opencode-go":  { "type": "api_key", "key": "sk-…" },
-  "mistral":      { "type": "api_key", "key": "…" }
+  "mistral":      { "type": "api_key", "key": "…" },
+  "devin":        { "type": "oauth", "access": "…", "refresh": "", "expires": 1794…, "devin": { "apiServerURL": "https://server.codeium.com", … } }
 }
 ```
 
@@ -91,6 +93,8 @@ session state, and none of it is read or echoed.
 | `accountId` | Codex | `chatgpt-account-id` header, display identity | no |
 | `projectId` | Antigravity | `{ project }` body field, display identity (printed once, also when it is the only identity there is) | no |
 | `email` | all | display identity, redacted in artifacts | no |
+| `access` (Devin) | `devin.js` | hashed in memory as `sha256(apiServerURL + "\0" + access)` and compared with the snapshot's `scope`; never sent | no |
+| `devin.apiServerURL` | `pi-auth.js` | the other half of that hash; not contacted | no |
 | `key` | OpenCode Go, Mistral, Claude/Codex `api_key` siblings | OpenCode: Zen validity probe; Mistral: `Authorization: Bearer` to `api.mistral.ai/v1/billing/*` only; Claude/Codex API keys: never sent, identity fingerprint only | no |
 
 Codex JWT **payload** only (signature never verified, token never disclosed):
@@ -108,6 +112,7 @@ Codex JWT **payload** only (signature never verified, token never disclosed):
 | `PI_QUOTA_CLAUDE_CODE_CREDENTIALS` | replace the Claude Code credential file |
 | `PI_QUOTA_CLAUDE_SOURCE` | `auto` (default, prefers Claude Code), `claude-code`, or `pi` |
 | `CLAUDE_CONFIG_DIR` | Claude Code's own relocation variable, honoured as-is |
+| `PI_QUOTA_DEVIN_USAGE_PATH` | replace the pi-devin quota snapshot path |
 | `OPENCODE_GO_AUTH_COOKIE`, `OPENCODE_GO_WORKSPACE_ID` | supply the opencode.ai session directly |
 | `MOSHI_API_BASE` | override the paired-host base URL |
 | `MOSHI_SOCKET_PATH` | where the approval mirror dials the daemon |
@@ -125,6 +130,7 @@ Codex JWT **payload** only (signature never verified, token never disclosed):
 | Antigravity | no | **yes, in memory only** | transparent; nothing is preserved to disk, and the report describes the renewed token (no expiry claim) — a failed renewal keeps the stored countdown and its warning |
 | OpenCode Go | n/a (API key) | n/a | n/a |
 | Mistral | n/a (API key) | n/a | n/a |
+| Devin | pi-devin's business | **never** | the token is not used here; a snapshot of another sign-in is not shown |
 | Claude / Codex `api_key` sibling | n/a (API key) | n/a | n/a — the key is never sent; the account shows a note and no windows |
 
 Claude and OpenAI rotate the refresh token. Refreshing them here would invalidate

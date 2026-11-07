@@ -4,7 +4,7 @@ Instructions, architecture rules, and testing guidelines for AI coding agents wo
 
 ## Project Overview
 
-`piQuota` is a standalone, zero-dependency quota monitor for AI providers configured in the [Pi Coding Agent](https://github.com/earendil-works/pi) ecosystem. It aggregates real-time quota, reset countdowns, and subscription tiers across multiple AI providers (Claude, OpenAI Codex, Antigravity, OpenCode Go, Mistral) across multiple surfaces:
+`piQuota` is a standalone, zero-dependency quota monitor for AI providers configured in the [Pi Coding Agent](https://github.com/earendil-works/pi) ecosystem. It aggregates real-time quota, reset countdowns, and subscription tiers across multiple AI providers (Claude, OpenAI Codex, Antigravity, OpenCode Go, Mistral, Devin) across multiple surfaces:
 - **Terminal CLI**: `piquota` (boxed widget, compact line, status, JSON).
 - **Pi TUI Extension**: `/usage`, custom editor rail widget, and gentle-pi sidebar integration.
 - **JSON & External Integrations**: `piquota --json` structured quota feed for `rp-host` and automation tools.
@@ -69,6 +69,7 @@ Any modification to this codebase MUST uphold these non-negotiable guarantees:
    - pi-usage's direct read of `~/.pi/agent/auth.json` uses `flag: "r"`; pi-usage code must never write, sync, or modify it. The extension's sole exception is delegating OAuth resolution to Pi's `ctx.modelRegistry.getProviderAuth`; Pi may persist a renewal through its own locked auth-storage path.
    - The CLI and systemd timer never call Pi auth resolution and remain strictly read-only on `auth.json`.
    - `~/.claude/.credentials.json` is opened read-only.
+   - `@buyong/pi-devin`'s quota snapshot (`<agent dir>/pi-devin/account-usage.json`, beside the `auth.json` the Devin login came from, or `PI_QUOTA_DEVIN_USAGE_PATH`) is opened read-only and capped at 64 KB. pi-usage makes no Devin request: the Devin token never leaves the process, and is only hashed in memory to match pi-devin's `scope`.
    - Pi's session files (`~/.pi/agent/sessions/**/*.jsonl`,
      `$PI_CODING_AGENT_DIR/sessions`, `~/.omp/agent/sessions`) are opened read-only
      for the local token scan. The scan cache keeps per-file offsets and open

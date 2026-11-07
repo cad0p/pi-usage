@@ -16,6 +16,7 @@ const FAMILY_SHORT = {
   antigravity: "A",
   "opencode-go": "G",
   mistral: "M",
+  devin: "D",
   "github-actions": "GH",
 };
 
@@ -25,6 +26,7 @@ const FAMILY_TITLE = {
   antigravity: "Antigravity (Pi)",
   "opencode-go": "OpenCode Go (Pi)",
   mistral: "Mistral (Pi)",
+  devin: "Devin (Pi)",
   "github-actions": "GitHub Actions",
 };
 
@@ -323,6 +325,9 @@ export function renderBoxWidget(providers, paint, totalWidth = typeof process?.s
   // without it never sees a permanent "not configured" row.
   if (providerFor("mistral") && providerFor("mistral").notConfigured !== true) {
     rows.push({ label: "Mistral:", ...windowFor("mistral", (window) => window.id === "vibe") });
+  }
+  if (providerFor("devin") && providerFor("devin").notConfigured !== true) {
+    rows.push({ label: "Devin:  ", ...windowFor("devin", (window) => window.id === "daily") });
   }
   if (providerFor("github-actions")) {
     rows.push({ label: "GH Actions:", ...windowFor("github-actions", (window) => window.id === "monthly") });
