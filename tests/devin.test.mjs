@@ -123,7 +123,7 @@ test("devin: a reset exactly at the run is already past", async () => {
   assert.equal(result.windows.find((window) => window.id === "daily")?.usedPercent, null);
 });
 
-test("devin: a FIFO at the snapshot path is rejected, not waited on", { skip: process.platform === "win32" }, async () => {
+test("devin: a FIFO at the snapshot path is rejected, not waited on", { skip: process.platform === "win32", timeout: 5000 }, async () => {
   const { directory, authPath } = agentDir(null);
   mkdirSync(join(directory, "pi-devin"));
   execFileSync("mkfifo", [join(directory, "pi-devin", "account-usage.json")]);
