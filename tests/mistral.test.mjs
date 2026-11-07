@@ -377,6 +377,13 @@ test("mistral: keys of one organisation answer one budget and merge into one row
   const { renderProviderLines: extensionLines } = await import("../extensions/quota-panel.ts");
   const theme = { fg: (_key, text) => text, bold: (text) => text };
   assert.match(extensionLines(results[0], /** @type {any} */ (theme), undefined, false).join("\n"), /share one organisation budget/);
+
+  // The session scan counts tokens per key; the merged /usage row sums its keys.
+  const { renderAccountRows } = await import("../extensions/quota-panel.ts");
+  const stats = { byAccount: { "#1": { todayTokens: 1_000_000 }, "#1-api": { todayTokens: 500_000 }, "#2": { todayTokens: 250_000 } } };
+  const rows = renderAccountRows(/** @type {any} */ (results), /** @type {any} */ (theme), /** @type {any} */ (stats));
+  assert.match(rows.find((line) => line.includes("#1 · #1-api")) ?? "", /1\.5M today/, "both keys' tokens on the merged row");
+  assert.match(rows.find((line) => /#2 /.test(line)) ?? "", /250k today/);
 });
 
 test("mistral: a fresh or spent budget does not identify an organisation, so it never merges", () => {
@@ -405,6 +412,7 @@ test("mistral: a fresh or spent budget does not identify an organisation, so it 
   const single = buildRecords(/** @type {any} */ ({ providers: pair, byFamily: { mistral: pair } }), { now: NOW })[0].record;
   assert.equal(single.tierLabel, "EDU · keys #1 · #1-api");
   assert.equal(single.accounts, undefined);
+  assert.match(renderPanel(pair, plainPalette()).join("\n"), /Mistral \(Pi\) #1 · #1-api · plan EDU/, "the CLI names the keys of a lone merged row too");
   // Three keys of one organisation: one row, every slot in order, the note names them all.
   const three = mergeSharedBudgets([row(null, 40.5), row("1-api", 40.5), row("2", 40.5, { note: "kept" })]);
   assert.equal(three.length, 1);

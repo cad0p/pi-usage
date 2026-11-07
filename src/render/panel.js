@@ -387,7 +387,11 @@ export function renderPanel(providers, paint, meta = {}) {
   }
   /** @param {import("../model.js").QuotaResult} provider */
   const accountTitle = (provider) => {
-    if ((familyCounts.get(provider.family) ?? 0) <= 1) return null;
+    // A row that merged several keys (Mistral keys of one organisation) names
+    // them even when it is the family's only row: the title is the one place
+    // that says two keys are behind one budget.
+    const merged = Array.isArray(provider.sharedSlots) && provider.sharedSlots.length > 1;
+    if (!merged && (familyCounts.get(provider.family) ?? 0) <= 1) return null;
     return `${FAMILY_TITLE[provider.family] ?? provider.label} ${slotLabel(provider)}`;
   };
 
