@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [calver-released]
+
+<!-- USER-EDITABLE SECTION START -->
+<!-- Add your curated release notes here. -->
+<!-- USER-EDITABLE SECTION END -->
+
+### 🚀 Features
+
+- Mistral quota from the billing API (closes #36)
+
+
 ## [0.11.6] - 2026-11-03
 
 <!-- USER-EDITABLE SECTION START -->
