@@ -200,11 +200,11 @@ export function hasMonthFiles(historyDir) {
 
 /**
  * @param {string} slot
- * @returns {string} "" for the base entry (it has no number), "#<slot>" for a
- * real sibling slot.
+ * @returns {string} "#1" for the base entry (the first account of the family),
+ * "#<slot>" for a sibling slot ("#2", "#1-api").
  */
 export function accountLabel(slot) {
-  return slot === "" || slot === null || slot === undefined ? "" : `#${slot}`;
+  return slot === "" || slot === null || slot === undefined ? "#1" : `#${slot}`;
 }
 
 /**
@@ -521,9 +521,9 @@ export function parseTotals(raw) {
     if (entry.accounts && typeof entry.accounts === "object" && !Array.isArray(entry.accounts)) {
       for (const [rawLabel, accountValue] of Object.entries(entry.accounts)) {
         if (!accountValue || typeof accountValue !== "object") continue;
-        // Files written before the base entry lost its invented "#1" carry that
-        // key; normalize on read so one account never shows up twice.
-        const label = rawLabel === "#1" ? "" : rawLabel;
+        // Files written while the base entry was unlabelled carry "" for it;
+        // normalize on read so one account never shows up twice.
+        const label = rawLabel === "" ? "#1" : rawLabel;
         const account = /** @type {Record<string, unknown>} */ (accountValue);
         familyTotals.accounts.set(label, {
           totalPrompts: count(account.totalPrompts),

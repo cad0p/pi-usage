@@ -43,14 +43,14 @@ function record(value) {
 }
 
 /**
- * The account label shown by every surface: the base auth.json entry has no
- * numeric suffix, so it gets no number; a sibling slot is `#<slot>`.
+ * The account label shown by every surface: the base auth.json entry is the
+ * family's first account, `#1`; a sibling slot is `#<slot>` (`#1-api`).
  *
  * @param {{ slot?: string | null }} credential
  * @returns {string}
  */
 function accountLabel(credential) {
-  return credential.slot ? `#${credential.slot}` : "";
+  return credential.slot ? `#${credential.slot}` : "#1";
 }
 
 /**

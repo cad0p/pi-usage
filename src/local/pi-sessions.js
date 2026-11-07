@@ -925,8 +925,8 @@ function tokensByModel(models) {
  * @returns {number}
  */
 function labelOrder(label) {
-  // "" is the base entry; "#1" is the old invented label for it, kept so a
-  // totals.json written before the fix still sorts first.
+  // "#1" is the base entry; "" is the label it had for a while, kept so a
+  // totals.json written then still sorts first.
   if (label === "" || label === "#1") return -1;
   const numeric = Number.parseInt(String(label).replace(/^#/, ""), 10);
   return Number.isFinite(numeric) ? numeric : Number.MAX_SAFE_INTEGER;

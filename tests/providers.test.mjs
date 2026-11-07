@@ -53,6 +53,38 @@ test("claude: a 401 degrades with a re-login hint instead of throwing", async ()
   assert.match(result.error ?? "", /use any Claude model in Pi/);
 });
 
+test("claude: an api_key sibling is a working account with no plan windows and no request", async () => {
+  const { fetchFn, calls } = routedFetch([["api.anthropic.com", () => jsonResponse(claudeUsageBody())]]);
+  const credential = normalizeCredential("anthropic-1-api", { type: "api_key", key: "sk-ant-FAKE" }, "/tmp/auth.json");
+  assert.ok(credential);
+  assert.equal(credential.kind, "api_key");
+  assert.equal(credential.slot, "1-api");
+
+  const result = await fetchClaude(credential, { now: NOW, fetchFn });
+  assert.equal(result.ok, true);
+  assert.equal(result.error, null);
+  assert.equal(result.plan, null);
+  assert.deepEqual(result.windows, []);
+  assert.equal(result.note, "API key · pay-as-you-go, no plan windows (Anthropic shows API keys no balance)");
+  assert.equal(calls.length, 0, "the key is never sent to the usage endpoint");
+});
+
+test("codex: an api_key sibling is a working account with no plan windows and no request", async () => {
+  const { fetchFn, calls } = routedFetch([["chatgpt.com", () => jsonResponse(codexUsageBody())]]);
+  const credential = normalizeCredential("openai-codex-1-api", { type: "api_key", key: "sk-FAKE" }, "/tmp/auth.json");
+  assert.ok(credential);
+  assert.equal(credential.kind, "api_key");
+  assert.equal(credential.slot, "1-api");
+
+  const result = await fetchCodex(credential, { now: NOW, fetchFn });
+  assert.equal(result.ok, true);
+  assert.equal(result.error, null);
+  assert.equal(result.plan, null);
+  assert.deepEqual(result.windows, []);
+  assert.equal(result.note, "API key · pay-as-you-go, no plan windows (OpenAI shows API keys no balance)");
+  assert.equal(calls.length, 0, "the key is never sent to the usage endpoint");
+});
+
 test("codex: maps primary/secondary windows by their real length and sends chatgpt-account-id", async () => {
   const access = makeFakeJwt({
     "https://api.openai.com/auth": { chatgpt_account_id: "acct_fixture", chatgpt_plan_type: "plus" },
@@ -314,7 +346,7 @@ test("opencode-go: the API key reads its own 5h/weekly/monthly windows", async (
 
   const first = await fetchOpenCodeGo(base, { now: NOW, fetchFn, env: {}, stores: [], allowBrowser: false });
   assert.equal(first.ok, true);
-  assert.equal(first.account, "", "the base entry has no number in auth.json");
+  assert.equal(first.account, "#1", "the base entry is the family's first account");
   assert.equal(first.plan, "Go plan");
   assert.deepEqual(first.windows.map((window) => window.id), ["5h", "weekly", "monthly"]);
   assert.deepEqual(first.windows.map((window) => window.usedPercent), [0, 9, 100]);

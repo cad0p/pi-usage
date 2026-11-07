@@ -523,6 +523,19 @@ Item {
         width: parent.width
         spacing: Style.space(10)
 
+        // The label column fits the widest label ("#1-api", "#14"), so no label
+        // runs into the window columns; a pathological one is capped and elided.
+        TextMetrics {
+          id: labelMetrics
+          text: Logic.longestId(section.accountList)
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.bodySmall
+          font.bold: true
+        }
+        readonly property real labelWidth: Math.min(
+          Math.max(Style.space(30), Math.ceil(labelMetrics.advanceWidth) + Style.space(2)),
+          Math.round(width * 0.35))
+
         PanelSectionHeader {
           text: "ACCOUNTS"
           foreground: root.foreground
@@ -535,6 +548,7 @@ Item {
           AccountRow {
             required property var modelData
             width: accountsSection.width
+            labelWidth: accountsSection.labelWidth
             account: modelData
           }
         }
@@ -710,6 +724,7 @@ Item {
   component AccountRow: Item {
     id: accountRow
     property var account: null
+    property real labelWidth: Style.space(30)
 
     readonly property var windows: account ? account.windows : []
     readonly property bool ok: !!account && account.ok
@@ -726,7 +741,8 @@ Item {
       font.family: root.fontFamily
       font.pixelSize: Style.font.bodySmall
       font.bold: true
-      width: Style.space(30)
+      width: accountRow.labelWidth
+      elide: Text.ElideRight
       anchors.left: parent.left
       anchors.top: parent.top
     }

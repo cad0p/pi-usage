@@ -10,6 +10,7 @@ import { fileURLToPath } from "node:url";
 import test from "node:test";
 
 import { collectFamily, collectQuota } from "../src/engine.js";
+import { buildRecords } from "../src/omarchy/record.js";
 import { clearCache, readCache, withCache, writeCache } from "../src/cache.js";
 import {
   antigravityUsageBody,
@@ -825,6 +826,35 @@ test("every request carries the package User-Agent unless the provider sets its 
   const original = { Accept: "application/json" };
   withUserAgent(original);
   assert.deepEqual(original, { Accept: "application/json" }, "the caller's headers object is not mutated");
+});
+
+test("a Claude api_key sibling answers beside the OAuth base, and the record labels both by slot", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "pi-quota-claude-api-"));
+  const authPath = join(directory, "auth.json");
+  writeFileSync(authPath, JSON.stringify({
+    anthropic: { type: "oauth", access: "sk-ant-oat01-FAKE" },
+    "anthropic-1-api": { type: "api_key", key: "sk-ant-FAKE-api" },
+  }));
+  const { fetchFn, calls } = routedFetch([["api.anthropic.com", () => jsonResponse(claudeUsageBody())]]);
+  const report = await collectQuota({ paths: [authPath], claudeCodePaths: [], now: NOW, fetchFn, families: ["claude"], env: {}, home: directory, stores: [], allowBrowser: false });
+
+  const results = report.byFamily.claude;
+  assert.equal(results.length, 2);
+  const api = results.find((result) => result.slot === "1-api");
+  assert.equal(api.ok, true);
+  assert.deepEqual(api.windows, []);
+  assert.match(api.note ?? "", /API key · pay-as-you-go/);
+  assert.equal(calls.length, 1, "only the OAuth account reaches Anthropic");
+  assert.equal(JSON.stringify(report).includes("sk-ant-FAKE-api"), false, "the key never reaches the report");
+
+  const { record } = buildRecords(report, { now: NOW })[0];
+  assert.deepEqual(record.accounts.map((account) => account.id), ["#1", "#1-api"]);
+  assert.equal(record.tierLabel, "2 of 2 accounts");
+  assert.equal(record.usageStatusText, "", "the api key is not an unavailable account");
+  assert.equal(record.authHelpText, "");
+  const apiRow = record.accounts.find((account) => account.id === "#1-api");
+  assert.equal(apiRow.ok, true);
+  assert.equal(apiRow.status, api.note, "a windowless answered account says why it is empty");
 });
 
 test("the OpenCode Go usage request is sent with the package User-Agent", async () => {
