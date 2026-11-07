@@ -5,7 +5,7 @@
 
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -123,12 +123,26 @@ test("devin: a reset exactly at the run is already past", async () => {
   assert.equal(result.windows.find((window) => window.id === "daily")?.usedPercent, null);
 });
 
-test("devin: a FIFO at the snapshot path is rejected, not waited on", { skip: process.platform === "win32", timeout: 5000 }, async () => {
+// A blocking open on a FIFO with no writer stops the whole event loop, so a
+// node:test timeout could never fire. The read runs in a child process that
+// spawnSync kills after 5 s: a regression fails here instead of hanging CI.
+test("devin: a FIFO at the snapshot path is rejected, not waited on", { skip: process.platform === "win32" }, () => {
   const { directory, authPath } = agentDir(null);
   mkdirSync(join(directory, "pi-devin"));
   execFileSync("mkfifo", [join(directory, "pi-devin", "account-usage.json")]);
-  const result = await fetchQuota(credentialFor(authPath), { now: NOW, env: {} });
-  assert.match(String(result.error), /unreadable \(not a file\)/);
+  const source = [
+    `import { fetchQuota } from ${JSON.stringify(new URL("../src/providers/devin.js", import.meta.url).href)};`,
+    `import { normalizeCredential } from ${JSON.stringify(new URL("../src/auth/pi-auth.js", import.meta.url).href)};`,
+    `import { readFileSync } from "node:fs";`,
+    `const authPath = ${JSON.stringify(authPath)};`,
+    `const credential = normalizeCredential("devin", JSON.parse(readFileSync(authPath, "utf8")).devin, authPath);`,
+    `const result = await fetchQuota(credential, { now: ${NOW}, env: {} });`,
+    `process.stdout.write(String(result.error));`,
+  ].join("\n");
+  const child = spawnSync(process.execPath, ["--input-type=module", "-e", source], { encoding: "utf8", timeout: 5000 });
+  assert.equal(child.error?.code, undefined, "the read returned instead of blocking on the FIFO");
+  assert.equal(child.status, 0, child.stderr);
+  assert.match(child.stdout, /unreadable \(not a file\)/);
 });
 
 test("devin: a snapshot from another sign-in is not shown", async () => {
