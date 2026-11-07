@@ -1588,7 +1588,7 @@ test("r forces every provider in the background and never closes the overlay", a
   overlays[0].component.handleInput("r");
   await settle();
   const forced = calls.slice(baseline).filter((call) => call.force);
-  assert.equal(forced.length, 4, "r forces Claude, Codex, Antigravity and OpenCode Go independently");
+  assert.equal(forced.length, 5, "r forces Claude, Codex, Antigravity, OpenCode Go and Mistral independently");
   assert.equal(overlays[0].doneCalls, 0, "r leaves the view open");
 
   // On History, r reloads the month AND the report its today row depends on.
@@ -1599,7 +1599,7 @@ test("r forces every provider in the background and never closes the overlay", a
   overlays[0].component.handleInput("r");
   await settle();
   const after = calls.slice(onHistory);
-  assert.equal(after.filter((call) => call.force).length, 4, "r on History forces every provider");
+  assert.equal(after.filter((call) => call.force).length, 5, "r on History forces every provider");
   assert.ok(historyCalls.length > historyBefore, "r on History reloads the month");
   assert.match(frameText(overlays[0]).split("\n")[0], /updated \d\d:\d\d/, "History's header shows when the report it merges was updated");
 
@@ -1799,6 +1799,8 @@ test("opening uses per-family clocks and r forces all enabled families", async (
   const now = Date.now();
   const cached = withFamilies(overlayReport());
   cached.providers.push(structuredClone(REPORT.providers.find((provider) => provider.family === "antigravity")));
+  // Every enabled family needs a fresh clock, or it is refreshed on open too.
+  cached.providers.push({ ...structuredClone(REPORT.providers.find((provider) => provider.family === "antigravity")), family: "mistral", label: "Mistral (Pi)" });
   cached.generatedAt = new Date(now).toISOString();
   cached.providers = cached.providers.map((provider) => ({
     ...provider,
@@ -1828,7 +1830,7 @@ test("opening uses per-family clocks and r forces all enabled families", async (
   overlays[0].component.handleInput("r");
   await settle();
   const forced = calls.filter((call) => call.force).map((call) => call.family).sort();
-  assert.deepEqual(forced, ["antigravity", "claude", "codex", "opencode-go"]);
+  assert.deepEqual(forced, ["antigravity", "claude", "codex", "mistral", "opencode-go"]);
   overlays[0].component.handleInput("\u001b");
   await pending;
 });
@@ -1856,7 +1858,7 @@ test("a slow family never delays others, and does not block their forced refresh
   const usage = harness.commands.find((command) => command.name === "usage");
   const pending = usage.definition.handler("", harness.ctx);
   await settle();
-  assert.deepEqual(completed.sort(), ["claude", "codex", "opencode-go"], "fast sections land while Antigravity is held");
+  assert.deepEqual(completed.sort(), ["claude", "codex", "mistral", "opencode-go"], "fast sections land while Antigravity is held");
   assert.match(frameText(overlays[0]), /Claude/);
   assert.match(frameText(overlays[0]), /OP-Go/);
   assert.ok(published.some((item) => item.families.includes("claude") && !item.prune), "each arrived family publishes its Omarchy record immediately");
@@ -1865,7 +1867,7 @@ test("a slow family never delays others, and does not block their forced refresh
   overlays[0].component.handleInput("r");
   await settle();
   const forcedFamilies = calls.filter((call) => call.force).map((call) => call.family).sort();
-  assert.deepEqual(forcedFamilies, ["claude", "codex", "opencode-go"], "the in-flight Antigravity request does not serialize forced refreshes for other families");
+  assert.deepEqual(forcedFamilies, ["claude", "codex", "mistral", "opencode-go"], "the in-flight Antigravity request does not serialize forced refreshes for other families");
   assert.equal(calls.filter((call) => call.family === "antigravity").length, 1, "the same family is never double-started");
 
   releaseAntigravity();
@@ -2206,7 +2208,7 @@ test("a failing CLI reports an error instead of throwing", async () => {
 
   const usage = harness.commands.find((command) => command.name === "usage");
   await usage.definition.handler("refresh", harness.ctx);
-  assert.ok(harness.notifications.some((message) => message.startsWith("Quota refresh failed: Claude: piquota exploded (+3 more)")));
+  assert.ok(harness.notifications.some((message) => message.startsWith("Quota refresh failed: Claude: piquota exploded (+4 more)")));
 });
 
 test("session_shutdown clears both the footer and the widget", async () => {

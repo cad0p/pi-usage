@@ -15,6 +15,7 @@ const FAMILY_SHORT = {
   codex: "X",
   antigravity: "A",
   "opencode-go": "G",
+  mistral: "M",
   "github-actions": "GH",
 };
 
@@ -23,6 +24,7 @@ const FAMILY_TITLE = {
   codex: "Codex (Pi)",
   antigravity: "Antigravity (Pi)",
   "opencode-go": "OpenCode Go (Pi)",
+  mistral: "Mistral (Pi)",
   "github-actions": "GitHub Actions",
 };
 
@@ -218,6 +220,8 @@ export function renderProviderLines(provider, paint, contentWidth = MAX_WIDTH, o
   }
 
   if ((provider.windows ?? []).length === 0) {
+    // A provider that answered but cannot show windows says why in its note.
+    if (provider.note) lines.push(`  ${paint("warning", `~ ${clip(provider.note, contentWidth - 4)}`)}`);
     lines.push(`  ${paint("dim", "no rate-limit windows reported")}`);
     return lines;
   }
@@ -285,6 +289,11 @@ export function renderBoxWidget(providers, paint, totalWidth = typeof process?.s
     { label: "Agy C/G:", ...windowFor("antigravity", (window) => window.id === "claude-gpt-5h" || (/(claude|gpt|3p)/i.test(window.id) && isFiveHour(window))) },
     { label: "OP-Go:  ", ...windowFor("opencode-go") },
   ];
+  // Mistral joins the compact widget only when it is configured, so a user
+  // without it never sees a permanent "not configured" row.
+  if (providerFor("mistral") && providerFor("mistral").notConfigured !== true) {
+    rows.push({ label: "Mistral:", ...windowFor("mistral", (window) => window.id === "vibe") });
+  }
   if (providerFor("github-actions")) {
     rows.push({ label: "GH Actions:", ...windowFor("github-actions", (window) => window.id === "monthly") });
   }

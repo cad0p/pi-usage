@@ -4,7 +4,7 @@ Instructions, architecture rules, and testing guidelines for AI coding agents wo
 
 ## Project Overview
 
-`piQuota` is a standalone, zero-dependency quota monitor for AI providers configured in the [Pi Coding Agent](https://github.com/earendil-works/pi) ecosystem. It aggregates real-time quota, reset countdowns, and subscription tiers across multiple AI providers (Claude, OpenAI Codex, Antigravity, OpenCode Go) across multiple surfaces:
+`piQuota` is a standalone, zero-dependency quota monitor for AI providers configured in the [Pi Coding Agent](https://github.com/earendil-works/pi) ecosystem. It aggregates real-time quota, reset countdowns, and subscription tiers across multiple AI providers (Claude, OpenAI Codex, Antigravity, OpenCode Go, Mistral) across multiple surfaces:
 - **Terminal CLI**: `piquota` (boxed widget, compact line, status, JSON).
 - **Pi TUI Extension**: `/usage`, custom editor rail widget, and gentle-pi sidebar integration.
 - **JSON & External Integrations**: `piquota --json` structured quota feed for `rp-host` and automation tools.

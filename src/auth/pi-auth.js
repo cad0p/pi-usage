@@ -28,6 +28,7 @@ export const FAMILY_BY_PROVIDER = {
   // kept for stores written by older Pi releases and third-party plugins.
   "google-antigravity": "antigravity",
   "opencode-go": "opencode-go",
+  mistral: "mistral",
 };
 
 /** Display label used by every surface (terminal, Pi TUI, Moshi cards). */
@@ -36,6 +37,7 @@ export const LABEL_BY_FAMILY = {
   claude: "Claude (Pi)",
   antigravity: "Antigravity (Pi)",
   "opencode-go": "OpenCode Go (Pi)",
+  mistral: "Mistral (Pi)",
   "github-actions": "GitHub Actions",
 };
 

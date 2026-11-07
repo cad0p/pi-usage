@@ -34,7 +34,7 @@ function fullRoutes() {
   ]);
 }
 
-test("collectQuota reports all five registered families when GitHub Actions is enabled", async () => {
+test("collectQuota reports all six registered families when GitHub Actions is enabled", async () => {
   const { fetchFn } = fullRoutes();
   const runCommand = (_command, args) => {
     const path = args.at(-1);
@@ -56,7 +56,7 @@ test("collectQuota reports all five registered families when GitHub Actions is e
     allowBrowser: false,
   });
 
-  assert.deepEqual(Object.keys(report.byFamily).sort(), ["antigravity", "claude", "codex", "github-actions", "opencode-go"]);
+  assert.deepEqual(Object.keys(report.byFamily).sort(), ["antigravity", "claude", "codex", "github-actions", "mistral", "opencode-go"]);
   assert.equal(report.readOnly, true);
   assert.equal(report.schemaVersion, 1);
 
@@ -392,7 +392,7 @@ test("withCache merges a partial family query without poisoning the full cache",
 
   const fullReport = await collectQuota({ paths: [FIXTURE], claudeCodePaths: [], now: NOW, fetchFn, env: {}, stores: [], allowBrowser: false });
   writeCache(fullReport, { path, now: NOW });
-  assert.equal(readCache({ path, now: NOW }).report.providers.length, 4);
+  assert.equal(readCache({ path, now: NOW }).report.providers.length, 5);
 
   const partial = await withCache(
     { path, now: NOW + 1000, ttlMs: 60_000, families: ["codex"] },
@@ -401,8 +401,8 @@ test("withCache merges a partial family query without poisoning the full cache",
   assert.deepEqual(partial.report.providers.map((p) => p.family), ["codex"]);
 
   const cachedFull = readCache({ path, now: NOW + 1000 });
-  assert.equal(cachedFull.report.providers.length, 4);
-  assert.deepEqual(Object.keys(cachedFull.report.byFamily).sort(), ["antigravity", "claude", "codex", "opencode-go"]);
+  assert.equal(cachedFull.report.providers.length, 5);
+  assert.deepEqual(Object.keys(cachedFull.report.byFamily).sort(), ["antigravity", "claude", "codex", "mistral", "opencode-go"]);
 });
 
 test("the terminal surface also shows last known values while a provider is throttled", async () => {

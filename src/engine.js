@@ -16,10 +16,11 @@ import { fetchQuota as fetchClaude } from "./providers/claude.js";
 import { fetchQuota as fetchCodex } from "./providers/codex.js";
 import { fetchQuota as fetchAntigravity } from "./providers/antigravity.js";
 import { fetchQuota as fetchOpenCodeGo } from "./providers/opencode-go.js";
+import { fetchQuota as fetchMistral } from "./providers/mistral.js";
 import { fetchQuota as fetchGithubActions } from "./providers/github-actions.js";
 
 /** Canonical family order used by every surface. */
-export const FAMILIES = ["claude", "codex", "antigravity", "opencode-go", "github-actions"];
+export const FAMILIES = ["claude", "codex", "antigravity", "opencode-go", "mistral", "github-actions"];
 
 /**
  * Return the ordered families enabled for a run.
@@ -196,6 +197,7 @@ const PROVIDERS = {
   codex: fetchCodex,
   antigravity: fetchAntigravity,
   "opencode-go": fetchOpenCodeGo,
+  mistral: fetchMistral,
   "github-actions": fetchGithubActions,
 };
 

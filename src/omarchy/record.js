@@ -38,6 +38,7 @@ const LOGIN_HINT = {
   codex: "Run `/login openai-codex` in Pi to restore usage.",
   antigravity: "Run `/login antigravity` in Pi to restore usage.",
   "opencode-go": "Run `piquota auth opencode` to restore usage.",
+  mistral: "Run `/login mistral` in Pi to restore usage.",
 };
 
 const HELP_MAX = 200;
@@ -118,9 +119,11 @@ function mapLimits(windows, provider, prefix = "") {
   for (const window of windows ?? []) {
     // A window without a percentage would otherwise read as "0% used".
     if (typeof window.usedPercent !== "number" || !Number.isFinite(window.usedPercent)) continue;
+    // Spending past the allowance changes what 100% means, so the title says so.
+    const payg = typeof window.note === "string" && /pay-as-you-go/i.test(window.note) ? " · pay-as-you-go" : "";
     limits.push({
       label: redact(`${prefix}${window.label || window.id || "Limit"}`),
-      title: redact(`${prefix}${windowTitle(window, provider)}`),
+      title: redact(`${prefix}${windowTitle(window, provider)}${payg}`),
       percent: Math.min(1, Math.max(0, window.usedPercent / 100)),
       resetsAt: typeof window.resetsAt === "string" ? window.resetsAt : "",
     });
@@ -384,7 +387,11 @@ function buildFamilyRecord(family, providers, options = {}) {
       const window = bindingWindow(provider.windows);
       const mapped = window ? mapLimits([window], provider, label === "" ? "" : `${label} · `)[0] : null;
       if (mapped) limits.push(mapped);
-      accounts.push({ id: redact(label), ok: true, status: "", limits: mapLimits(provider.windows, provider) });
+      const accountLimits = mapLimits(provider.windows, provider);
+      // An account that answered without windows (Mistral without the usage
+      // permission) says why instead of showing an empty row.
+      const quiet = accountLimits.length === 0 && typeof provider.note === "string" ? redact(provider.note).slice(0, HELP_MAX) : "";
+      accounts.push({ id: redact(label), ok: true, status: quiet, limits: accountLimits });
       return;
     }
     failures.push({ label, reason: failureReason(provider.error) });
@@ -481,9 +488,11 @@ export function buildRecord(provider, options = {}) {
 
   if (failed && errorKind(provider.error) === "missing") return null;
 
-  const status = failed
-    ? describeError(provider.family, provider.error ?? "no usage windows")
-    : { usageStatusText: "", authHelpText: "" };
+  const status = provider.ok && limits.length === 0 && typeof provider.note === "string" && provider.note !== ""
+    ? { usageStatusText: "Usage not visible", authHelpText: redact(provider.note).slice(0, HELP_MAX) }
+    : failed
+      ? describeError(provider.family, provider.error ?? "no usage windows")
+      : { usageStatusText: "", authHelpText: "" };
 
   const id = recordId(provider.family);
   return {
