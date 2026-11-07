@@ -116,6 +116,24 @@ test("siblings are ordered numerically and de-duplicated by base provider and se
   assert.deepEqual(credentials.map((credential) => credential.family), ["opencode-go", "opencode-go", "opencode-go", "opencode-go"]);
 });
 
+test("a <base>-1 sibling beside the base is flagged as a second #1", () => {
+  const directory = mkdtempSync(join(tmpdir(), "pi-quota-auth-"));
+  const path = join(directory, "auth.json");
+  writeFileSync(
+    path,
+    JSON.stringify({
+      "opencode-go": { type: "api_key", key: "sk-fixture-base" },
+      "opencode-go-1": { type: "api_key", key: "sk-fixture-one" },
+      anthropic: { type: "api_key", key: "sk-fixture-anthropic" },
+      "anthropic-1-api": { type: "api_key", key: "sk-fixture-anthropic-api" },
+    }),
+  );
+  const { credentials, warnings } = loadPiCredentials({ paths: [path] });
+  assert.equal(credentials.length, 4);
+  assert.deepEqual(warnings, ["opencode-go: opencode-go and opencode-go-1 are both account #1; rename opencode-go-1 to the next free number"]);
+  assert.equal(/sk-fixture/.test(warnings.join(" ")), false, "no key in a warning");
+});
+
 test("an unreadable or corrupt store degrades with a warning instead of throwing", () => {
   const directory = mkdtempSync(join(tmpdir(), "pi-quota-auth-"));
   const broken = join(directory, "auth.json");

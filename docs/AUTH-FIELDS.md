@@ -47,7 +47,8 @@ same secret in two slots collapses into one.
 An `api_key` entry also works as a Claude or Codex sibling (`anthropic-1-api`,
 `openai-codex-1-api`): it is a working pay-as-you-go account shown with a note
 and no plan windows — Anthropic and OpenAI serve no balance to an API key — and
-the key is never sent anywhere.
+the key is never sent anywhere. Choosing the Claude Code CLI store over Pi's
+`anthropic` login replaces only that OAuth login; an API-key account stays.
 
 ### Claude Code entry schema
 

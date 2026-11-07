@@ -124,8 +124,11 @@ export function resolveClaudeCredentials(input) {
   }
 
   if (claudeCode.ok) {
+    // Pay-as-you-go API keys (`anthropic-1-api`) are accounts of their own,
+    // not a second source for the subscription, so the source choice keeps them.
+    const apiKeys = fromPi.filter((credential) => credential.kind === "api_key");
     return {
-      credentials: [claudeCode.credential],
+      credentials: [claudeCode.credential, ...apiKeys],
       mode: "claude-code",
       unavailable: null,
       claudeCodePaths: claudeCode.paths,

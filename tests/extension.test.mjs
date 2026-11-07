@@ -596,6 +596,36 @@ test("a Claude report labels its account rows by slot, never by identity", async
   assert.equal(/c64efc0f|00aa11bb/.test(panel), false, "the identity is not a label");
 });
 
+test("a lone account's header carries no #1", async () => {
+  const module = await import(EXTENSION);
+  const harness = makeHarness({
+    report: {
+      generatedAt: "2030-01-01T00:00:00.000Z",
+      sources: [],
+      warnings: [],
+      providers: [{
+        family: "opencode-go",
+        label: "OpenCode Go (Pi)",
+        primaryWindowId: "5h",
+        account: "#1",
+        slot: null,
+        plan: "go",
+        windows: [{ id: "5h", label: "5h window", usedPercent: 10, remainingPercent: 90, resetsAt: null, resetsInSec: 600, note: null }],
+        error: null,
+        ok: true,
+        updatedAt: "2030-01-01T00:00:00.000Z",
+        expiresInMin: null,
+      }],
+    },
+  });
+  module.default(harness.pi);
+  const usage = harness.commands.find((command) => command.name === "usage");
+  await usage.definition.handler("panel", harness.ctx);
+  const panel = plain(renderWidget(harness.widgets.at(-1)).join("\n"));
+  assert.match(panel, /plan go/);
+  assert.equal(/#1/.test(panel), false);
+});
+
 test("an account row without windows prints the account's note, not a generic line", async () => {
   const module = await import(EXTENSION);
   const note = "API key · pay-as-you-go, no plan windows (Anthropic shows API keys no balance)";

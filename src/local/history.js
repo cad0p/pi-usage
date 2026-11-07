@@ -523,13 +523,34 @@ export function parseTotals(raw) {
         if (!accountValue || typeof accountValue !== "object") continue;
         // Files written while the base entry was unlabelled carry "" for it;
         // normalize on read so one account never shows up twice.
+        // A file frozen across both conventions carries "#1" and "" for the
+        // same account: the two halves are summed, never one dropped.
         const label = rawLabel === "" ? "#1" : rawLabel;
         const account = /** @type {Record<string, unknown>} */ (accountValue);
-        familyTotals.accounts.set(label, {
+        const parsed = {
           totalPrompts: count(account.totalPrompts),
           totalSessions: count(account.totalSessions),
           models: modelsFromJson(account.modelUsage),
-        });
+        };
+        const existing = familyTotals.accounts.get(label);
+        if (!existing) {
+          familyTotals.accounts.set(label, parsed);
+          continue;
+        }
+        existing.totalPrompts += parsed.totalPrompts;
+        existing.totalSessions += parsed.totalSessions;
+        for (const [model, bucket] of parsed.models) {
+          const seen = existing.models.get(model);
+          if (!seen) {
+            existing.models.set(model, bucket);
+            continue;
+          }
+          seen.input += bucket.input;
+          seen.output += bucket.output;
+          seen.cacheRead += bucket.cacheRead;
+          seen.cacheWrite += bucket.cacheWrite;
+          seen.messages += bucket.messages;
+        }
       }
     }
   }

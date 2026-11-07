@@ -263,6 +263,37 @@ test("a totals file written while the base was unlabelled reads back as one #1 a
   assert.deepEqual(Array.from(totals.families.get("opencode-go").accounts.keys()).sort(), ["#1", "#2"]);
 });
 
+test("a totals file carrying both \"#1\" and \"\" for the base sums them instead of dropping one", () => {
+  const bucket = (input) => ({ input, output: 0, cacheRead: 0, cacheWrite: 0, messages: 1 });
+  const totals = parseTotals({
+    schemaVersion: 1,
+    lastFrozenDay: "2026-11-02",
+    families: {
+      "opencode-go": {
+        firstDay: "2026-10-01",
+        activeDates: ["2026-10-01", "2026-11-02"],
+        totalPrompts: 5,
+        totalSessions: 2,
+        modelUsage: {},
+        accounts: {
+          // Frozen before the base lost its number, then while it had none.
+          "#1": { totalPrompts: 3, totalSessions: 1, modelUsage: { "m-old": bucket(100), shared: bucket(10) } },
+          "": { totalPrompts: 2, totalSessions: 1, modelUsage: { "m-new": bucket(50), shared: bucket(5) } },
+        },
+      },
+    },
+  });
+  assert.ok(totals);
+  const accounts = totals.families.get("opencode-go").accounts;
+  assert.deepEqual(Array.from(accounts.keys()), ["#1"]);
+  const base = accounts.get("#1");
+  assert.equal(base.totalPrompts, 5);
+  assert.equal(base.totalSessions, 2);
+  assert.deepEqual(Array.from(base.models.keys()).sort(), ["m-new", "m-old", "shared"]);
+  assert.equal(base.models.get("shared").input, 15);
+  assert.equal(base.models.get("shared").messages, 2);
+});
+
 test("the base account is #1 and siblings sort numerically", async () => {
   const tree = tempTree();
   writeSession(tree.sessions, "a.jsonl", [

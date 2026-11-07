@@ -9,7 +9,8 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 
-import { collectFamily, collectQuota } from "../src/engine.js";
+import { collectFamily, collectQuota, resolveClaudeCredentials } from "../src/engine.js";
+import { normalizeCredential } from "../src/auth/pi-auth.js";
 import { buildRecords } from "../src/omarchy/record.js";
 import { clearCache, readCache, withCache, writeCache } from "../src/cache.js";
 import {
@@ -870,4 +871,22 @@ test("the OpenCode Go usage request is sent with the package User-Agent", async 
   await collectQuota({ paths: [authPath], claudeCodePaths: [], now: NOW, fetchFn, families: ["opencode-go"], env: {}, home: directory, stores: [], allowBrowser: false });
   assert.equal(agents.length, 1);
   assert.match(agents[0], /^pi-usage\/\d+\.\d+\.\d+/);
+});
+
+
+test("a healthy Claude Code store does not drop a Pi API-key account", () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-quota-cc-"));
+  const credentialsPath = join(home, ".credentials.json");
+  writeFileSync(
+    credentialsPath,
+    JSON.stringify({ claudeAiOauth: { accessToken: "sk-ant-oat01-fixture", refreshToken: "sk-ant-ort01-fixture", expiresAt: NOW + 3_600_000, subscriptionType: "max" } }),
+  );
+  const piOauth = normalizeCredential("anthropic", { type: "oauth", access: "sk-ant-oat01-pi", refresh: "sk-ant-ort01-pi", expires: NOW + 3_600_000 }, "fixture");
+  const piKey = normalizeCredential("anthropic-1-api", { type: "api_key", key: "sk-ant-api03-fixture" }, "fixture");
+  const resolved = resolveClaudeCredentials({ credentials: [piOauth, piKey], env: {}, home, claudeCodePaths: [credentialsPath], now: NOW });
+  assert.equal(resolved.mode, "claude-code");
+  assert.deepEqual(resolved.credentials.map((credential) => [credential.sourceKind, credential.kind ?? "oauth", credential.slot ?? null]), [
+    ["claude-code", "oauth", null],
+    ["pi", "api_key", "1-api"],
+  ], "the CLI store replaces Pi's OAuth login, not the API key");
 });

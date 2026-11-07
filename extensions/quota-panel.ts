@@ -878,8 +878,9 @@ function renderProviderLines(provider: QuotaProvider, theme: Theme, localStats: 
   const lines: string[] = [];
   const labelWidth = Math.max(6, ...provider.windows.map((window) => String(window.label ?? "").length));
   const name = paint(BRAND[provider.family] ?? "#8B949E", provider.label);
+  // A lone account is the family: its "#1" would say nothing.
   const account = String(provider.account ?? "");
-  const meta: string[] = account === "" ? [] : [account];
+  const meta: string[] = account === "" || account === "#1" ? [] : [account];
   if (provider.plan) meta.push(`plan ${provider.plan}`);
   // Two stores can back Claude, and this is the one place that says which.
   if (provider.sourceKind === "claude-code") meta.push("Claude Code CLI");

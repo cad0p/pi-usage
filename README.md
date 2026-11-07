@@ -365,7 +365,8 @@ ok`) plus one line per account with every window and its reset, e.g.
 `#2 ● session 2% (10m) · week 10% (6d) · month 90% (19d)`, or the reason it failed
 (`key rejected`, `no Go plan`). The base entry in `auth.json` (`opencode-go`) is the
 family's first account, `#1`; sibling slots (`opencode-go-2` …) are numbered
-`#2` … `#14`. The leading glyph is the fullest window's band. The
+`#2` … `#14`, and a lone account prints no number. A `<base>-1` sibling
+beside the base would be a second `#1`, so the report warns to renumber it. The leading glyph is the fullest window's band. The
 overlay and the pinned panel are rendered as components, so Pi's ten-line cap on
 plain widgets never truncates them.
 
@@ -874,7 +875,7 @@ extensions/quota-panel.ts      Pi TUI line and /usage
 ## Tests
 
 ```bash
-node --test tests/*.test.mjs     # 484 tests, fake tokens only, no network
+node --test tests/*.test.mjs     # 489 tests, fake tokens only, no network
 ```
 
 Modules covered: `auth.json` parsing and de-duplication, the Claude Code store

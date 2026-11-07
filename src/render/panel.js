@@ -195,7 +195,8 @@ export function renderProviderLines(provider, paint, contentWidth = MAX_WIDTH, o
 
   // A multi-account family puts "#<slot>" in the title, so repeating it in the
   // meta line would print the same label twice on one row.
-  const accountText = provider.account || "";
+  // A lone account is the family: its "#1" would say nothing.
+  const accountText = provider.account === "#1" ? "" : provider.account || "";
   const meta = options.accountInTitle || accountText === "" ? [] : [accountText];
   if (provider.plan) meta.push(`plan ${provider.plan}`);
   // Claude has two stores, and a broken one is the first thing to rule out when

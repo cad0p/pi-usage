@@ -153,6 +153,12 @@ test("the panel titles one row per account of a multi-account family", () => {
   assert.equal((text.match(/#\d+/g) ?? []).length, 2, "each account label prints once, on its own row");
 });
 
+test("a lone account prints no #1: it is the family", () => {
+  const text = renderPanel([accountFixture(1, 20)], plainPalette(), { generatedAt: "2030-01-01T00:00:00.000Z" }).join("\n");
+  assert.equal(/#1/.test(text), false);
+  assert.match(text, /plan plus/);
+});
+
 test("a report cached while the base was unlabelled prints it as #1", () => {
   const lines = renderPanel(
     [
