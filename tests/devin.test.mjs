@@ -5,6 +5,7 @@
 
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
+import { execFileSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -116,6 +117,20 @@ test("devin: a window whose reset passed since the read shows no stale percentag
   assert.match(String(stale.note), /reset since the last read/);
 });
 
+test("devin: a reset exactly at the run is already past", async () => {
+  const { authPath } = agentDir(snapshot({ dailyRemainingPercent: 4, dailyResetAtMs: NOW }));
+  const result = await fetchQuota(credentialFor(authPath), { now: NOW, env: {} });
+  assert.equal(result.windows.find((window) => window.id === "daily")?.usedPercent, null);
+});
+
+test("devin: a FIFO at the snapshot path is rejected, not waited on", { skip: process.platform === "win32" }, async () => {
+  const { directory, authPath } = agentDir(null);
+  mkdirSync(join(directory, "pi-devin"));
+  execFileSync("mkfifo", [join(directory, "pi-devin", "account-usage.json")]);
+  const result = await fetchQuota(credentialFor(authPath), { now: NOW, env: {} });
+  assert.match(String(result.error), /unreadable \(not a file\)/);
+});
+
 test("devin: a snapshot from another sign-in is not shown", async () => {
   const { authPath } = agentDir(snapshot({}, { scope: scopeOf("devin-session-token$OTHER") }));
   const result = await fetchQuota(credentialFor(authPath), { now: NOW, env: {} });
@@ -130,6 +145,7 @@ test("devin: the scope is pi-devin's hash of the origin and token, with its defa
   assert.equal(loginScope({ access: TOKEN, apiServerURL: SERVER }), scopeOf());
   assert.equal(loginScope({ access: TOKEN }), scopeOf(TOKEN, DEFAULT_API_SERVER_URL));
   assert.equal(loginScope({ access: TOKEN, apiServerURL: "https://other.example" }) === scopeOf(), false);
+  assert.equal(loginScope({ access: TOKEN, apiServerURL: "https://Server.Codeium.com/" }), scopeOf(), "pi-devin hashes the normalized origin");
   assert.equal(loginScope({}), null);
 });
 

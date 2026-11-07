@@ -23,7 +23,7 @@
  */
 
 import { createHash } from "node:crypto";
-import { closeSync, fstatSync, openSync, readSync } from "node:fs";
+import { closeSync, constants, fstatSync, openSync, readSync } from "node:fs";
 import { dirname, join } from "node:path";
 
 import { buildWindow, degradedResult, finiteNumber, stringValue } from "../model.js";
@@ -80,6 +80,21 @@ export function snapshotPath(credential, env = process.env) {
 }
 
 /**
+ * pi-devin hashes the origin it validated (`new URL(value).origin`), so a
+ * stored "https://Server.codeium.com/" is the same login as the bare origin.
+ *
+ * @param {string} value
+ * @returns {string}
+ */
+function origin(value) {
+  try {
+    return new URL(value).origin;
+  } catch {
+    return value;
+  }
+}
+
+/**
  * pi-devin's scope for a login, or null when the login has no token.
  *
  * @param {{ access?: string, apiServerURL?: string | null }} credential
@@ -87,7 +102,7 @@ export function snapshotPath(credential, env = process.env) {
  */
 export function loginScope(credential) {
   if (!credential.access) return null;
-  const server = credential.apiServerURL || DEFAULT_API_SERVER_URL;
+  const server = origin(credential.apiServerURL || DEFAULT_API_SERVER_URL);
   return createHash("sha256").update(`${server}\0${credential.access}`).digest("hex");
 }
 
@@ -100,7 +115,9 @@ export function loginScope(credential) {
 function readSnapshot(path) {
   let fd;
   try {
-    fd = openSync(path, "r");
+    // Non-blocking, so a FIFO planted at the path cannot hang the run before
+    // the regular-file check below rejects it.
+    fd = openSync(path, constants.O_RDONLY | constants.O_NONBLOCK);
   } catch (error) {
     const code = /** @type {{ code?: string }} */ (error)?.code;
     if (code === "ENOENT" || code === "ENOTDIR") return { ok: false, missing: true, reason: "absent" };
