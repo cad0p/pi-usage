@@ -6,6 +6,7 @@ One source of truth for quota: **the credentials Pi already owns**.
 > `@cad0p/pi-usage` is a fork of [J3pf/piQuota](https://github.com/J3pf/piQuota) (`@j3pf/piquota`). It adds:
 >
 > * **OpenCode Go from the API key**: `GET https://opencode.ai/zen/go/v1/usage` returns the rolling (5h), weekly and monthly windows for the key Pi already stores, so no browser session is needed.
+> * **Mistral from the API key**: `GET https://api.mistral.ai/v1/billing/budget` and `/v1/billing/subscription`, the two reads the Vibe CLI makes for its usage gauge, return the monthly Vibe Code and API budgets and the plan for the key Pi already stores (`mistral`, and siblings such as `mistral-1-api`). They are read-only and cost no tokens.
 > * **Numbered accounts**: `auth.json` entries such as `opencode-go-2` … `opencode-go-14` (the [pi-fallback-provider](https://github.com/cad0p/pi-fallback-provider) sibling convention) are read as extra accounts of their base provider. The accounts of one provider are queried in parallel (8 at a time, `PI_QUOTA_ACCOUNT_CONCURRENCY` from 1 to 32), so 14 OpenCode Go keys cost about one round trip instead of fourteen. Every request carries `User-Agent: pi-usage/<version> (+https://github.com/cad0p/pi-usage)` unless a provider needs its own client string: OpenCode Go asks clients not to use a generic HTTP-library name, and Node's default is `node`.
 > * **One Omarchy tab per provider**: a multi-account provider shows each account's binding window (`#2 · Monthly`) in a single tab, and summarises failed accounts.
 > * **Tokens by day and by model**: the tokens Pi's own session files recorded are folded per provider and shown in `/usage`, in `--json` (`localStats`) and in the Omarchy records, at a bounded scan cost.
@@ -83,6 +84,7 @@ shuvquota, and it never writes to a credential file.
 | Codex | `openai-codex.access` + `accountId` | `GET chatgpt.com/backend-api/wham/usage` | ✅ 5h + weekly + plan |
 | Antigravity | `google-antigravity.access` (or legacy `antigravity`) + `projectId` | `POST cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary` | ✅ Gemini + Claude/GPT buckets, **with in-memory refresh** |
 | OpenCode Go | `opencode-go.key`, numbered siblings included | `GET opencode.ai/zen/go/v1/usage` | ✅ 5h + weekly + monthly per account; the session cookie and SSR dashboard are a base-account fallback |
+| Mistral | `mistral.key`, numbered siblings included | `GET api.mistral.ai/v1/billing/budget` + `/v1/billing/subscription` | ✅ Vibe monthly + API monthly + plan per key; without the `see_org_inference_usage` permission the plan alone, with a note. Keys of one organisation share its budgets, so they show the same numbers |
 | GitHub Actions (opt-in) | Authenticated `gh` CLI | `gh api /organizations/<org>/settings/billing/usage/summary?product=Actions` | ✅ org-wide monthly Linux minutes, plan-derived allowance |
 
 Four findings worth recording, each of which cost a wrong hypothesis:
@@ -384,7 +386,8 @@ right rail instead, under Status and TODO, and the above-editor box stays quiet 
 the numbers are not shown twice. See [the rail slot](#the-gentle-pi-rail-slot).
 
 * each name is painted with its **own brand colour** — Claude `#D97757`, Codex
-  `#10A37F`, Antigravity `#4285F4`, OpenCode `#007AFF`;
+  `#10A37F`, Antigravity `#4285F4`, OpenCode `#007AFF`, Mistral `#FA520F` (its row,
+  the Vibe budget, appears only when a Mistral key is configured);
 * the numbers are **used**, not remaining, and the semaphore is both colour and
   shape (`○` plenty left → `◔` → `◕` → `●` nearly spent), so it still reads on a
   colourblind or mono terminal;
@@ -563,7 +566,7 @@ stale without triggering rate limits:
 | Family | Clock |
 | --- | --- |
 | Claude | **300 s** (`--claude-ttl`) |
-| Codex, Antigravity, OpenCode Go | **60 s** (`--fetch-ttl`) |
+| Codex, Antigravity, OpenCode Go, Mistral | **60 s** (`--fetch-ttl`) |
 
 `src/refresh.js` keeps a timestamp per family, requests only what is past its own
 clock, and merges the result back into the canonical report. `src/sticky.js`
@@ -576,7 +579,7 @@ credential) are never masked.
 Omarchy 4.0.4's **Agents** bar panel draws every `*.json` record in
 `${XDG_STATE_HOME:-~/.local/state}/omarchy/agents/usage/`, whoever wrote it.
 `piquota omarchy` (opt-in, one shot) writes one record per provider piQuota can
-read, so Claude, Codex, Antigravity and OpenCode Go all get a tab:
+read, so Claude, Codex, Antigravity, OpenCode Go and Mistral all get a tab:
 
 ```bash
 piquota omarchy                  # write pi-claude.json, pi-codex.json, ... once
@@ -699,7 +702,7 @@ What counts: one assistant message with a non-zero token count is one prompt,
 and its tokens are `input + output + cacheRead + cacheWrite` — the same sum the
 Omarchy panel renders. Messages are bucketed by **local** date (the panel calls
 the last row "Today"). Only providers piQuota can bill are counted:
-`anthropic`, `openai-codex`, `antigravity`, `opencode-go` and their numbered
+`anthropic`, `openai-codex`, `antigravity`, `opencode-go`, `mistral` and their numbered
 siblings, so `opencode-go-7` is account `#7`. Providers it does not manage
 (`deepinfra`, `xai`, ...) are ignored, and so is the custom `claude-bridge`
 provider: its tokens are not a Pi subscription.
@@ -868,12 +871,13 @@ extensions/quota-panel.ts      Pi TUI line and /usage
 ## Tests
 
 ```bash
-node --test tests/*.test.mjs     # 455 tests, fake tokens only, no network
+node --test tests/*.test.mjs     # 472 tests, fake tokens only, no network
 ```
 
 Modules covered: `auth.json` parsing and de-duplication, the Claude Code store
 (including that the refresh token never leaves it and that reading leaves the file
-byte-identical), Claude source precedence, the five providers (including GitHub
+byte-identical), Claude source precedence, the six providers (including Mistral's two budgets,
+the missing usage permission and a rejected key, GitHub
 Actions plan resolution, opt-in gating and degradation, the two Antigravity
 failures and the OpenCode degradation), the dashboard parser's three
 strategies, the Firefox cookie reader against a synthetic SQLite database, the

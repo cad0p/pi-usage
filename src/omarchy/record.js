@@ -38,6 +38,7 @@ const LOGIN_HINT = {
   codex: "Run `/login openai-codex` in Pi to restore usage.",
   antigravity: "Run `/login antigravity` in Pi to restore usage.",
   "opencode-go": "Run `piquota auth opencode` to restore usage.",
+  mistral: "Run `/login mistral` in Pi to restore usage.",
 };
 
 const HELP_MAX = 200;

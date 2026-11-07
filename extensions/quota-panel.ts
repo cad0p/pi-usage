@@ -187,6 +187,7 @@ const BRAND: Record<string, string> = {
   codex: "#10A37F",
   antigravity: "#4285F4",
   "opencode-go": "#007AFF",
+  mistral: "#FA520F",
   "github-actions": "#2088FF",
 };
 
@@ -196,6 +197,7 @@ const SHORT_NAME: Record<string, string> = {
   codex: "Codex",
   antigravity: "Agy",
   "opencode-go": "OP-Go",
+  mistral: "Mistral",
   "github-actions": "GH",
 };
 
@@ -469,6 +471,9 @@ export function renderBox(report: QuotaReport, theme: Theme, totalWidth?: number
     { label: "Agy C/G:", color: "#7AA2F7", ...windowFor("antigravity", (window) => window.id === "claude-gpt-5h" || (/(claude|gpt|3p)/i.test(window.id) && isFiveHour(window))) },
     { label: "OP-Go:  ", color: "#007AFF", ...windowFor("opencode-go", isFiveHour) },
   ];
+  if (providerFor("mistral")) {
+    rows.push({ label: "Mistral:", color: "#FA520F", ...windowFor("mistral", (window) => window.id === "vibe") });
+  }
   if (providerFor("github-actions")) {
     rows.push({ label: "GH Actions:", color: "#2088FF", ...windowFor("github-actions", (window) => window.id === "monthly") });
   }
@@ -518,6 +523,9 @@ function renderSidebarCard(report: QuotaReport | null, theme: Theme, width: numb
         { label: "Agy:    ", color: "#4285F4", ...windowFor("antigravity", (window) => window.id === "gemini-5h" || (/gemini/i.test(window.id) && isFiveHour(window))) },
         { label: "Agy C/G:", color: "#7AA2F7", ...windowFor("antigravity", (window) => window.id === "claude-gpt-5h" || (/(claude|gpt|3p)/i.test(window.id) && isFiveHour(window))) },
         { label: "OP-Go:  ", color: "#007AFF", ...windowFor("opencode-go", isFiveHour) },
+        ...(providerFor("mistral")
+          ? [{ label: "Mistral:", color: "#FA520F", ...windowFor("mistral", (window) => window.id === "vibe") }]
+          : []),
         ...(providerFor("github-actions")
           ? [{ label: "GH Actions:", color: "#2088FF", ...windowFor("github-actions", (window) => window.id === "monthly") }]
           : []),
@@ -1130,6 +1138,7 @@ const FAMILY_LABEL: Record<string, string> = {
   codex: "Codex (Pi)",
   antigravity: "Antigravity (Pi)",
   "opencode-go": "OpenCode Go (Pi)",
+  mistral: "Mistral (Pi)",
   "github-actions": "GitHub Actions",
 };
 

@@ -22,6 +22,8 @@ export const FAMILY_ALIASES = {
   opencode: "opencode-go",
   go: "opencode-go",
   zen: "opencode-go",
+  mistral: "mistral",
+  vibe: "mistral",
   "github-actions": "github-actions",
   gh: "github-actions",
   actions: "github-actions",
