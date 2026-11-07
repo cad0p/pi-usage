@@ -11,6 +11,7 @@ All notable changes to this project will be documented in this file.
 ### 🚀 Features
 
 - Mistral quota from the billing API (closes #36)
+- Devin quota from pi-devin's snapshot (closes #37)
 
 ### 🐛 Bug Fixes
 
