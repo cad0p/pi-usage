@@ -223,18 +223,96 @@ test("mistral: collectQuota reports every Mistral slot in auth.json order", asyn
   assert.equal(JSON.stringify(report).includes("mistral-FAKE"), false, "no key reaches the report");
 });
 
-test("mistral: the compact widget gains a Mistral row only when Mistral is configured", async () => {
+test("mistral: the compact widgets gain a Mistral row only when a Mistral key is configured", async () => {
   const { renderBoxWidget } = await import("../src/render/panel.js");
   const { plainPalette } = await import("../src/render/theme.js");
-  const { fetchFn } = routes();
-  const mistral = await fetchQuota(credential(), { now: NOW, fetchFn });
-  const claude = { family: "claude", label: "Claude (Pi)", account: "", plan: null, windows: [], error: "no claude credential in the Pi store", ok: false, notConfigured: true, updatedAt: new Date(NOW).toISOString(), source: "fixture" };
+  const { renderBox } = await import("../extensions/quota-panel.ts");
+  const theme = { fg: (_key, text) => text, bold: (text) => text };
+  const directory = mkdtempSync(join(tmpdir(), "pi-quota-mistral-box-"));
+  const run = async (auth) => {
+    const authPath = join(directory, `auth-${Object.keys(auth).join("-")}.json`);
+    writeFileSync(authPath, JSON.stringify(auth));
+    const { fetchFn } = routes();
+    // The engine's own report: an unconfigured family is still in it, flagged.
+    return collectQuota({ paths: [authPath], claudeCodePaths: [], now: NOW, fetchFn, env: {}, home: directory, stores: [], allowBrowser: false });
+  };
 
-  const without = renderBoxWidget([claude], plainPalette(), 0).join("\n");
-  assert.doesNotMatch(without, /Mistral/, "no permanent not-configured row for a user without Mistral");
+  const without = await run({ "opencode-go": { type: "api_key", key: "oc-FAKE" } });
+  assert.equal(without.byFamily.mistral[0].notConfigured, true, "the engine reports the family as not configured");
+  assert.doesNotMatch(renderBoxWidget(without.providers, plainPalette(), 0).join("\n"), /Mistral/, "CLI box: no permanent not-configured row");
+  assert.doesNotMatch(renderBox(without, theme, 0).join("\n"), /Mistral/, "extension box: no permanent not-configured row");
 
-  const withMistral = renderBoxWidget([claude, mistral], plainPalette(), 0).join("\n");
-  assert.match(withMistral, /Mistral:.*81%/, "the row shows the Vibe budget");
+  const configured = await run({ mistral: { type: "api_key", key: "mistral-FAKE-box" } });
+  assert.match(renderBoxWidget(configured.providers, plainPalette(), 0).join("\n"), /Mistral:.*81%/, "the row shows the Vibe budget");
+  assert.match(renderBox(configured, theme, 0).join("\n"), /Mistral:.*81%/);
+});
+
+test("mistral: without the usage permission every surface says why", async () => {
+  const { renderProviderLines } = await import("../src/render/panel.js");
+  const { plainPalette } = await import("../src/render/theme.js");
+  const { buildRecord, buildRecords } = await import("../src/omarchy/record.js");
+  const forbidden = () => jsonResponse({ detail: "forbidden" }, { status: 403 });
+  const { fetchFn } = routes({ budget: forbidden });
+  const quiet = { ...(await fetchQuota(credential(), { now: NOW, fetchFn })), slot: null };
+
+  assert.match(renderProviderLines(quiet, plainPalette()).join("\n"), /see_org_inference_usage/, "the CLI panel prints the note");
+
+  const single = buildRecord(quiet, { now: NOW })?.record;
+  assert.equal(single?.usageStatusText, "Usage not visible");
+  assert.match(String(single?.authHelpText), /see_org_inference_usage/);
+  assert.notEqual(single?.usageStatusText, "Quota unavailable");
+
+  const { fetchFn: healthy } = routes();
+  const sibling = { ...(await fetchQuota(credential("mistral-1-api"), { now: NOW, fetchFn: healthy })), slot: "1-api" };
+  const family = buildRecords(/** @type {any} */ ({ providers: [quiet, sibling], byFamily: { mistral: [quiet, sibling] } }), { now: NOW })[0].record;
+  const base = family.accounts.find((account) => account.id === "");
+  assert.equal(base.ok, true);
+  assert.match(base.status, /see_org_inference_usage/, "the multi-account row says why it is empty");
+});
+
+test("mistral: pay-as-you-go reaches the Omarchy title, and falls back to the subscription's flags", async () => {
+  const { buildRecord } = await import("../src/omarchy/record.js");
+  const body = budgetBody();
+  body.vibe_budget.payg_enabled = true;
+  const { fetchFn } = routes({ budget: () => jsonResponse(body) });
+  const result = await fetchQuota(credential(), { now: NOW, fetchFn });
+  const titles = buildRecord(result, { now: NOW })?.record.limits.map((limit) => limit.title);
+  assert.deepEqual(titles, ["Vibe monthly · pay-as-you-go", "API monthly"]);
+
+  // A budget without its own flag uses the subscription's for that budget.
+  const unflagged = budgetBody();
+  delete unflagged.vibe_budget.payg_enabled;
+  delete unflagged.api_budget.payg_enabled;
+  const { fetchFn: fromSubscription } = routes({
+    subscription: () => jsonResponse({ ...subscriptionBody, vibe_payg_enabled: true, payg_enabled: false }),
+    budget: () => jsonResponse(unflagged),
+  });
+  const fallback = await fetchQuota(credential(), { now: NOW, fetchFn: fromSubscription });
+  assert.deepEqual(fallback.windows.map((window) => window.note), ["of 127.50 EUR · pay-as-you-go", "of 12.75 EUR"]);
+
+  // The budget's own answer wins over the subscription's.
+  const { fetchFn: conflicting } = routes({ subscription: () => jsonResponse({ ...subscriptionBody, vibe_payg_enabled: true }) });
+  const own = await fetchQuota(credential(), { now: NOW, fetchFn: conflicting });
+  assert.equal(own.windows[0].note, "of 127.50 EUR");
+
+  // Without the usage permission the subscription still says pay-as-you-go is on.
+  const { fetchFn: quiet } = routes({
+    subscription: () => jsonResponse({ ...subscriptionBody, vibe_payg_enabled: true }),
+    budget: () => jsonResponse({}, { status: 403 }),
+  });
+  const plain = await fetchQuota(credential(), { now: NOW, fetchFn: quiet });
+  assert.match(plain.note ?? "", /pay-as-you-go on/);
+});
+
+test("mistral: hostile amounts and names are not printed raw", () => {
+  const huge = parseBudgetWindows({ vibe_budget: { usage_percentage: 10, initial_budget: 1e308, currency: "EUR" } }, NOW);
+  assert.equal(huge[0].note, null, "an absurd amount is not printed as 1e+308");
+  assert.equal(parsePlanName({ plan_name: "Pro\u009b2J" }), "Pro2J", "C1 controls are stripped too");
+});
+
+test("mistral: an unreadable named budget does not hide a readable top-level one", () => {
+  const windows = parseBudgetWindows({ vibe_budget: { usage_percentage: "n/a" }, usage_percentage: 40, initial_budget: 10, currency: "EUR" }, NOW);
+  assert.deepEqual(windows.map((window) => [window.id, window.usedPercent]), [["budget", 40]]);
 });
 
 test("mistral: the Omarchy record carries both budgets, the plan and no key", async () => {

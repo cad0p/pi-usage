@@ -471,7 +471,7 @@ export function renderBox(report: QuotaReport, theme: Theme, totalWidth?: number
     { label: "Agy C/G:", color: "#7AA2F7", ...windowFor("antigravity", (window) => window.id === "claude-gpt-5h" || (/(claude|gpt|3p)/i.test(window.id) && isFiveHour(window))) },
     { label: "OP-Go:  ", color: "#007AFF", ...windowFor("opencode-go", isFiveHour) },
   ];
-  if (providerFor("mistral")) {
+  if (providerFor("mistral") && providerFor("mistral")?.notConfigured !== true) {
     rows.push({ label: "Mistral:", color: "#FA520F", ...windowFor("mistral", (window) => window.id === "vibe") });
   }
   if (providerFor("github-actions")) {
@@ -523,7 +523,7 @@ function renderSidebarCard(report: QuotaReport | null, theme: Theme, width: numb
         { label: "Agy:    ", color: "#4285F4", ...windowFor("antigravity", (window) => window.id === "gemini-5h" || (/gemini/i.test(window.id) && isFiveHour(window))) },
         { label: "Agy C/G:", color: "#7AA2F7", ...windowFor("antigravity", (window) => window.id === "claude-gpt-5h" || (/(claude|gpt|3p)/i.test(window.id) && isFiveHour(window))) },
         { label: "OP-Go:  ", color: "#007AFF", ...windowFor("opencode-go", isFiveHour) },
-        ...(providerFor("mistral")
+        ...(providerFor("mistral") && providerFor("mistral")?.notConfigured !== true
           ? [{ label: "Mistral:", color: "#FA520F", ...windowFor("mistral", (window) => window.id === "vibe") }]
           : []),
         ...(providerFor("github-actions")

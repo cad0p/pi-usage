@@ -30,6 +30,7 @@ const BUDGETS = [
 ];
 
 const MONTH_SECONDS = 2_592_000;
+const PAYG = "pay-as-you-go";
 
 /**
  * @param {unknown} value
@@ -61,7 +62,8 @@ function accountLabel(credential) {
  */
 function money(amount, currency) {
   const value = typeof amount === "number" ? amount : typeof amount === "string" && amount.trim() !== "" ? Number(amount) : NaN;
-  if (!Number.isFinite(value) || value < 0) return null;
+  // A budget is a few hundred euros; anything absurd is not printed as 1e+308.
+  if (!Number.isFinite(value) || value < 0 || value >= 1e9) return null;
   const code = stringValue(currency);
   const safeCode = code && /^[A-Za-z]{3}$/.test(code) ? ` ${code.toUpperCase()}` : "";
   return `${value.toFixed(2)}${safeCode}`;
@@ -75,33 +77,52 @@ function money(amount, currency) {
  * smaller answer still shows something and a full answer never shows a budget
  * twice.
  *
+ * A budget that does not say whether pay-as-you-go is on falls back to the
+ * subscription's flag for it (`vibe_payg_enabled` for Vibe, `payg_enabled`
+ * for the API).
+ *
  * @param {unknown} body
  * @param {number} now
+ * @param {{ vibe?: boolean | null, api?: boolean | null }} [payg] From `/billing/subscription`.
  * @returns {import("../model.js").QuotaWindow[]}
  */
-export function parseBudgetWindows(body, now = Date.now()) {
+export function parseBudgetWindows(body, now = Date.now(), payg = {}) {
   const root = record(body);
   if (!root) return [];
 
   /** @type {Array<{ id: string, label: string, entry: Record<string, unknown> }>} */
-  const found = [];
+  const named = [];
   for (const spec of BUDGETS) {
     const entry = record(root[spec.field]);
-    if (entry) found.push({ id: spec.id, label: spec.label, entry });
+    if (entry) named.push({ id: spec.id, label: spec.label, entry });
   }
-  if (found.length === 0 && root.usage_percentage !== undefined) {
-    found.push({ id: "budget", label: "Monthly budget", entry: root });
+  const windows = toWindows(named, now, payg);
+  // The top-level copy stands in only when no named budget produced a window,
+  // so a full answer never shows a budget twice and an unreadable named one
+  // does not hide a readable top-level one.
+  if (windows.length === 0 && root.usage_percentage !== undefined) {
+    return toWindows([{ id: "budget", label: "Monthly budget", entry: root }], now, payg);
   }
+  return windows;
+}
 
+/**
+ * @param {Array<{ id: string, label: string, entry: Record<string, unknown> }>} budgets
+ * @param {number} now
+ * @param {{ vibe?: boolean | null, api?: boolean | null }} payg
+ * @returns {import("../model.js").QuotaWindow[]}
+ */
+function toWindows(budgets, now, payg) {
   /** @type {import("../model.js").QuotaWindow[]} */
   const windows = [];
-  for (const { id, label, entry } of found) {
+  for (const { id, label, entry } of budgets) {
     // No readable percentage, no window: "n/a" must not become an empty bar.
     if (clampPercent(entry.usage_percentage) === null) continue;
     const notes = [];
     const amount = money(entry.initial_budget, entry.currency);
     if (amount) notes.push(`of ${amount}`);
-    if (entry.payg_enabled === true) notes.push("pay-as-you-go");
+    const paygOn = typeof entry.payg_enabled === "boolean" ? entry.payg_enabled : (id === "vibe" ? payg.vibe : payg.api) === true;
+    if (paygOn) notes.push(PAYG);
     windows.push(
       buildWindow({
         id,
@@ -118,6 +139,18 @@ export function parseBudgetWindows(body, now = Date.now()) {
 }
 
 /**
+ * The pay-as-you-go flags of a `/billing/subscription` body.
+ *
+ * @param {unknown} body
+ * @returns {{ vibe: boolean | null, api: boolean | null }}
+ */
+export function parsePayg(body) {
+  const root = record(body);
+  const flag = (value) => (typeof value === "boolean" ? value : null);
+  return { vibe: flag(root?.vibe_payg_enabled), api: flag(root?.payg_enabled) };
+}
+
+/**
  * The plan's name from a `/billing/subscription` body, or null.
  *
  * @param {unknown} body
@@ -127,7 +160,7 @@ export function parsePlanName(body) {
   const name = stringValue(record(body)?.plan_name);
   if (!name) return null;
   // A display string only: keep it short and free of control characters.
-  const clean = name.replace(/[\u0000-\u001f\u007f]/g, "").trim().slice(0, 40);
+  const clean = name.replace(/[\u0000-\u001f\u007f-\u009f]/g, "").trim().slice(0, 40);
   return clean === "" ? null : clean;
 }
 
@@ -177,6 +210,7 @@ export async function fetchQuota(credential, options = {}) {
   const [subscription, budget] = await Promise.all([request(SUBSCRIPTION_URL), request(BUDGET_URL)]);
 
   const plan = subscription.ok ? parsePlanName(subscription.body) : null;
+  const payg = subscription.ok ? parsePayg(subscription.body) : { vibe: null, api: null };
 
   // A rejected key is a statement about the credential: report it once, as an
   // auth failure, whichever read noticed it.
@@ -185,7 +219,7 @@ export async function fetchQuota(credential, options = {}) {
   }
 
   if (budget.ok) {
-    const windows = parseBudgetWindows(budget.body, now);
+    const windows = parseBudgetWindows(budget.body, now, payg);
     if (windows.length === 0) {
       return degradedResult({ ...base, plan, error: "Mistral budget endpoint returned no budgets", now });
     }
@@ -206,7 +240,7 @@ export async function fetchQuota(credential, options = {}) {
       ...base,
       plan,
       windows: [],
-      note: "budget needs the see_org_inference_usage permission",
+      note: `budget needs the see_org_inference_usage permission${payg.vibe === true || payg.api === true ? ` · ${PAYG} on` : ""}`,
       error: null,
       ok: true,
       updatedAt: new Date(now).toISOString(),

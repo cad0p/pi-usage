@@ -530,6 +530,10 @@ Rp suite) without external network daemons or closed-source intermediaries:
 }
 ```
 
+A provider may also carry a top-level `note` when it answered but has no windows
+to show, such as a Mistral key without the `see_org_inference_usage` permission
+(`"ok": true`, `"windows": []`, the plan, and the reason in `note`).
+
 The token part of the same report is abridged here (`recentDays` always carries
 seven entries, oldest first, today last):
 
@@ -871,7 +875,7 @@ extensions/quota-panel.ts      Pi TUI line and /usage
 ## Tests
 
 ```bash
-node --test tests/*.test.mjs     # 472 tests, fake tokens only, no network
+node --test tests/*.test.mjs     # 476 tests, fake tokens only, no network
 ```
 
 Modules covered: `auth.json` parsing and de-duplication, the Claude Code store
